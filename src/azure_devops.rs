@@ -630,6 +630,7 @@ fn replies_from_thread(thread: &Value) -> Vec<Reply> {
                 author,
                 body: comment["content"].as_str().unwrap_or("").trim().to_string(),
                 created_at: comment["publishedDate"].as_str().unwrap_or("").to_string(),
+                avatar_url: azure_avatar(&comment["author"]),
             }
         })
         .collect()
@@ -692,6 +693,7 @@ fn merge_comments(threads: &[&Value], pr: &Value) -> Vec<Comment> {
             is_resolved,
             is_outdated: false,
             replies: replies_from_thread(thread),
+            avatar_url: azure_avatar(&root["author"]),
         });
     }
     for reviewer in pr["reviewers"].as_array().into_iter().flatten() {
@@ -711,10 +713,18 @@ fn merge_comments(threads: &[&Value], pr: &Value) -> Vec<Comment> {
         // request's standing verdict.
         let mut row = prose_row(CommentKind::Review, author, bot, body.to_string(), String::new());
         row.review_state = Some(state);
+        row.avatar_url = azure_avatar(reviewer);
         out.push(row);
     }
     finish_comments(&mut out);
     out
+}
+
+/// An identity's avatar link. Azure DevOps serves it behind the organization's sign-in, so
+/// an unauthenticated download fails and the turn keeps its dot.
+fn azure_avatar(identity: &Value) -> Option<String> {
+    crate::forge::avatar_url(&identity["_links"]["avatar"]["href"])
+        .or_else(|| crate::forge::avatar_url(&identity["imageUrl"]))
 }
 
 /// The prose and verdict one reviewer vote renders as; a zero vote renders nothing.
@@ -875,7 +885,8 @@ mod tests {
         assert!(!truncated);
         assert_eq!(rows.len(), 2, "the system thread drops");
         let pr = json!({"reviewers": [
-            {"displayName": "Mark Wilkie", "vote": 10},
+            {"displayName": "Mark Wilkie", "vote": 10,
+             "_links": {"avatar": {"href": "https://dev.azure.com/org/_apis/GraphProfile/x"}}},
             {"displayName": "Waiting Reviewer", "vote": -5},
             {"displayName": "Quiet Reviewer", "vote": 0},
             {"displayName": "Leads", "vote": 10, "isContainer": true},
@@ -896,6 +907,11 @@ mod tests {
         assert_eq!(votes[0].body, "Approved this pull request.");
         assert_eq!(votes[1].body, "Is waiting for the author.");
         assert_eq!(votes[0].review_state, Some(ReviewState::Approved));
+        assert_eq!(
+            votes[0].avatar_url.as_deref(),
+            Some("https://dev.azure.com/org/_apis/GraphProfile/x")
+        );
+        assert_eq!(votes[1].avatar_url, None, "no link: a dot");
         assert_eq!(votes[1].review_state, Some(ReviewState::ChangesRequested));
         // Undated votes are the standing verdict, so they close the oldest-first list.
         assert!(comments.iter().rev().take(2).all(|c| c.kind == CommentKind::Review));

@@ -716,6 +716,7 @@ fn replies_from_discussion(discussion: &Value) -> Vec<Reply> {
                 author,
                 body: note["body"].as_str().unwrap_or("").trim().to_string(),
                 created_at: note["created_at"].as_str().unwrap_or("").to_string(),
+                avatar_url: crate::forge::avatar_url(&note["author"]["avatar_url"]),
             }
         })
         .collect()
@@ -760,6 +761,7 @@ fn merge_comments(discussions: &[Value], approvals: &Value) -> Vec<Comment> {
             is_resolved,
             is_outdated: false,
             replies: replies_from_discussion(discussion),
+            avatar_url: crate::forge::avatar_url(&root["author"]["avatar_url"]),
         });
     }
     for user in approvals["approved_by"].as_array().into_iter().flatten() {
@@ -778,6 +780,7 @@ fn merge_comments(discussions: &[Value], approvals: &Value) -> Vec<Comment> {
             String::new(),
         );
         row.review_state = Some(crate::forge::ReviewState::Approved);
+        row.avatar_url = crate::forge::avatar_url(&user["user"]["avatar_url"]);
         out.push(row);
     }
     finish_comments(&mut out);
@@ -1191,7 +1194,8 @@ mod tests {
                 ]
             }
         ]);
-        let approvals = json!({"approved_by": [{"user": {"username": "reviewer"}}]});
+        let approvals = json!({"approved_by": [{"user": {"username": "reviewer",
+            "avatar_url": "https://gitlab.example/uploads/reviewer.png"}}]});
         let comments = merge_comments(discussions.as_array().unwrap(), &approvals);
         assert_eq!(comments.len(), 4);
         let finding = comments.iter().find(|c| c.body == "Looks wrong.").unwrap();
@@ -1209,6 +1213,11 @@ mod tests {
         assert_eq!(approval.kind, CommentKind::Review, "the undated approval sorts last");
         assert_eq!(approval.author, "reviewer");
         assert_eq!(approval.review_state, Some(crate::forge::ReviewState::Approved));
+        assert_eq!(
+            approval.avatar_url.as_deref(),
+            Some("https://gitlab.example/uploads/reviewer.png"),
+            "the approver's `avatar_url` reaches the row"
+        );
         let dated: Vec<_> = comments[..3].iter().map(|c| c.created_at.as_str()).collect();
         assert!(dated.windows(2).all(|w| w[0] <= w[1]), "dated rows run oldest first: {dated:?}");
     }

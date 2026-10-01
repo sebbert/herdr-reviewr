@@ -229,6 +229,7 @@ toggle_direction = "down"
 split_ratio = 0.33
 auto_open = false
 pane_outer_borders = false
+avatars = true
 github_host = "github.example.com"
 editor = "code -g {file}:{line}"
 
@@ -282,6 +283,32 @@ The frames go. One divider line stays between the file list and the diff. Each p
 its title on a top row of its own, and the focused pane's title is lit instead of its
 border. Popups, the comment box, and the keys help keep their frames: they float over the
 panes rather than sitting against the edge.
+
+### Avatars
+
+Opt in to show each comment author's avatar in place of the `●` on the PR tab's thread
+timeline:
+
+```toml
+avatars = true          # default: false (dots)
+avatar_width = 1        # 1 or 2 cells; default 1
+avatar_fit = "height"   # "height" or "width"; default "height"
+```
+
+This needs a terminal that speaks the Kitty graphics protocol with Unicode placeholders.
+Ghostty and kitty do, and so does herdr's own pane renderer. reviewr asks the terminal once,
+and anywhere it gets no answer, the dots stay. The avatars load lazily: the PR paints with
+dots straight away, the visible cards fetch first, and each avatar swaps in when it arrives.
+A failed download stays a dot. Nothing moves when one lands.
+
+`avatar_width = 1` takes the dot's own cell. `2` takes the dot and the space after it.
+`avatar_fit = "height"` makes the circle as tall as the row, so it can spill into the blank
+cells beside the dot, cut off before any border or text. `"width"` makes it exactly as wide
+as its cells, with clear space above and below. Avatars on GitHub Enterprise or Azure DevOps
+that need a sign-in stay dots.
+
+To check a terminal, run `cargo run --example avatar_check` inside a herdr pane. It should
+draw four round pictures.
 
 ### Base branch
 

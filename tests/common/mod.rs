@@ -205,6 +205,7 @@ pub fn comment() -> herdr_reviewr::forge::Comment {
         is_resolved: false,
         is_outdated: false,
         replies: Vec::new(),
+        avatar_url: None,
     }
 }
 

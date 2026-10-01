@@ -108,6 +108,11 @@ fn scrim_behind(frame: &mut Frame, app: &App, area: Rect) {
         for y in band.y..band.y + band.height {
             for x in band.x..band.x + band.width {
                 if let Some(cell) = buf.cell_mut((x, y)) {
+                    // An avatar cell's foreground is its image id, not a colour: blending it
+                    // would name another image.
+                    if cell.symbol().starts_with(crate::avatar::PLACEHOLDER) {
+                        continue;
+                    }
                     cell.fg = p.scrim(cell.fg);
                     cell.bg = p.scrim(cell.bg);
                 }
@@ -913,10 +918,13 @@ fn skip_display_cols(text: &str, cols: usize) -> String {
     let mut acc = 0usize;
     text.chars()
         .skip_while(|ch| {
-            if acc >= cols {
+            let w = UnicodeWidthChar::width(*ch).unwrap_or(0);
+            // A zero-width mark belongs to the cell before it (an avatar placeholder's
+            // diacritics), so it goes with a skipped cell rather than opening the text.
+            if acc >= cols && (w > 0 || cols == 0) {
                 return false;
             }
-            acc += UnicodeWidthChar::width(*ch).unwrap_or(0);
+            acc += w;
             true
         })
         .collect()
@@ -4743,6 +4751,9 @@ struct PrReadContent {
     cols: Vec<(usize, Option<usize>)>,
     /// Each cursor item's first display line (`tops[cursor]`), where a selection scrolls to.
     tops: Vec<usize>,
+    /// Each turn byline's display line and its author's avatar URL — the painted ones start
+    /// their downloads first.
+    avatars: Vec<(usize, String)>,
 }
 
 /// Below this pane width a comment box would leave too little room for its text, so the
@@ -4754,7 +4765,9 @@ const MIN_BOX_WIDTH: usize = 24;
 #[derive(Clone, Copy)]
 enum Rail {
     Blank,
-    Dot(Color),
+    /// A turn's byline: its dot colour, and the image id that paints the author's avatar
+    /// over the dot once it is on the terminal.
+    Dot(Color, Option<u32>),
     Line,
 }
 
@@ -4762,6 +4775,8 @@ enum Rail {
 /// markdown bodies and snippet quotes sit among them.
 struct Card {
     lines: Vec<(Line<'static>, Rail)>,
+    /// Each byline's row and its author's avatar URL, for the visible-first downloads.
+    avatars: Vec<(usize, String)>,
     bodies: Vec<(usize, crate::markdown::Rendered)>,
     snippets: Vec<(std::ops::Range<usize>, usize)>,
 }
@@ -4774,19 +4789,31 @@ fn build_card(app: &App, cm: &forge::Comment, cw: usize, p: &Palette) -> Card {
     let snippet = push_finding_quote(&mut quote, app, cm, cw, p);
     let mut card = Card {
         lines: quote.into_iter().map(|l| (l, Rail::Blank)).collect(),
+        avatars: Vec::new(),
         bodies: Vec::new(),
         snippets: snippet.into_iter().collect(),
     };
     let now = std::time::SystemTime::now();
-    let root = (cm.author.as_str(), cm.author_is_bot, cm.created_at.as_str(), cm.body.as_str());
-    let turns: Vec<_> =
-        std::iter::once(root)
-            .chain(cm.replies.iter().map(|r| {
-                (r.author.as_str(), r.author_is_bot, r.created_at.as_str(), r.body.as_str())
-            }))
-            .collect();
+    let root = (
+        cm.author.as_str(),
+        cm.author_is_bot,
+        cm.created_at.as_str(),
+        cm.body.as_str(),
+        cm.avatar_url.as_deref(),
+    );
+    let turns: Vec<_> = std::iter::once(root)
+        .chain(cm.replies.iter().map(|r| {
+            (
+                r.author.as_str(),
+                r.author_is_bot,
+                r.created_at.as_str(),
+                r.body.as_str(),
+                r.avatar_url.as_deref(),
+            )
+        }))
+        .collect();
     let last = turns.len() - 1;
-    for (t, (author, bot, created, body)) in turns.into_iter().enumerate() {
+    for (t, (author, bot, created, body, avatar)) in turns.into_iter().enumerate() {
         let after = if t < last { Rail::Line } else { Rail::Blank };
         if t > 0 {
             card.lines.push((Line::raw(""), Rail::Line));
@@ -4796,7 +4823,11 @@ fn build_card(app: &App, cm: &forge::Comment, cw: usize, p: &Palette) -> Card {
         let mut byline = Vec::new();
         push_comment_byline(&mut byline, author, bot, created, now, p);
         let dot = if bot { p.dim1 } else { p.orange };
-        card.lines.extend(byline.into_iter().map(|l| (l, Rail::Dot(dot))));
+        if let Some(url) = avatar {
+            card.avatars.push((card.lines.len(), url.to_string()));
+        }
+        let id = app.avatar_id(avatar);
+        card.lines.extend(byline.into_iter().map(|l| (l, Rail::Dot(dot, id))));
         if !body.is_empty() {
             let mut rendered = app.markdown_render(body, cw.max(1));
             let lines = std::mem::take(&mut rendered.lines);
@@ -4805,6 +4836,24 @@ fn build_card(app: &App, cm: &forge::Comment, cw: usize, p: &Palette) -> Card {
         }
     }
     card
+}
+
+/// A byline's four timeline columns with its avatar in them: the border, then the blank,
+/// dot, and blank cells, the ones the placement covers painted as Kitty placeholder cells
+/// (the image id in the foreground), the rest left blank. Same four columns as the dot.
+fn avatar_cells(id: u32, g: crate::avatar::Geometry, border: Style) -> Vec<Span<'static>> {
+    let (r, gr, b) = crate::avatar::id_rgb(id);
+    let image = Style::default().fg(Color::Rgb(r, gr, b));
+    // Cell 0 is the blank after the border, 1 the dot's, 2 the blank after the dot.
+    let start = 1 - usize::from(g.before.min(1));
+    let mut spans = vec![Span::styled("│", border)];
+    for cell in 0..3_usize {
+        match cell.checked_sub(start).filter(|col| *col < usize::from(g.cols)) {
+            Some(col) => spans.push(Span::styled(crate::avatar::placeholder_cell(col), image)),
+            None => spans.push(Span::raw(" ")),
+        }
+    }
+    spans
 }
 
 /// `spans` cut to at most `max` display columns, and the width they then occupy.
@@ -4842,6 +4891,7 @@ fn push_card(
     card: Card,
     width: usize,
     selected: bool,
+    avatar: Option<crate::avatar::Geometry>,
     p: &Palette,
 ) {
     let boxed = width >= MIN_BOX_WIDTH;
@@ -4863,6 +4913,9 @@ fn push_card(
         content.cols.push((0, None));
     }
     let first = base + 1;
+    if boxed {
+        content.avatars.extend(card.avatars.into_iter().map(|(row, url)| (first + row, url)));
+    }
     for (row, (line, rail)) in card.lines.into_iter().enumerate() {
         let snip = card.snippets.iter().find(|(r, _)| r.contains(&row)).map_or(0, |(_, w)| *w);
         if !boxed {
@@ -4878,12 +4931,17 @@ fn push_card(
             Span::styled(sp.content, style)
         });
         let (text, used) = fit_spans(patched.collect(), cw);
-        let rail = match rail {
-            Rail::Blank => Span::raw("  "),
-            Rail::Dot(color) => Span::styled("● ", Style::default().fg(color)),
-            Rail::Line => Span::styled("│ ", Style::default().fg(p.dim2)),
+        let mut spans = match (rail, avatar) {
+            (Rail::Dot(_, Some(id)), Some(g)) => avatar_cells(id, g, border),
+            (rail, _) => {
+                let rail = match rail {
+                    Rail::Blank => Span::raw("  "),
+                    Rail::Dot(color, _) => Span::styled("● ", Style::default().fg(color)),
+                    Rail::Line => Span::styled("│ ", Style::default().fg(p.dim2)),
+                };
+                vec![Span::styled("│ ", border), rail]
+            }
         };
-        let mut spans = vec![Span::styled("│ ", border), rail];
         spans.extend(text);
         spans.push(Span::styled(" ".repeat(cw - used), fill));
         spans.push(Span::styled(" │", border));
@@ -4982,6 +5040,7 @@ fn pr_read_content(app: &App, inner: Rect) -> PrReadContent {
         body_meta: Vec::new(),
         cols: Vec::new(),
         tops: Vec::new(),
+        avatars: Vec::new(),
     };
     let Some(s) = app.pr_snapshot().filter(|s| app.pr_has_description() || !s.comments.is_empty())
     else {
@@ -5025,7 +5084,8 @@ fn pr_read_content(app: &App, inner: Rect) -> PrReadContent {
         content.tops.push(content.lines.len());
         let selected = app.pr_cursor == i + offset;
         let card = build_card(app, cm, cw, p);
-        push_card(&mut content, card_header(cm, selected, p), card, width, selected, p);
+        let header = card_header(cm, selected, p);
+        push_card(&mut content, header, card, width, selected, app.avatar_geometry(), p);
     }
     content
 }
@@ -5069,6 +5129,11 @@ fn render_pr_read(frame: &mut Frame, app: &App, pane: Pane) {
     let max = content.lines.len().saturating_sub(body.height as usize);
     app.note_pr_read_max_scroll(max);
     let scroll = app.settle_pr_read_scroll(&content.tops, max);
+    app.clear_painted_avatars();
+    let visible = scroll..scroll + body.height as usize;
+    for (_, url) in content.avatars.iter().filter(|(line, _)| visible.contains(line)) {
+        app.note_painted_avatar(url);
+    }
     for (row, col, rendered) in &content.body_meta {
         let col = (*col as u16).min(body.width);
         let shifted = Rect::new(body.x + col, body.y, body.width - col, body.height);

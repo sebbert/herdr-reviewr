@@ -66,7 +66,7 @@ impl Config {
     }
 }
 
-const PLUGIN_CONFIG_KEYS: [&str; 14] = [
+const PLUGIN_CONFIG_KEYS: [&str; 17] = [
     "theme",
     "default_scope",
     "navigator_position",
@@ -75,6 +75,9 @@ const PLUGIN_CONFIG_KEYS: [&str; 14] = [
     "split_ratio",
     "auto_open",
     "pane_outer_borders",
+    "avatars",
+    "avatar_width",
+    "avatar_fit",
     "github_host",
     "gitlab_host",
     "azure_devops_host",
@@ -199,6 +202,13 @@ pub struct PluginConfig {
     /// herdr's `[ui] pane_outer_borders` for reviewr's own panes: `false` drops every border
     /// on the reviewr pane's outer edge, keeping one divider between the tiled panes.
     pane_outer_borders: bool,
+    /// Opt-in: paint each PR conversation turn's dot as the author's avatar where the
+    /// terminal speaks the Kitty graphics protocol.
+    avatars: bool,
+    /// The avatar's width in cells, 1 (the dot's own cell) or 2 (the dot and the space after).
+    avatar_width: u8,
+    /// Whether the avatar's circle is as tall as the row or as wide as its cells.
+    avatar_fit: crate::avatar::Fit,
     github_host: Option<String>,
     gitlab_host: Option<String>,
     azure_devops_host: Option<String>,
@@ -218,6 +228,9 @@ impl Default for PluginConfig {
             split_ratio: SplitRatio::default(),
             auto_open: true,
             pane_outer_borders: true,
+            avatars: false,
+            avatar_width: 1,
+            avatar_fit: crate::avatar::Fit::Height,
             github_host: None,
             gitlab_host: None,
             azure_devops_host: None,
@@ -261,6 +274,18 @@ impl PluginConfig {
 
     pub fn pane_outer_borders(&self) -> bool {
         self.pane_outer_borders
+    }
+
+    pub fn avatars(&self) -> bool {
+        self.avatars
+    }
+
+    pub fn avatar_width(&self) -> u8 {
+        self.avatar_width
+    }
+
+    pub fn avatar_fit(&self) -> crate::avatar::Fit {
+        self.avatar_fit
     }
 
     pub fn github_host(&self) -> Option<&str> {
@@ -318,6 +343,9 @@ impl PluginConfig {
             "split_ratio": self.split_ratio.get(),
             "auto_open": self.auto_open,
             "pane_outer_borders": self.pane_outer_borders,
+            "avatars": self.avatars,
+            "avatar_width": self.avatar_width,
+            "avatar_fit": self.avatar_fit.as_str(),
             "github_host": self.github_host,
             "gitlab_host": self.gitlab_host,
             "azure_devops_host": self.azure_devops_host,
@@ -493,6 +521,25 @@ fn parse_plugin_config(path: &Path) -> Result<PluginConfig, PluginConfigError> {
     if let Some(value) = table.get("pane_outer_borders") {
         config.pane_outer_borders =
             value.as_bool().ok_or_else(|| value_error(path, "pane_outer_borders", "a boolean"))?;
+    }
+    if let Some(value) = table.get("avatars") {
+        config.avatars =
+            value.as_bool().ok_or_else(|| value_error(path, "avatars", "a boolean"))?;
+    }
+    if let Some(value) = table.get("avatar_width") {
+        config.avatar_width = match value.as_integer() {
+            Some(1) => 1,
+            Some(2) => 2,
+            _ => return Err(value_error(path, "avatar_width", "1 or 2")),
+        };
+    }
+    if let Some(value) = table.get("avatar_fit") {
+        let expected = "one of height, width";
+        config.avatar_fit = match string_value(path, "avatar_fit", value, expected)? {
+            "height" => crate::avatar::Fit::Height,
+            "width" => crate::avatar::Fit::Width,
+            _ => return Err(value_error(path, "avatar_fit", expected)),
+        };
     }
     if let Some(value) = table.get("github_host") {
         config.github_host = Some(parse_forge_host(path, "github_host", value)?);
@@ -816,6 +863,9 @@ mod tests {
         assert_eq!(config.split_ratio(), super::SplitRatio(0.4));
         assert!(config.auto_open());
         assert!(config.pane_outer_borders(), "today's framed look by default");
+        assert!(!config.avatars(), "avatars are opt-in");
+        assert_eq!(config.avatar_width(), 1);
+        assert_eq!(config.avatar_fit(), crate::avatar::Fit::Height);
         assert_eq!(config.github_host(), None);
         assert_eq!(config.url_opener(), None);
     }
@@ -834,6 +884,9 @@ mod tests {
                 "split_ratio = 0.33\n",
                 "auto_open = false\n",
                 "pane_outer_borders = false\n",
+                "avatars = true\n",
+                "avatar_width = 2\n",
+                "avatar_fit = \"width\"\n",
                 "github_host = \"GitHub.Example.COM\"\n",
             ),
         )
@@ -848,6 +901,12 @@ mod tests {
         assert!(!config.auto_open());
         assert!(!config.pane_outer_borders());
         assert_eq!(config.to_json()["pane_outer_borders"], false);
+        assert!(config.avatars());
+        assert_eq!(config.avatar_width(), 2);
+        assert_eq!(config.to_json()["avatars"], true);
+        assert_eq!(config.to_json()["avatar_width"], 2);
+        assert_eq!(config.avatar_fit(), crate::avatar::Fit::Width);
+        assert_eq!(config.to_json()["avatar_fit"], "width");
         assert_eq!(config.github_host(), Some("github.example.com"));
     }
 
@@ -942,6 +1001,14 @@ mod tests {
             ("auto_open = \"yes\"\n", "`auto_open`"),
             ("pane_outer_borders = \"false\"\n", "`pane_outer_borders`"),
             ("pane_outer_borders = 0\n", "`pane_outer_borders`"),
+            ("avatars = \"yes\"\n", "`avatars`"),
+            ("avatar_width = 0\n", "`avatar_width`"),
+            ("avatar_width = 3\n", "`avatar_width`"),
+            ("avatar_width = 1.5\n", "`avatar_width`"),
+            ("avatar_width = \"2\"\n", "`avatar_width`"),
+            ("avatar_fit = \"cover\"\n", "`avatar_fit`"),
+            ("avatar_fit = \"Height\"\n", "`avatar_fit`"),
+            ("avatar_fit = 1\n", "`avatar_fit`"),
             ("github_host = \"https://github.example.com\"\n", "`github_host`"),
             ("editor = \"\"\n", "`editor`"),
             ("editor = \"   \"\n", "`editor`"),

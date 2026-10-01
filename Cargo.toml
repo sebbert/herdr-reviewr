@@ -15,6 +15,8 @@ categories = ["command-line-utilities", "development-tools"]
 anyhow = "1"
 dirs = "7"
 fff-search = "0.11.0"
+# Avatar decoding only: the formats forge avatar hosts serve, no encoders, no rayon.
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp"] }
 # The matcher fff-search scores with: the base picker ranks branch names by the same rule
 # as the search screen, over a plain string list.
 neo_frizbee = "0.13.3"

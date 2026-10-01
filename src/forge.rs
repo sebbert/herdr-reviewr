@@ -234,6 +234,9 @@ pub struct Comment {
     pub is_outdated: bool,
     /// Replies after the root, oldest first. Empty for a single card.
     pub replies: Vec<Reply>,
+    /// The author's avatar image URL as the forge names it — a string only: the PR fetch
+    /// never downloads it (the avatar worker does, after the snapshot paints).
+    pub avatar_url: Option<String>,
 }
 
 /// One reply on a thread. The root lives on [`Comment`].
@@ -243,6 +246,8 @@ pub struct Reply {
     pub author_is_bot: bool,
     pub body: String,
     pub created_at: String,
+    /// The author's avatar image URL, as on [`Comment::avatar_url`].
+    pub avatar_url: Option<String>,
 }
 
 /// What a comment is anchored to.
@@ -1056,11 +1061,11 @@ fn build_detail_query(number: u64) -> String {
          headRefOid isCrossRepository \
          commits(last:1){{nodes{{commit{{statusCheckRollup{{contexts(first:100){{pageInfo{{hasNextPage}} nodes{{__typename \
          ... on CheckRun{{name status conclusion}} ... on StatusContext{{context state}}}}}}}}}}}}}} \
-         reviews(last:100){{pageInfo{{hasPreviousPage}} nodes{{author{{login}} body state submittedAt}}}} \
-         comments(last:100){{pageInfo{{hasPreviousPage}} nodes{{author{{login}} body createdAt}}}} \
+         reviews(last:100){{pageInfo{{hasPreviousPage}} nodes{{author{{login avatarUrl(size:64)}} body state submittedAt}}}} \
+         comments(last:100){{pageInfo{{hasPreviousPage}} nodes{{author{{login avatarUrl(size:64)}} body createdAt}}}} \
          reviewThreads(last:100){{pageInfo{{hasPreviousPage}} nodes{{id isResolved isOutdated path \
          startLine line originalStartLine originalLine diffSide \
-         comments(first:100){{pageInfo{{hasNextPage endCursor}} nodes{{author{{login}} body createdAt diffHunk}}}}}}}}}}}}}}"
+         comments(first:100){{pageInfo{{hasNextPage endCursor}} nodes{{author{{login avatarUrl(size:64)}} body createdAt diffHunk}}}}}}}}}}}}}}"
     )
 }
 
@@ -1546,6 +1551,7 @@ fn merge_comments(reviews: &Value, issues: &Value, threads: &Value) -> Vec<Comme
             is_resolved: t["isResolved"].as_bool().unwrap_or(false),
             is_outdated: t["isOutdated"].as_bool().unwrap_or(false),
             replies: replies_from_nodes(&nodes[root_i..]),
+            avatar_url: avatar_url(&root["author"]["avatarUrl"]),
         });
     }
 
@@ -1561,7 +1567,18 @@ fn prose_comment(
 ) -> Comment {
     let login = user["login"].as_str().unwrap_or("").to_string();
     let bot = is_bot(&login);
-    prose_row(kind, login, bot, body, created_at.unwrap_or("").to_string())
+    let mut row = prose_row(kind, login, bot, body, created_at.unwrap_or("").to_string());
+    row.avatar_url = avatar_url(&user["avatarUrl"]);
+    row
+}
+
+/// An avatar URL field, kept only when it is an `http(s)` URL — anything else stays a dot.
+pub(crate) fn avatar_url(value: &Value) -> Option<String> {
+    value
+        .as_str()
+        .map(str::trim)
+        .filter(|url| url.starts_with("https://") || url.starts_with("http://"))
+        .map(str::to_string)
 }
 
 pub(crate) fn finding_anchor(path: &str, start: Option<u64>, end: Option<u64>) -> String {
@@ -1633,6 +1650,7 @@ pub(crate) fn prose_row(
         is_resolved: false,
         is_outdated: false,
         replies: Vec::new(),
+        avatar_url: None,
     }
 }
 
@@ -1652,6 +1670,7 @@ fn replies_from_nodes(nodes: &[Value]) -> Vec<Reply> {
                 author: login,
                 body: body.to_string(),
                 created_at: n["createdAt"].as_str().unwrap_or("").to_string(),
+                avatar_url: avatar_url(&n["author"]["avatarUrl"]),
             })
         })
         .collect()
@@ -2323,6 +2342,41 @@ mod tests {
     }
 
     #[test]
+    fn every_surface_carries_its_authors_avatar_url_as_a_string() {
+        let reviews = serde_json::json!([
+            {"author": {"login": "ann", "avatarUrl": "https://avatars.githubusercontent.com/u/1?s=64"},
+             "state": "APPROVED", "body": "", "submittedAt": "2026-06-27T09:00:00Z"}
+        ]);
+        let issues = serde_json::json!([
+            {"author": {"login": "bob", "avatarUrl": "javascript:alert(1)"}, "body": "hi",
+             "createdAt": "2026-06-27T10:00:00Z"}
+        ]);
+        let threads = serde_json::json!([
+            {"isResolved": false, "isOutdated": false, "path": "a.rs", "line": 1,
+             "comments": {"nodes": [
+                {"author": {"login": "cat", "avatarUrl": "https://avatars.example/cat"},
+                 "body": "root", "createdAt": "2026-06-27T11:00:00Z"},
+                {"author": {"login": "dan", "avatarUrl": "https://avatars.example/dan"},
+                 "body": "reply", "createdAt": "2026-06-27T11:30:00Z"}
+             ]}}
+        ]);
+        let cs = merge_comments(&reviews, &issues, &threads);
+        let urls: Vec<_> = cs.iter().map(|c| c.avatar_url.as_deref()).collect();
+        assert_eq!(
+            urls,
+            [
+                Some("https://avatars.githubusercontent.com/u/1?s=64"),
+                None, // not an http(s) URL: a dot
+                Some("https://avatars.example/cat"),
+            ]
+        );
+        assert_eq!(cs[2].replies[0].avatar_url.as_deref(), Some("https://avatars.example/dan"));
+        // The query asks for small avatars on every author it reads.
+        let query = build_detail_query(1);
+        assert_eq!(query.matches("author{login avatarUrl(size:64)}").count(), 3, "{query}");
+    }
+
+    #[test]
     fn a_bodyless_review_lands_only_when_it_carries_a_verdict() {
         let reviews = serde_json::json!([
             {"author": {"login": "ann"}, "state": "APPROVED", "body": "", "submittedAt": "2026-06-27T10:00:00Z"},
@@ -2491,6 +2545,7 @@ mod tests {
             is_resolved: false,
             is_outdated: false,
             replies: Vec::new(),
+            avatar_url: None,
         };
         let mut out = vec![
             row(CommentKind::Review, "review", "approved", ""),

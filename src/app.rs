@@ -735,6 +735,16 @@ pub struct App {
     /// The link regions painted this frame — a click resolves against the painted
     /// frame.
     painted_links: std::cell::RefCell<Vec<PaintedLink>>,
+    /// Every avatar this session asked for, keyed by URL (`crate::avatar`). Session memory:
+    /// a config recovery carries it, so nothing transmitted is ever orphaned.
+    pub avatars: crate::avatar::Store,
+    /// Whether the terminal answered the Kitty graphics probe: `None` until it answers or
+    /// the window passes. Dots meanwhile.
+    pub avatar_graphics: Option<bool>,
+    /// The terminal's cell size in pixels, read when avatars first need it and after a resize.
+    pub avatar_cell: Option<(u16, u16)>,
+    /// The avatar URLs on the turns painted this frame, top first — the order downloads start.
+    painted_avatars: std::cell::RefCell<Vec<String>>,
     /// The read pane's display-line layout as painted this frame (`ui::read_layout`) — the
     /// recording every read-pane hit test indexes, so no map can disagree with the screen.
     /// A mid-event scroll re-runs the walk (`ui::refresh_read_layout`)
@@ -965,6 +975,10 @@ impl App {
             preview_scrolled: false,
             pane_width: std::cell::Cell::new(0),
             painted_links: std::cell::RefCell::new(Vec::new()),
+            avatars: crate::avatar::Store::default(),
+            avatar_graphics: None,
+            avatar_cell: None,
+            painted_avatars: std::cell::RefCell::new(Vec::new()),
             painted_slots: std::cell::RefCell::new(Vec::new()),
             painted_anchors: std::cell::RefCell::new(Vec::new()),
             painted_details: std::cell::RefCell::new(Vec::new()),
@@ -1142,6 +1156,9 @@ impl App {
             self.focus = Focus::Diff;
         }
         self.search_pct = old.search_pct;
+        self.avatars = std::mem::take(&mut old.avatars);
+        self.avatar_graphics = old.avatar_graphics;
+        self.avatar_cell = old.avatar_cell;
         // A tab switch requested its refresh and recovery landed first: the carried fields
         // below may reinstate the stale stashed frame, so the pending request must survive
         // the swap or that frame never refreshes until the next poll.
@@ -2171,6 +2188,71 @@ impl App {
     #[must_use]
     pub fn pane_outer_borders(&self) -> bool {
         self.plugin_config().is_none_or(crate::config::PluginConfig::pane_outer_borders)
+    }
+
+    /// The avatar width in cells when avatars paint: the config opted in and the terminal
+    /// answered the graphics probe. `None` paints dots.
+    #[must_use]
+    pub fn avatar_cols(&self) -> Option<u8> {
+        let config = self.plugin_config().filter(|c| c.avatars())?;
+        (self.avatar_graphics == Some(true)).then(|| config.avatar_width())
+    }
+
+    /// Where avatars paint around the dot this frame, when they paint at all.
+    #[must_use]
+    pub fn avatar_geometry(&self) -> Option<crate::avatar::Geometry> {
+        let cols = self.avatar_cols()?;
+        let fit = self.plugin_config()?.avatar_fit();
+        let cell = self.avatar_cell.unwrap_or(crate::avatar::FALLBACK_CELL);
+        Some(crate::avatar::geometry(cell, cols, fit))
+    }
+
+    /// Whether the config asks for avatars at all — the gate on the probe and every download.
+    #[must_use]
+    pub fn avatars_wanted(&self) -> bool {
+        self.plugin_config().is_some_and(crate::config::PluginConfig::avatars)
+    }
+
+    /// The image id to paint for `url` in place of a dot, when avatars paint and it is on the
+    /// terminal.
+    #[must_use]
+    pub fn avatar_id(&self, url: Option<&str>) -> Option<u32> {
+        self.avatar_cols()?;
+        self.avatars.painted_id(url?)
+    }
+
+    /// Note an avatar URL on a turn painted this frame.
+    pub(crate) fn note_painted_avatar(&self, url: &str) {
+        let mut painted = self.painted_avatars.borrow_mut();
+        if !painted.iter().any(|u| u == url) {
+            painted.push(url.to_string());
+        }
+    }
+
+    pub(crate) fn clear_painted_avatars(&self) {
+        self.painted_avatars.borrow_mut().clear();
+    }
+
+    /// The avatar URLs not yet asked for: the painted turns' first, top down, then the rest
+    /// of the conversation's, oldest first. Empty unless avatars paint.
+    #[must_use]
+    pub fn avatar_requests(&self) -> Vec<String> {
+        if self.avatar_cols().is_none() {
+            return Vec::new();
+        }
+        let Some(s) = self.pr_snapshot() else { return Vec::new() };
+        let all = s.comments.iter().flat_map(|c| {
+            std::iter::once(c.avatar_url.as_deref())
+                .chain(c.replies.iter().map(|r| r.avatar_url.as_deref()))
+        });
+        let mut out: Vec<String> = Vec::new();
+        let painted = self.painted_avatars.borrow();
+        for url in painted.iter().map(String::as_str).chain(all.flatten()) {
+            if self.avatars.is_new(url) && !out.iter().any(|u| u == url) {
+                out.push(url.to_string());
+            }
+        }
+        out
     }
 
     /// The navigator share remembered for the active side or stacked axis.

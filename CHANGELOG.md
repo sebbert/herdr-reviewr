@@ -7,6 +7,17 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ## [Unreleased]
 
 ### Added
+- **Opt-in author avatars on the PR tab.** With `avatars = true` (off by default), each comment
+  author's avatar replaces the `●` on the thread timeline, as a round picture through the
+  Kitty graphics protocol's Unicode placeholders, so herdr and Ghostty can show it.
+  `avatar_width` (1 or 2 cells, default 1) and `avatar_fit` (`height` or `width`, default
+  `height`) size it. At height fit the circle fills the row and spills into the blank cells
+  beside the dot, never over a border or text. Nothing waits on an avatar. The PR paints
+  with dots at once, and reviewr asks the terminal once without blocking. The avatars download on
+  their own worker (four `curl`s at a time, visible cards first) and each swaps in when it lands.
+  A terminal that never answers, a failed download, or an Azure DevOps avatar that needs a
+  sign-in keeps the dot. reviewr deletes its images on exit and before handing the pane to a
+  terminal editor. `cargo run --example avatar_check` checks a terminal by hand.
 - **`pane_outer_borders = false` drops reviewr's pane frames**, matching herdr's `[ui]` key of
   the same name. One divider line stays between the two panes and follows every navigator
   position. Each pane keeps its title on a top row of its own, and the focused pane's title

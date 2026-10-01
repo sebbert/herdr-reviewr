@@ -9,6 +9,7 @@
 //! [`app::App`] methods and renders with [`ui`].
 
 pub mod app;
+pub mod avatar;
 pub mod azure_devops;
 pub mod browser;
 pub mod config;
@@ -292,6 +293,9 @@ fn run_editor(
     // raw mode is a signal, not a key. That gap is the editor's own startup and reviewr adds
     // nothing to it.
     app.forget_pointer();
+    // The editor gets a clean pane: no avatar of reviewr's under its text. The next tick
+    // re-transmits them on the way back.
+    write_terminal(&app.avatars.deletions());
     release_terminal(kbd);
     let launched = cmd.status();
     claim_terminal(kbd);
@@ -856,6 +860,110 @@ fn glyph_clears(lit_for: Duration) -> bool {
 /// build's own speed — shared by the world and search workers.
 const WORKER_TIGHT_WAKE: Duration = Duration::from_millis(15);
 
+/// The wake while an avatar download or the graphics probe is out: an avatar is a
+/// cosmetic swap, so a looser beat than a worker landing that the reviewer waits on.
+const AVATAR_WAKE: Duration = Duration::from_millis(50);
+
+/// The loop's avatar side (`crate::avatar`): the graphics probe, the download worker, and
+/// the out-of-band terminal writes. Everything here writes or polls; nothing waits — not on
+/// the probe's answer, not on a download, not on a decode.
+#[derive(Default)]
+struct AvatarHost {
+    probe: crate::avatar::ProbeFilter,
+    probe_sent: bool,
+    fetcher: Option<crate::avatar::Fetcher>,
+}
+
+impl AvatarHost {
+    /// Run before every draw: land finished downloads and transmit them, so this draw's
+    /// placeholder cells name images the terminal holds. Avatars switched off in the config
+    /// delete whatever was sent.
+    fn before_draw(&mut self, app: &mut App) {
+        if !app.avatars_wanted() {
+            write_terminal(&app.avatars.deletions());
+            return;
+        }
+        self.probe.expire(Instant::now());
+        app.avatar_graphics = self.probe.answer();
+        if app.avatar_cols().is_none() {
+            return;
+        }
+        if app.avatar_cell.is_none() {
+            app.avatar_cell = Some(cell_pixels());
+        }
+        if let Some(fetcher) = &self.fetcher {
+            while let Some((url, image)) = fetcher.try_recv() {
+                app.avatars.land(url, image);
+            }
+        }
+        if let Some(geometry) = app.avatar_geometry() {
+            write_terminal(&app.avatars.transmissions(geometry));
+        }
+    }
+
+    /// Run after every draw: send the probe once avatars are wanted, and request the
+    /// missing URLs — the turns this frame painted first, so the visible cards fill in first.
+    /// The PR snapshot has already painted with dots by the time anything is asked for.
+    fn after_draw(&mut self, app: &mut App) {
+        if !app.avatars_wanted() {
+            return;
+        }
+        if !self.probe_sent {
+            self.probe_sent = true;
+            self.probe.start(Instant::now());
+            write_terminal(crate::avatar::PROBE.as_bytes());
+        }
+        let requests = app.avatar_requests();
+        if requests.is_empty() {
+            return;
+        }
+        let fetcher =
+            self.fetcher.get_or_insert_with(|| crate::avatar::Fetcher::spawn(crate::avatar::curl));
+        for url in requests {
+            app.avatars.mark_requested(&url);
+            fetcher.request(&url);
+        }
+    }
+
+    /// Whether the loop should keep waking for avatar work: the probe's window, or downloads.
+    fn busy(&self, app: &App) -> bool {
+        app.avatars_wanted() && (self.probe.waiting() || app.avatars.pending())
+    }
+
+    /// Swallow a key that is part of the probe's reply, which the input parser reads as an
+    /// `Alt+_`, payload, `Alt+\` run (`crate::avatar::ProbeFilter`).
+    fn swallows(&mut self, event: &Event) -> bool {
+        let Event::Key(k) = event else { return false };
+        let KeyCode::Char(ch) = k.code else { return false };
+        if k.kind != KeyEventKind::Press {
+            return false;
+        }
+        let alt = k.modifiers.contains(KeyModifiers::ALT);
+        self.probe.feed(ch, alt) == crate::avatar::Fed::Swallowed
+    }
+}
+
+/// The terminal's cell size in pixels from the window-size ioctl, or the fallback when the
+/// pty reports no pixel size.
+fn cell_pixels() -> (u16, u16) {
+    match ratatui::crossterm::terminal::window_size() {
+        Ok(w) if w.columns > 0 && w.rows > 0 && w.width >= w.columns && w.height >= w.rows => {
+            (w.width / w.columns, w.height / w.rows)
+        }
+        _ => crate::avatar::FALLBACK_CELL,
+    }
+}
+
+/// Write out-of-band escape sequences between frames. A failed write leaves dots.
+fn write_terminal(bytes: &[u8]) {
+    use std::io::Write;
+    if bytes.is_empty() {
+        return;
+    }
+    let mut out = io::stdout().lock();
+    let _ = out.write_all(bytes).and_then(|()| out.flush());
+}
+
 /// The wake while a world job is in flight: tight for a building job so its landing paints
 /// near the build's own speed, the fetch cadence for a sample-only one.
 fn world_wake(builds: bool) -> Duration {
@@ -911,6 +1019,7 @@ fn event_loop(
     let mut config_epoch = 0_u64;
     let mut status_at = Instant::now();
     let mut last_status = String::new();
+    let mut avatars = AvatarHost::default();
     // Fetch the PR snapshot as soon as the panel opens, not on first switching to the tab, so the
     // tab is already populated when the user gets there.
     app.pr_pending = None;
@@ -1019,7 +1128,9 @@ fn event_loop(
             }
             app.bound_file_scroll(file_vp);
             let painted_frame = PaintedFrameSnapshot::capture(app);
+            avatars.before_draw(app);
             terminal.draw(|f| ui::render(f, app))?;
+            avatars.after_draw(app);
 
             // A world completion reconciles into the view only while the view it described is
             // still current; the worker's baseline is authoritative either way.
@@ -1276,6 +1387,9 @@ fn event_loop(
             if let Some(started) = pr.wait_started {
                 timeout = timeout.min(INDICATOR_DELAY.saturating_sub(started.elapsed()));
             }
+            if avatars.busy(app) {
+                timeout = timeout.min(AVATAR_WAKE);
+            }
             if app.config_error().is_none()
                 && let Some(wait) = app.base_probe_wait()
             {
@@ -1290,6 +1404,9 @@ fn event_loop(
                     continue;
                 }
                 let event = event::read()?;
+                if avatars.swallows(&event) {
+                    continue;
+                }
                 if app.config_error().is_some() {
                     handle_blocked_event(app, &event);
                     continue;
@@ -1398,6 +1515,8 @@ fn event_loop(
         }
         Ok(())
     })();
+    // Nothing reviewr transmitted outlives it in the herdr pane.
+    write_terminal(&app.avatars.deletions());
     restore_terminal(kbd);
     drain_pr_shutdown(&mut pr, &probe_rx, &pr_rx);
     result
@@ -1943,6 +2062,9 @@ fn handle_resize(app: &mut App) {
     app.cancel_gesture();
     app.clear_settled_selection();
     app.hover = None;
+    // A resize can change the cell size and may drop images: measure again and re-send.
+    app.avatars.forget_sent();
+    app.avatar_cell = None;
 }
 
 /// Route a mouse-down over selectable text: it arms the text gesture, carrying its

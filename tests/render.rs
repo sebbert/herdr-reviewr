@@ -1693,6 +1693,7 @@ fn the_read_pane_shows_the_description_then_every_comment_oldest_first() {
                 author_is_bot: false,
                 body: "THREAD_REPLY".into(),
                 created_at: "2026-06-27T10:30:00Z".into(),
+                avatar_url: None,
             }],
             ..common::comment()
         },
@@ -2532,6 +2533,7 @@ fn a_finding_paints_its_replies_in_the_read_pane() {
                 author_is_bot: false,
                 body: "Addressed in abc".into(),
                 created_at: "2026-06-27T11:30:00Z".into(),
+                avatar_url: None,
             }],
             ..common::comment()
         }],
@@ -4867,5 +4869,127 @@ fn a_borderless_divider_drags_to_the_mouse_and_the_read_thumb_never_covers_text(
         if position == NavigatorPosition::Right {
             assert!(ui::hit_divider(area, &app, col, read.y), "on the divider");
         }
+    }
+}
+
+/// Load a config with avatars on at `width` and `fit`, the terminal's graphics answer `graphics`.
+fn with_avatars(app: &mut App, width: u8, fit: &str, graphics: Option<bool>) {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("config.toml"),
+        format!("avatars = true\navatar_width = {width}\navatar_fit = \"{fit}\"\n"),
+    )
+    .unwrap();
+    app.set_plugin_config(herdr_reviewr::config::plugin_config_in(dir.path()).unwrap());
+    app.avatar_graphics = graphics;
+    app.avatar_cell = Some((10, 20));
+}
+
+/// A PR tab whose one comment and its reply carry avatar URLs.
+fn avatar_pr_app() -> App {
+    use herdr_reviewr::forge::{Comment, PrSnapshot, PrView, Reply};
+    let mut app = edited_app();
+    app.set_tab(Tab::Pr).unwrap();
+    app.pr = PrView::Pr(Box::new(PrSnapshot {
+        comments: vec![Comment {
+            body: "ROOT_BODY".into(),
+            avatar_url: Some("https://avatars.example/ann.png".into()),
+            replies: vec![Reply {
+                author: "bob".into(),
+                author_is_bot: false,
+                body: "REPLY_BODY".into(),
+                created_at: "2026-06-27T11:00:00Z".into(),
+                avatar_url: Some("https://avatars.example/bob.png".into()),
+            }],
+            ..common::comment()
+        }],
+        ..common::pr_snapshot()
+    }));
+    app
+}
+
+#[test]
+fn a_pr_paints_its_dots_while_avatars_are_unavailable_or_still_downloading() {
+    let plain = avatar_pr_app();
+    let today = render_buffer(&plain);
+
+    // Opted in, but the terminal has not answered the probe (or said no): today's frame.
+    for graphics in [None, Some(false)] {
+        let mut app = avatar_pr_app();
+        with_avatars(&mut app, 1, "height", graphics);
+        assert_eq!(render_buffer(&app), today, "graphics {graphics:?}: byte-identical");
+    }
+
+    // Graphics on, the worker stalled: the snapshot paints straight away, every turn a dot.
+    let mut app = avatar_pr_app();
+    with_avatars(&mut app, 2, "height", Some(true));
+    let requests = app.avatar_requests();
+    assert_eq!(requests.len(), 2, "both turns' avatars are wanted: {requests:?}");
+    for url in &requests {
+        app.avatars.mark_requested(url);
+    }
+    assert!(app.avatars.pending());
+    assert_eq!(render_buffer(&app), today, "pending downloads paint dots");
+    assert!(app.avatar_requests().is_empty(), "nothing asked for twice");
+
+    // A failed download stays a dot.
+    for url in requests {
+        app.avatars.land(url, None);
+    }
+    assert_eq!(render_buffer(&app), today);
+}
+
+#[test]
+fn a_landed_avatar_covers_the_dots_cells_and_its_blank_neighbours_only() {
+    let plain = avatar_pr_app();
+    let today = dump(&render_buffer(&plain));
+    let row_of = |out: &str, needle: &str| out.lines().position(|l| l.contains(needle)).unwrap();
+    let ann_row = row_of(&today, "● @ann");
+    let border_x = today.lines().nth(ann_row).unwrap().chars().position(|c| c == '●').unwrap() - 2;
+
+    // (width, fit, the covered cells after the border as placeholder column numbers).
+    for (width, fit, expected) in [
+        (1, "height", [Some(0), Some(1), Some(2)]),
+        (2, "height", [None, Some(0), Some(1)]),
+        (1, "width", [None, Some(0), None]),
+        (2, "width", [None, Some(0), Some(1)]),
+    ] {
+        let mut app = avatar_pr_app();
+        with_avatars(&mut app, width, fit, Some(true));
+        let source = image::RgbaImage::from_pixel(16, 16, image::Rgba([9, 9, 9, 255]));
+        for url in app.avatar_requests() {
+            app.avatars.mark_requested(&url);
+            app.avatars.land(url, Some(source.clone()));
+        }
+        let geometry = app.avatar_geometry().unwrap();
+        assert!(!app.avatars.transmissions(geometry).is_empty());
+
+        let buf = render_buffer(&app);
+        let out = dump(&buf);
+        let y = ann_row as u16;
+        let id = buf[(border_x as u16 + 2, y)].fg;
+        for (cell, col) in expected.iter().enumerate() {
+            let c = &buf[(border_x as u16 + 1 + cell as u16, y)];
+            match col {
+                Some(col) => {
+                    let mark = ['\u{0305}', '\u{030D}', '\u{030E}'][*col];
+                    let want = format!("\u{10EEEE}\u{0305}{mark}");
+                    assert_eq!(c.symbol(), want, "{width}/{fit}: cell {cell}");
+                    assert_eq!(c.fg, id, "one image across the placement");
+                }
+                None => assert_eq!(c.symbol(), " ", "{width}/{fit}: cell {cell} stays blank"),
+            }
+        }
+        assert!(matches!(id, ratatui::style::Color::Rgb(..)), "the id rides the foreground");
+        // No layout shift: the border, the byline text, and the body sit where they did.
+        assert_eq!(buf[(border_x as u16, y)].symbol(), "│");
+        let today_buf = render_buffer(&plain);
+        let text_at = |b: &Buffer| cells(b, border_x as u16 + 4, y, 40);
+        assert_eq!(text_at(&buf), text_at(&today_buf), "{width}/{fit}: the text never moves");
+        assert!(text_at(&buf).starts_with("@ann · "));
+        assert_eq!(row_of(&out, "REPLY_BODY"), row_of(&today, "REPLY_BODY"));
+        // The reply's byline has its own avatar, a different image.
+        let bob_row = row_of(&today, "● @bob") as u16;
+        assert_ne!(buf[(border_x as u16 + 2, bob_row)].fg, id, "each author their own image");
     }
 }

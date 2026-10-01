@@ -7088,6 +7088,7 @@ fn a_drag_across_a_comment_box_copies_its_text_without_the_border() {
                 author_is_bot: false,
                 body: "gamma".into(),
                 created_at: "2026-06-27T11:00:00Z".into(),
+                avatar_url: None,
             }],
             ..common::comment()
         }],
@@ -7133,6 +7134,44 @@ fn a_borderless_read_pane_drag_copies_from_its_first_painted_cell() {
     sel_mouse(&mut app, MouseEventKind::Drag(MouseButton::Left), inner.x + 40, inner.y);
     sel_mouse(&mut app, MouseEventKind::Up(MouseButton::Left), inner.x + 40, inner.y);
     assert_eq!(last_copy().as_deref(), Some("alpha beta"));
+}
+
+#[test]
+fn a_drag_across_an_avatar_byline_copies_the_text_never_the_image_cells() {
+    use herdr_reviewr::app::Tab;
+    use herdr_reviewr::forge::{Comment, PrSnapshot, PrView};
+    let r = Repo::init();
+    r.write("x.rs", "y\n");
+    r.commit_all("init");
+    let mut app = app_on(&r);
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("config.toml"), "avatars = true\n").unwrap();
+    app.set_plugin_config(herdr_reviewr::config::plugin_config_in(dir.path()).unwrap());
+    app.avatar_graphics = Some(true);
+    app.avatar_cell = Some((10, 20));
+    app.set_tab(Tab::Pr).unwrap();
+    app.apply_pr(PrView::Pr(Box::new(PrSnapshot {
+        comments: vec![Comment {
+            body: "alpha beta".into(),
+            avatar_url: Some("https://avatars.example/ann.png".into()),
+            ..common::comment()
+        }],
+        ..common::pr_snapshot()
+    })));
+    for url in app.avatar_requests() {
+        app.avatars.mark_requested(&url);
+        let source = image::RgbaImage::from_pixel(8, 8, image::Rgba([1, 2, 3, 255]));
+        app.avatars.land(url, Some(source));
+    }
+    let _ = app.avatars.transmissions(app.avatar_geometry().unwrap());
+    let inner = herdr_reviewr::ui::read_inner_rect(SEL_AREA, &app);
+    sel_mouse(&mut app, MouseEventKind::Down(MouseButton::Left), inner.x, inner.y + 2);
+    sel_mouse(&mut app, MouseEventKind::Drag(MouseButton::Left), inner.x + 100, inner.y + 6);
+    sel_mouse(&mut app, MouseEventKind::Up(MouseButton::Left), inner.x + 100, inner.y + 6);
+    let copied = last_copy().expect("the drag copies");
+    assert!(copied.contains("@ann") && copied.contains("alpha beta"), "{copied:?}");
+    assert!(!copied.contains(herdr_reviewr::avatar::PLACEHOLDER), "no image cell: {copied:?}");
+    assert!(!copied.contains('\u{0305}'), "no placeholder diacritic: {copied:?}");
 }
 
 #[test]
