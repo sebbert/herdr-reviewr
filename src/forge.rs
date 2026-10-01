@@ -739,7 +739,8 @@ fn read_pr(
     let sync = local_sync(repo, input.local.head_oid.as_deref(), pr_head)
         .map_err(|error| GhError::LocalGit(error.0))?;
     let mut snapshot = build_snapshot(node, sync);
-    snapshot.stack = read_stack(&target, node)?;
+    let cancelled = || target.cancelled.load(Ordering::Acquire);
+    snapshot.stack = stack_outcome(read_stack(&target, node), cancelled)?;
     Ok(Some(PrView::Pr(Box::new(snapshot))))
 }
 
@@ -1061,6 +1062,24 @@ fn build_detail_query(number: u64) -> String {
          startLine line originalStartLine originalLine diffSide \
          comments(first:100){{pageInfo{{hasNextPage endCursor}} nodes{{author{{login}} body createdAt diffHunk}}}}}}}}}}}}}}"
     )
+}
+
+/// What a stack read decides for the snapshot. The stack is secondary: a failed read lists
+/// no stack and never costs the PR its snapshot. Only a cancelled fetch propagates, since
+/// the coordinator superseded the whole read. `cancelled` reads the fetch's own flag — the
+/// one proof, as cancellation reaches here as a plain `Other` failure.
+fn stack_outcome(
+    read: Result<Vec<StackEntry>, GhError>,
+    cancelled: impl FnOnce() -> bool,
+) -> Result<Vec<StackEntry>, GhError> {
+    match read {
+        Ok(stack) => Ok(stack),
+        Err(error) if cancelled() => Err(error),
+        Err(error) => {
+            crate::logln!("pr stack read failed, listing no stack: {error:?}");
+            Ok(Vec::new())
+        }
+    }
 }
 
 /// Round trips one stack walk may spend: each reads one level in both directions, so a
@@ -1856,6 +1875,23 @@ mod tests {
             "isDraft": false, "headRefName": head, "baseRefName": base,
             "isCrossRepository": false,
         })
+    }
+
+    #[test]
+    fn a_failed_stack_read_lists_no_stack_unless_the_fetch_was_cancelled() {
+        let failed = || Err(GhError::Other("rate limited".into()));
+        assert_eq!(stack_outcome(failed(), || false), Ok(Vec::new()), "the snapshot survives");
+        assert_eq!(
+            stack_outcome(Err(GhError::NotAuthed("github.com".into())), || false),
+            Ok(Vec::new())
+        );
+        assert_eq!(
+            stack_outcome(failed(), || true),
+            Err(GhError::Other("rate limited".into())),
+            "a superseded fetch still aborts whole"
+        );
+        let stack = vec![stack_entry(&stack_node(1, "a", "main", "OPEN"), 0).unwrap()];
+        assert_eq!(stack_outcome(Ok(stack.clone()), || true), Ok(stack));
     }
 
     #[test]
