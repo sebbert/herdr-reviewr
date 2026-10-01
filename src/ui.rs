@@ -4904,8 +4904,12 @@ fn pr_read_content(app: &App, inner: Rect) -> PrReadContent {
             push_heavy_rule(&mut content.lines, &label, width, p);
             content.cols.push((0, None));
         }
-        content.lines.push(Line::raw(""));
-        content.cols.push((0, None));
+        // Boxes stack flush, their borders already part them; the rule above the first, and
+        // the flat cards of a narrow pane, keep a blank line.
+        if i == 0 || width < MIN_BOX_WIDTH {
+            content.lines.push(Line::raw(""));
+            content.cols.push((0, None));
+        }
         // The box's top line is the card's top: a selection scrolls its border to the edge.
         content.tops.push(content.lines.len());
         let selected = app.pr_cursor == i + offset;

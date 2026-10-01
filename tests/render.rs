@@ -1733,6 +1733,10 @@ fn the_read_pane_shows_the_description_then_every_comment_oldest_first() {
     let bottoms =
         read.iter().filter(|l| l.starts_with("╰─") && l.trim_end().ends_with('╯')).count();
     assert_eq!((tops, bottoms), (3, 3), "one box per card:\n{out}");
+    // Boxes stack flush: every box after the first opens on the line after the last closes.
+    let flush =
+        read.windows(2).filter(|w| w[0].starts_with("╰─") && w[1].starts_with("╭─ ")).count();
+    assert_eq!(flush, 2, "no blank line between boxes:\n{out}");
     assert!(read.iter().any(|l| l.starts_with("╭─ x.rs:1 · resolved · 1 reply ")), "{out}");
     let thread: Vec<&String> = read
         .iter()
