@@ -5331,3 +5331,300 @@ fn navigator_separators_rule_the_sections_apart_only_when_configured() {
     assert!(!above.contains('─'), "nothing above checks to part from: {above:?}");
     assert_eq!(below, "──────");
 }
+
+/// A `Write` sink shared with the test, so the bytes a real crossterm backend emits can be
+/// replayed after each draw.
+#[derive(Clone, Default)]
+struct Sink(std::rc::Rc<std::cell::RefCell<Vec<u8>>>);
+
+impl std::io::Write for Sink {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.borrow_mut().extend_from_slice(buf);
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// A grapheme-aware terminal grid, the way Ghostty lays text out: cursor moves (`CSI row;col H`)
+/// position absolutely, every other escape is ignored, a printable codepoint takes its
+/// `unicode-width` cells, a zero-width one joins the cell before it, and VS16 (U+FE0F) widens
+/// that cell to two — the emoji presentation the terminal paints.
+struct GraphemeTerminal {
+    cells: Vec<Vec<String>>,
+    x: usize,
+    y: usize,
+    last: Option<(usize, usize)>,
+}
+
+impl GraphemeTerminal {
+    fn new(w: usize, h: usize) -> Self {
+        Self { cells: vec![vec![" ".to_string(); w]; h], x: 0, y: 0, last: None }
+    }
+
+    fn feed(&mut self, bytes: &[u8]) {
+        use unicode_width::UnicodeWidthChar;
+        let text = String::from_utf8_lossy(bytes);
+        let mut chars = text.chars().peekable();
+        while let Some(ch) = chars.next() {
+            if ch == '\x1b' {
+                if chars.peek() == Some(&'[') {
+                    chars.next();
+                    let mut params = String::new();
+                    for c in chars.by_ref() {
+                        if c.is_ascii_alphabetic() || c == '~' {
+                            if c == 'H' {
+                                let mut it =
+                                    params.split(';').map(|n| n.parse::<usize>().unwrap_or(1));
+                                self.y = it.next().unwrap_or(1).saturating_sub(1);
+                                self.x = it.next().unwrap_or(1).saturating_sub(1);
+                                self.last = None;
+                            }
+                            break;
+                        }
+                        params.push(c);
+                    }
+                }
+                continue;
+            }
+            let (w, h) = (self.cells[0].len(), self.cells.len());
+            match ch.width().unwrap_or(0) {
+                0 => {
+                    if let Some((lx, ly)) = self.last {
+                        self.cells[ly][lx].push(ch);
+                        if ch == '\u{FE0F}' && lx + 1 < w && self.x == lx + 1 {
+                            self.cells[ly][lx + 1] = String::new();
+                            self.x += 1;
+                        }
+                    }
+                }
+                cw => {
+                    if self.y < h && self.x < w {
+                        // Writing over either half of a wide glyph erases the whole glyph.
+                        let row = &mut self.cells[self.y];
+                        if self.x + 1 < w && row[self.x + 1].is_empty() {
+                            row[self.x + 1] = " ".to_string();
+                        }
+                        if row[self.x].is_empty() && self.x > 0 {
+                            row[self.x - 1] = " ".to_string();
+                        }
+                        self.cells[self.y][self.x] = ch.to_string();
+                        for k in 1..cw {
+                            if self.x + k < w {
+                                self.cells[self.y][self.x + k] = String::new();
+                            }
+                        }
+                        self.last = Some((self.x, self.y));
+                    }
+                    self.x += cw;
+                }
+            }
+        }
+    }
+
+    /// Every cell the terminal shows that disagrees with the buffer ratatui believes is there.
+    fn disagreements(&self, buf: &Buffer) -> Vec<(u16, u16, String, String)> {
+        use unicode_width::UnicodeWidthStr;
+        let mut out = Vec::new();
+        for y in 0..buf.area.height {
+            let mut x = 0;
+            while x < buf.area.width {
+                let want = buf[(x, y)].symbol();
+                let got = &self.cells[y as usize][x as usize];
+                if got != want {
+                    out.push((x, y, want.to_string(), got.clone()));
+                }
+                x += want.width().max(1) as u16;
+            }
+        }
+        out
+    }
+}
+
+/// Draw `app` through a real crossterm backend into a grapheme-aware terminal model, scroll
+/// the read pane by `pages` between frames, and report what the terminal ends up showing
+/// differently from ratatui's buffer.
+fn replay_scrolled(app: &mut App, w: u16, h: u16, pages: usize) -> Vec<(u16, u16, String, String)> {
+    use ratatui::backend::CrosstermBackend;
+    use ratatui::{TerminalOptions, Viewport};
+    let sink = Sink::default();
+    let area = Rect::new(0, 0, w, h);
+    let mut terminal = Terminal::with_options(
+        CrosstermBackend::new(sink.clone()),
+        TerminalOptions { viewport: Viewport::Fixed(area) },
+    )
+    .unwrap();
+    let mut screen = GraphemeTerminal::new(w as usize, h as usize);
+    let mut worst = Vec::new();
+    for _ in 0..=pages {
+        let frame = terminal.draw(|f| ui::render(f, app)).unwrap();
+        let buffer = frame.buffer.clone();
+        screen.feed(&sink.0.borrow_mut().split_off(0));
+        let bad = screen.disagreements(&buffer);
+        if bad.len() > worst.len() {
+            worst = bad;
+        }
+        handle_key(app, KeyEvent::from(KeyCode::PageDown), area, &Keymap::default()).unwrap();
+    }
+    worst
+}
+
+/// The PR conversation from the report: the dbschema plan with its 🗄️ heading and 🟡 table,
+/// and the reviewer's 🤖/✅/⚫ round.
+fn emoji_pr_app(framed: bool) -> App {
+    use herdr_reviewr::forge::{Comment, PrSnapshot, PrView};
+    let plan = "### 🗄️ dbschema plan (preview only — no changes applied)\n\n\
+        | Target | Path | Env | Result |\n|---|---|---|---|\n\
+        | acme_shop_staging/public | db/shop/ | pp | 🟡 changes |\n\
+        | acme_shop_prod/public | db/shop/ | p | 🟡 changes |\n\n\
+        <details><summary>🟡 shop-public-pp — changes</summary>\n\nbody\n</details>\n\n\
+        Full plan ⚠️ ℹ️ ✔️ done";
+    let codex = "🤖 Example Review v2 — Round 1 — ✅ patch is correct\n\n\
+        | Severity | Category | Finding |\n|---|---|---|\n| ⚫ | security | Remove remote image |";
+    let mut app = edited_app();
+    if !framed {
+        borderless(&mut app);
+    }
+    app.set_tab(Tab::Pr).unwrap();
+    let comments: Vec<Comment> = (0..4)
+        .map(|i| Comment {
+            author: format!("u{i}"),
+            body: if i % 2 == 0 { plan.into() } else { codex.into() },
+            created_at: format!("2026-06-27T1{i}:00:00Z"),
+            ..common::comment()
+        })
+        .collect();
+    app.pr = PrView::Pr(Box::new(PrSnapshot {
+        body: "🗄️ desc ⚠️ x".into(),
+        comments,
+        ..common::pr_snapshot()
+    }));
+    app.focus = Focus::Diff;
+    app
+}
+
+#[test]
+fn emoji_rows_paint_where_ratatui_put_them_in_a_grapheme_aware_terminal() {
+    // A VS16 emoji (`🗄️`) is the cell that drifted: ratatui writes its hidden second cell
+    // right after it with no cursor move, and a terminal that draws the emoji two wide puts
+    // that blank — and the rest of the run — one column right, over the box border, the
+    // divider, and the scrollbar thumb. Every frame of a scroll must land cell for cell.
+    for framed in [false, true] {
+        for pos in [NavigatorPosition::Right, NavigatorPosition::Bottom] {
+            let mut app = emoji_pr_app(framed);
+            app.navigator_position = pos;
+            let bad = replay_scrolled(&mut app, 70, 24, 12);
+            assert!(
+                bad.is_empty(),
+                "framed={framed} {pos:?}: the terminal shows {} cells ratatui never painted, \
+                 first {:?}",
+                bad.len(),
+                &bad[..bad.len().min(4)]
+            );
+        }
+    }
+}
+
+#[test]
+fn no_painted_cell_is_a_grapheme_terminals_measure_differently() {
+    use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
+    let app = emoji_pr_app(false);
+    let buf = render_size(&app, 70, 40);
+    for y in 0..40u16 {
+        for x in 0..70u16 {
+            let symbol = buf[(x, y)].symbol();
+            let parts: usize = symbol.chars().map(|c| c.width().unwrap_or(0)).sum();
+            assert_eq!(symbol.width(), parts, "({x},{y}) {symbol:?} measures two ways");
+        }
+    }
+    // The layout is unchanged: the emoji keeps its two-column slot, the hidden half now a
+    // plain blank the terminal is told to paint.
+    let out = dump(&buf);
+    assert!(out.contains("🗄  dbschema plan"), "{out}");
+    assert!(out.contains("🟡  changes"), "{out}");
+}
+
+#[test]
+fn the_read_thumb_tracks_top_middle_and_end_on_its_one_column_in_every_layout() {
+    // Both border settings, every navigator position and a hidden navigator, at a narrow and
+    // a wide pane: the thumb is one contiguous run in the track column — the frame border, the
+    // divider beside the read pane, or the read pane's reserved last column — and it opens at
+    // the top, moves, and closes at the bottom at the end of the scroll.
+    let doc = (0..60).map(|n| format!("para {n}")).collect::<Vec<_>>().join("\n\n");
+    let positions = [
+        None,
+        Some(NavigatorPosition::Right),
+        Some(NavigatorPosition::Left),
+        Some(NavigatorPosition::Bottom),
+        Some(NavigatorPosition::Top),
+    ];
+    for framed in [true, false] {
+        for pos in positions {
+            for (w, h) in [(44u16, 16u16), (100, 40)] {
+                let r = Repo::init();
+                r.write("doc.md", "# T\n");
+                r.commit_all("init");
+                r.write("doc.md", &doc);
+                let mut app = app_on(&r);
+                if !framed {
+                    borderless(&mut app);
+                }
+                match pos {
+                    Some(p) => app.navigator_position = p,
+                    None => app.navigator_hidden = true,
+                }
+                app.toggle_preview();
+                app.focus = Focus::Diff;
+                let area = Rect::new(0, 0, w, h);
+                let mut starts = Vec::new();
+                for presses in [0, 2, 200] {
+                    for _ in 0..presses {
+                        handle_key(
+                            &mut app,
+                            KeyEvent::from(KeyCode::PageDown),
+                            area,
+                            &Keymap::default(),
+                        )
+                        .unwrap();
+                    }
+                    let buf = render_size(&app, w, h);
+                    let read = ui::read_inner_rect(area, &app);
+                    let label = format!("framed={framed} {pos:?} {w}x{h} after {presses}");
+                    let thumb: Vec<(u16, u16)> = (0..h)
+                        .flat_map(|y| (0..w).map(move |x| (x, y)))
+                        .filter(|&(x, y)| buf[(x, y)].symbol() == "┃")
+                        .collect();
+                    assert!(!thumb.is_empty(), "{label}: a thumb");
+                    let col = thumb[0].0;
+                    assert_eq!(col, read.x + read.width, "{label}: the track hugs the text");
+                    assert!(thumb.iter().all(|t| t.0 == col), "{label}: one column");
+                    let rows: Vec<u16> = thumb.iter().map(|t| t.1).collect();
+                    assert!(rows.windows(2).all(|p| p[1] == p[0] + 1), "{label}: contiguous");
+                    for y in read.y..read.y + read.height {
+                        let cell = buf[(col, y)].symbol();
+                        assert!(
+                            ["┃", "│", " "].contains(&cell),
+                            "{label}: track row {y} holds {cell:?}"
+                        );
+                    }
+                    starts.push((rows[0], *rows.last().unwrap()));
+                    if presses == 0 {
+                        assert_eq!(rows[0], read.y, "{label}: opens at the top");
+                    }
+                    if presses == 200 {
+                        assert_eq!(
+                            *rows.last().unwrap(),
+                            read.y + read.height - 1,
+                            "{label}: closes at the end"
+                        );
+                    }
+                }
+                assert!(
+                    starts[0].0 < starts[1].0 && starts[1].0 < starts[2].0,
+                    "framed={framed} {pos:?} {w}x{h}: moves {starts:?}"
+                );
+            }
+        }
+    }
+}
