@@ -88,6 +88,15 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - **The navigator lists comments oldest first**, matching the conversation, with a `↳N`
   reply count on threads.
 
+### Fixed
+- **Emoji no longer break borders, the divider, or scrollbars.** A VS16 emoji (`🗄️`, `⚠️`,
+  `ℹ️`, `✔️`) is two cells in reviewr's layout but one in a terminal that measures by
+  codepoint. Each redraw then put the rest of its row one column off. Box borders vanished,
+  the divider broke into fragments, and stale glyphs and thumb remnants stayed behind as you
+  scrolled. Every grapheme that terminals measure two ways now paints as its plain first
+  codepoint in the same two-cell slot: VS16 emoji, skin tones, ZWJ families, and keycaps.
+  The layout doesn't move, and copying still takes the original text.
+
 ## [0.39.0] — 2026-09-23
 
 ### Added

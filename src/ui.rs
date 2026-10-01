@@ -32,6 +32,55 @@ use crate::snippet::{snippet_caption_sign, snippet_row_is_comment};
 use crate::theme::Palette;
 
 pub fn render(frame: &mut Frame, app: &App) {
+    render_frame(frame, app);
+    settle_ambiguous_widths(frame.buffer_mut());
+}
+
+/// Rewrite every cell whose grapheme terminals disagree on the width of, so the width
+/// ratatui laid the frame out with is the width every terminal advances by.
+///
+/// ratatui measures a grapheme cluster whole: `🗄️` (U+1F5C4 + VS16) is 2 cells, its
+/// second cell a hidden blank it never draws. A terminal that measures by codepoint —
+/// herdr's pane grid among them — advances 1 for it, so the hidden cell keeps whatever was
+/// there before and everything after it lands one column right of where ratatui thinks.
+/// Diffed redraws then never touch the drifted cells, which stay up as stale glyphs, gaps in
+/// the divider, a missing box border, a scrollbar thumb's remnants. A cluster whose whole
+/// width differs from the sum of its codepoints' widths (emoji presentation and skin-tone
+/// sequences, ZWJ families, keycaps) is replaced by its first codepoint — when that is no
+/// wider than the cluster's slot. The slot's layout is unchanged, and the hidden cell, now a
+/// plain blank, is drawn. Copying is unaffected: it reads the source text, not the cells.
+pub fn settle_ambiguous_widths(buf: &mut ratatui::buffer::Buffer) {
+    for cell in &mut buf.content {
+        let symbol = cell.symbol();
+        if symbol.len() == 1 {
+            continue;
+        }
+        if let Some(fixed) = unambiguous_symbol(symbol) {
+            cell.set_symbol(&fixed);
+        }
+    }
+}
+
+/// The unambiguous stand-in for a cell's grapheme, `None` when every way of measuring it
+/// already agrees.
+#[must_use]
+pub fn unambiguous_symbol(symbol: &str) -> Option<String> {
+    let whole = symbol.width();
+    let parts: usize = symbol.chars().map(|c| c.width().unwrap_or(0)).sum();
+    if whole == parts {
+        return None;
+    }
+    let first = symbol.chars().next()?;
+    let first_w = first.width().unwrap_or(0);
+    Some(if first_w >= 1 && first_w <= whole {
+        first.to_string()
+    } else {
+        // A first codepoint wider than the slot (or invisible) cannot stand in for it.
+        "\u{FFFD}".to_string()
+    })
+}
+
+fn render_frame(frame: &mut Frame, app: &App) {
     let area = frame.area();
     // Link hit-testing resolves against the painted frame; each frame repaints its own.
     app.clear_painted_frame();
@@ -2608,6 +2657,26 @@ pub fn age_label(secs: u64) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn ambiguous_graphemes_settle_to_one_measure_and_unambiguous_ones_stay() {
+        use super::unambiguous_symbol as fix;
+        // Emoji presentation sequences on a text-default base: ratatui 2, per-codepoint 1.
+        for (seq, base) in [("🗄️", "🗄"), ("⚠️", "⚠"), ("ℹ️", "ℹ"), ("✔️", "✔"), ("☑️", "☑")]
+        {
+            assert_eq!(fix(seq).as_deref(), Some(base), "{seq:?}");
+        }
+        // Skin tone, ZWJ family, keycap: the first codepoint fits the slot.
+        assert_eq!(fix("👍🏽").as_deref(), Some("👍"));
+        assert_eq!(fix("👨\u{200D}👩\u{200D}👧").as_deref(), Some("👨"));
+        assert_eq!(fix("1\u{FE0F}\u{20E3}").as_deref(), Some("1"));
+        // Already one measure: wide emoji, plain text, accents, the avatar placeholder cell.
+        for ok in
+            ["🟡", "⚫", "✅", "🤖", "🚀", "▸", "e\u{0301}", "\u{10EEEE}\u{0305}\u{030D}", "日"]
+        {
+            assert_eq!(fix(ok), None, "{ok:?}");
+        }
+    }
+
     use super::*;
     #[test]
     fn relative_age_buckets_by_magnitude() {
