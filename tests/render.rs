@@ -4553,3 +4553,69 @@ fn a_long_folder_name_leaves_room_for_the_dot() {
     let row = files_row(&app, "…");
     assert_eq!(row.replacen('▾', "▸", 1), collapsed_name, "the name reads the same expanded");
 }
+
+#[test]
+fn a_stacked_prs_target_names_its_source_in_the_header() {
+    use herdr_reviewr::forge::{PrSnapshot, PrView};
+    let (r, mut app) = based_app();
+    r.git(&["checkout", "-q", "-b", "child"]);
+    r.write("b.rs", "child\n");
+    r.commit_all("child work");
+    app.set_scope(Scope::Branch).unwrap();
+    app.apply_pr(PrView::Pr(Box::new(PrSnapshot {
+        base_ref: "feature".to_string(),
+        ..common::pr_snapshot()
+    })));
+    app.reload().unwrap();
+    let frame = render(&app);
+    assert!(frame.contains("vs feature (pr base)"), "{frame}");
+
+    // A pick of its own carries no source marker.
+    app.open_base_picker();
+    for ch in "dev".chars() {
+        app.input_push(ch);
+    }
+    app.base_picker_pick().unwrap();
+    let frame = render(&app);
+    assert!(frame.contains("vs dev") && !frame.contains("(pr base)"), "{frame}");
+}
+
+#[test]
+fn the_pr_navigator_lists_the_stack_top_first_with_this_pr_marked() {
+    use herdr_reviewr::app::Tab;
+    use herdr_reviewr::forge::{PrSnapshot, PrState, PrView, StackEntry};
+    let r = Repo::init();
+    r.write("x.rs", "y\n");
+    r.commit_all("init");
+    let mut app = app_on(&r);
+    app.set_tab(Tab::Pr).unwrap();
+    let entry = |number, title: &str, base: &str, state, level| StackEntry {
+        number,
+        title: title.to_string(),
+        state,
+        is_draft: false,
+        head_ref: String::new(),
+        base_ref: base.to_string(),
+        level,
+    };
+    app.apply_pr(PrView::Pr(Box::new(PrSnapshot {
+        number: 11,
+        stack: vec![
+            entry(10, "Parent work", "main", PrState::Merged, -1),
+            entry(11, "This work", "feature-a", PrState::Open, 0),
+            entry(12, "Child work", "feature-b", PrState::Open, 1),
+        ],
+        ..common::pr_snapshot()
+    })));
+    let frame = render_size(&app, 120, 30);
+    let text = dump(&frame);
+    assert!(text.contains("stack · 3"), "{text}");
+    let row = |needle: &str| text.lines().position(|l| l.contains(needle)).unwrap();
+    assert!(row("#12 open") < row("#11 open") && row("#11 open") < row("#10 merged"), "{text}");
+    assert!(text.lines().nth(row("#11 open")).unwrap().contains("▸ #11"), "{text}");
+    assert!(row("└ main") == row("#10 merged") + 1, "the trunk closes the stack: {text}");
+
+    // A PR alone lists no stack section.
+    app.apply_pr(PrView::Pr(Box::new(PrSnapshot { number: 11, ..common::pr_snapshot() })));
+    assert!(!dump(&render_size(&app, 120, 30)).contains("stack ·"));
+}

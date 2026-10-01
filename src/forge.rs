@@ -144,6 +144,25 @@ pub struct PrSnapshot {
     pub comments_truncated: bool,
     /// Checks had more rows than the 100-row fetch.
     pub checks_truncated: bool,
+    /// The stacked PRs this one sits in, trunk side first, the current one included —
+    /// empty when it stacks on nothing and nothing stacks on it. GitHub only: the other
+    /// providers leave it empty.
+    pub stack: Vec<StackEntry>,
+}
+
+/// One pull request of a stack: the chain whose bases are each other's heads, as
+/// `gh stack` builds it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StackEntry {
+    pub number: u64,
+    pub title: String,
+    pub state: PrState,
+    pub is_draft: bool,
+    pub head_ref: String,
+    pub base_ref: String,
+    /// Steps from the current PR: below it (toward the trunk) negative, the current one
+    /// zero, above it positive. Two PRs stacked on one branch share a level.
+    pub level: i32,
 }
 
 /// The PR lifecycle.
@@ -719,7 +738,9 @@ fn read_pr(
     let pr_head = node["headRefOid"].as_str().unwrap_or_default();
     let sync = local_sync(repo, input.local.head_oid.as_deref(), pr_head)
         .map_err(|error| GhError::LocalGit(error.0))?;
-    Ok(Some(PrView::Pr(Box::new(build_snapshot(node, sync)))))
+    let mut snapshot = build_snapshot(node, sync);
+    snapshot.stack = read_stack(&target, node)?;
+    Ok(Some(PrView::Pr(Box::new(snapshot))))
 }
 
 /// The branch's PR by head lookup. A fork clone (`origin` is the fork, the target is
@@ -1042,6 +1063,187 @@ fn build_detail_query(number: u64) -> String {
     )
 }
 
+/// Round trips one stack walk may spend: each reads one level in both directions, so a
+/// stack of five on either side of this PR resolves whole.
+const STACK_ROUNDS: usize = 5;
+/// PRs one stack lists at most, the current one included.
+const STACK_CAP: usize = 12;
+
+/// The stack around `node`: walk down through the PR whose head is this one's base until
+/// the base is the default branch, and up through the open PRs whose base is this one's
+/// head. Each round batches every pending name into one aliased query, so a stack costs
+/// one round trip per level, and a PR that stacks on nothing costs one. A fork head
+/// stacks on nothing: its name lives in another repository than the bases it would match.
+fn read_stack(target: &FetchTarget<'_>, node: &Value) -> Result<Vec<StackEntry>, GhError> {
+    let Some(mut walk) = StackWalk::new(node) else { return Ok(Vec::new()) };
+    while let Some((query, names)) = walk.next_query() {
+        let mut vars = vec![
+            ("o".to_string(), target.owner.to_string()),
+            ("n".to_string(), target.name.to_string()),
+        ];
+        vars.extend(names);
+        let v = graphql(target.repo, target.host, &query, &vars, target.cancelled)?;
+        walk.absorb(&v);
+    }
+    Ok(walk.finish())
+}
+
+/// The stack walk's state between round trips — pure, so its rules test without a forge.
+#[derive(Debug)]
+pub(crate) struct StackWalk {
+    current: StackEntry,
+    /// Nearest first.
+    below: Vec<StackEntry>,
+    above: Vec<StackEntry>,
+    /// The base branch whose PR the next round looks up.
+    down: Option<String>,
+    /// Head branches whose stacked PRs the next round looks up, with their level.
+    up: Vec<(String, i32)>,
+    default: Option<String>,
+    rounds: usize,
+}
+
+impl StackWalk {
+    pub(crate) fn new(node: &Value) -> Option<Self> {
+        if node["isCrossRepository"].as_bool() == Some(true) {
+            return None;
+        }
+        let current = stack_entry(node, 0)?;
+        let down = Some(current.base_ref.clone()).filter(|b| !b.is_empty());
+        let up = vec![(current.head_ref.clone(), 0)].into_iter().filter(|(h, _)| !h.is_empty());
+        Some(Self {
+            up: up.collect(),
+            down,
+            current,
+            below: Vec::new(),
+            above: Vec::new(),
+            default: None,
+            rounds: 0,
+        })
+    }
+
+    fn len(&self) -> usize {
+        1 + self.below.len() + self.above.len()
+    }
+
+    fn seen(&self, number: u64) -> bool {
+        self.current.number == number
+            || self.below.iter().chain(&self.above).any(|e| e.number == number)
+    }
+
+    /// The next round's query and its variables, or `None` when the walk is done.
+    pub(crate) fn next_query(&mut self) -> Option<(String, Vec<(String, String)>)> {
+        use std::fmt::Write;
+        if self.rounds >= STACK_ROUNDS || self.len() >= STACK_CAP {
+            return None;
+        }
+        if self.down.is_none() && self.up.is_empty() {
+            return None;
+        }
+        let fields = "nodes{number title state isDraft headRefName baseRefName isCrossRepository}";
+        let mut decl = String::from("query($o:String!,$n:String!");
+        let mut body = String::new();
+        let mut vars = Vec::new();
+        // The first round learns the default branch, where the downward walk stops.
+        if self.rounds == 0 {
+            body.push_str("defaultBranchRef{name} ");
+        }
+        if let Some(down) = &self.down {
+            decl.push_str(",$d:String!");
+            // Every lifecycle: a merged parent whose branch still stands is still the base.
+            let _ = write!(
+                body,
+                "d:pullRequests(headRefName:$d, first:5, \
+                 orderBy:{{field:CREATED_AT, direction:DESC}}){{{fields}}} "
+            );
+            vars.push(("d".to_string(), down.clone()));
+        }
+        for (i, (head, _)) in self.up.iter().enumerate() {
+            let _ = write!(decl, ",$u{i}:String!");
+            let _ = write!(
+                body,
+                "u{i}:pullRequests(baseRefName:$u{i}, states:[OPEN], first:10, \
+                 orderBy:{{field:CREATED_AT, direction:ASC}}){{{fields}}} "
+            );
+            vars.push((format!("u{i}"), head.clone()));
+        }
+        self.rounds += 1;
+        Some((format!("{decl}){{repository(owner:$o,name:$n){{{body}}}}}"), vars))
+    }
+
+    /// Fold one round's response in and line up the next round's names.
+    pub(crate) fn absorb(&mut self, v: &Value) {
+        let repo = &v["data"]["repository"];
+        if let Some(name) = repo["defaultBranchRef"]["name"].as_str() {
+            self.default = Some(name.to_string());
+        }
+        let nodes = |key: &str| repo[key]["nodes"].as_array().cloned().unwrap_or_default();
+        if let Some(down) = self.down.take()
+            && self.default.as_deref() != Some(down.as_str())
+        {
+            let level = -(i32::try_from(self.below.len()).unwrap_or(i32::MAX) + 1);
+            // The open PR on that branch is its story; with none, the newest finished one.
+            let candidates: Vec<StackEntry> = nodes("d")
+                .iter()
+                .filter(|n| n["isCrossRepository"].as_bool() != Some(true))
+                .filter_map(|n| stack_entry(n, level))
+                .filter(|e| e.head_ref == down && !self.seen(e.number))
+                .collect();
+            let pick = candidates
+                .iter()
+                .position(|e| e.state == PrState::Open)
+                .or((!candidates.is_empty()).then_some(0));
+            if let Some(entry) = pick.map(|i| candidates[i].clone())
+                && self.len() < STACK_CAP
+            {
+                self.down = Some(entry.base_ref.clone())
+                    .filter(|b| !b.is_empty() && self.default.as_deref() != Some(b.as_str()));
+                self.below.push(entry);
+            }
+        }
+        let up = std::mem::take(&mut self.up);
+        for (i, (head, level)) in up.iter().enumerate() {
+            for n in nodes(&format!("u{i}")) {
+                if n["isCrossRepository"].as_bool() == Some(true) {
+                    continue;
+                }
+                let Some(entry) = stack_entry(&n, level + 1) else { continue };
+                if entry.base_ref != *head || self.seen(entry.number) || self.len() >= STACK_CAP {
+                    continue;
+                }
+                if !entry.head_ref.is_empty() {
+                    self.up.push((entry.head_ref.clone(), entry.level));
+                }
+                self.above.push(entry);
+            }
+        }
+    }
+
+    /// The stack trunk side first, or empty when nothing stacks either way.
+    pub(crate) fn finish(self) -> Vec<StackEntry> {
+        if self.below.is_empty() && self.above.is_empty() {
+            return Vec::new();
+        }
+        let mut above = self.above;
+        // A stable sort: one level's PRs keep their creation order.
+        above.sort_by_key(|e| e.level);
+        self.below.into_iter().rev().chain(std::iter::once(self.current)).chain(above).collect()
+    }
+}
+
+/// One stack row from a PR node, `None` without a number.
+fn stack_entry(node: &Value, level: i32) -> Option<StackEntry> {
+    Some(StackEntry {
+        number: node["number"].as_u64()?,
+        title: node["title"].as_str().unwrap_or_default().to_string(),
+        state: parse_state(node["state"].as_str().unwrap_or("OPEN")),
+        is_draft: node["isDraft"].as_bool().unwrap_or(false),
+        head_ref: node["headRefName"].as_str().unwrap_or_default().to_string(),
+        base_ref: node["baseRefName"].as_str().unwrap_or_default().to_string(),
+        level,
+    })
+}
+
 /// Run a GraphQL `query` with `vars` and parse the response. Every variable is passed with
 /// `-f` (raw string) — `-F` type-coerces, so a branch literally named `123` would arrive
 /// as an Int and fail its `String!` declaration.
@@ -1176,6 +1378,7 @@ fn build_snapshot(node: &Value, sync: Sync) -> PrSnapshot {
         ),
         comments_truncated,
         checks_truncated,
+        stack: Vec::new(),
     }
 }
 
@@ -1630,6 +1833,7 @@ mod tests {
             comments: Vec::new(),
             comments_truncated: false,
             checks_truncated: false,
+            stack: Vec::new(),
         };
         assert_eq!(snap(&[]).checks_rollup(), None);
         assert_eq!(
@@ -1644,6 +1848,106 @@ mod tests {
             snap(&[CheckStatus::Running, CheckStatus::Failure]).checks_rollup(),
             Some(CheckStatus::Failure)
         );
+    }
+
+    fn stack_node(number: u64, head: &str, base: &str, state: &str) -> Value {
+        serde_json::json!({
+            "number": number, "title": format!("pr {number}"), "state": state,
+            "isDraft": false, "headRefName": head, "baseRefName": base,
+            "isCrossRepository": false,
+        })
+    }
+
+    #[test]
+    fn a_pr_that_stacks_on_nothing_costs_one_round_and_lists_no_stack() {
+        let mut walk = StackWalk::new(&stack_node(7, "feature", "main", "OPEN")).unwrap();
+        let (query, vars) = walk.next_query().unwrap();
+        assert!(query.contains("defaultBranchRef{name}"), "the first round learns the trunk");
+        assert!(query.contains("d:pullRequests(headRefName:$d"));
+        assert!(query.contains("u0:pullRequests(baseRefName:$u0, states:[OPEN]"));
+        assert_eq!(vars, [("d".into(), "main".into()), ("u0".into(), "feature".into())]);
+        walk.absorb(&serde_json::json!({"data": {"repository": {
+            "defaultBranchRef": {"name": "main"},
+            // A PR whose head happens to be `main` is no parent: the walk stops at the trunk.
+            "d": {"nodes": [stack_node(1, "main", "release", "OPEN")]},
+            "u0": {"nodes": []},
+        }}}));
+        assert!(walk.next_query().is_none());
+        assert!(walk.finish().is_empty());
+    }
+
+    #[test]
+    fn the_stack_walks_down_to_the_trunk_and_up_through_its_children() {
+        // main <- #1 a <- #2 b (current) <- #3 c, #4 d (both on b) <- #5 e (on c)
+        let mut walk = StackWalk::new(&stack_node(2, "b", "a", "OPEN")).unwrap();
+        let (_, vars) = walk.next_query().unwrap();
+        assert_eq!(vars, [("d".into(), "a".into()), ("u0".into(), "b".into())]);
+        walk.absorb(&serde_json::json!({"data": {"repository": {
+            "defaultBranchRef": {"name": "main"},
+            // The open PR on the parent branch wins over a newer finished one, and a fork's
+            // same-named head is no parent.
+            "d": {"nodes": [
+                stack_node(9, "a", "main", "CLOSED"),
+                {"number": 8, "headRefName": "a", "baseRefName": "main", "state": "OPEN",
+                 "isCrossRepository": true},
+                stack_node(1, "a", "main", "OPEN"),
+            ]},
+            "u0": {"nodes": [stack_node(3, "c", "b", "OPEN"), stack_node(4, "d", "b", "OPEN")]},
+        }}}));
+        let (query, vars) = walk.next_query().unwrap();
+        assert!(!query.contains("defaultBranchRef"), "the trunk is learned once");
+        assert!(!query.contains("$d"), "the parent targets the trunk: the walk down is done");
+        assert_eq!(vars, [("u0".into(), "c".into()), ("u1".into(), "d".into())]);
+        walk.absorb(&serde_json::json!({"data": {"repository": {
+            // The current PR showing up again (a cycle) is never listed twice.
+            "u0": {"nodes": [stack_node(5, "e", "c", "OPEN"), stack_node(2, "b", "c", "OPEN")]},
+            "u1": {"nodes": []},
+        }}}));
+        let (_, vars) = walk.next_query().unwrap();
+        assert_eq!(vars, [("u0".into(), "e".into())]);
+        walk.absorb(&serde_json::json!({"data": {"repository": {"u0": {"nodes": []}}}}));
+        assert!(walk.next_query().is_none());
+        let stack = walk.finish();
+        let order: Vec<(u64, i32)> = stack.iter().map(|e| (e.number, e.level)).collect();
+        assert_eq!(order, [(1, -1), (2, 0), (3, 1), (4, 1), (5, 2)], "trunk side first");
+        assert_eq!(stack[0].base_ref, "main");
+    }
+
+    #[test]
+    fn a_merged_parent_whose_branch_stands_is_still_the_stacks_bottom() {
+        let mut walk = StackWalk::new(&stack_node(2, "b", "a", "OPEN")).unwrap();
+        walk.next_query().unwrap();
+        walk.absorb(&serde_json::json!({"data": {"repository": {
+            "defaultBranchRef": {"name": "main"},
+            "d": {"nodes": [stack_node(1, "a", "main", "MERGED")]},
+            "u0": {"nodes": []},
+        }}}));
+        assert!(walk.next_query().is_none());
+        let stack = walk.finish();
+        assert_eq!(stack[0].state, PrState::Merged);
+        assert_eq!(stack.len(), 2);
+    }
+
+    #[test]
+    fn a_fork_head_stacks_on_nothing_and_the_walk_is_bounded() {
+        let mut fork = stack_node(2, "b", "a", "OPEN");
+        fork["isCrossRepository"] = Value::Bool(true);
+        assert!(StackWalk::new(&fork).is_none(), "a fork's head names another repository");
+
+        // An endless chain stops at the round budget, never spinning on the forge.
+        let mut walk = StackWalk::new(&stack_node(100, "h0", "b0", "OPEN")).unwrap();
+        let mut rounds: usize = 0;
+        while let Some((_, vars)) = walk.next_query() {
+            rounds += 1;
+            let down = vars.iter().find(|(k, _)| k == "d").map(|(_, v)| v.clone()).unwrap();
+            let n = 200 + rounds as u64;
+            walk.absorb(&serde_json::json!({"data": {"repository": {
+                "defaultBranchRef": {"name": "main"},
+                "d": {"nodes": [stack_node(n, &down, &format!("b{rounds}"), "OPEN")]},
+            }}}));
+        }
+        assert_eq!(rounds, STACK_ROUNDS);
+        assert_eq!(walk.finish().len(), STACK_ROUNDS + 1);
     }
 
     fn input(head: &str, names: &[&str]) -> PrFetchInput {

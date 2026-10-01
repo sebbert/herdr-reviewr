@@ -172,7 +172,8 @@ links, and scroll with the wheel.
 - **All files** — any file's current content from the whole worktree, comments too. A collapsed
   folder with a changed file under it shows a dot. Ignored paths show dimmed.
 - **PR** — a read-only mirror of the branch's pull request (GitHub, Azure DevOps) or merge
-  request (GitLab): state, checks, description, and comments, rendered as markdown. The read
+  request (GitLab): state, checks, description, and comments, rendered as markdown. A GitHub
+  PR that is part of a stack lists the stack too ([Stacked PRs](#stacked-prs)). The read
   pane is one conversation: the description, then every comment oldest first, with a rule
   between each. Conversation comments, review verdicts (`✓ approved`, `✗ changes requested`),
   and inline threads (`path:line`, replies grouped under the root) share the one list. reviewr
@@ -182,7 +183,8 @@ links, and scroll with the wheel.
 
 - **uncommitted** — the working tree vs `HEAD` (staged, unstaged, and untracked).
 - **branch** — the working tree vs the merge-base with the base branch: **uncommitted** plus
-  the branch's commits. The base is your repo's default branch until you pick another with
+  the branch's commits. The base is your repo's default branch, or a stacked PR's parent
+  branch, until you pick another with
   `B` ([Base branch](#base-branch)).
 - **last turn** — everything that changed in this worktree since its most recent turn started
   ([Limitations](#limitations)).
@@ -271,17 +273,46 @@ back.
 The **branch** scope diffs against the merge-base with your repo's default branch, with or
 without a remote. The header shows the resolved base, `vs main`.
 
-When the trunk is something else, or you review a stacked branch, press `B` (or click the
+When the branch's open PR targets another branch than the default — a stacked PR — the
+scope diffs against that branch instead, once the PR has loaded, and the header says where
+the base came from: `vs feature-a (pr base)`. You review this PR's own commits, not its
+parent's. When the PR retargets (its parent merged), the base follows on the next PR
+refresh. A merged or closed PR, or one from a fork, leaves the default in place. If the
+parent branch is not fetched, the header says so (`vs main · feature-a missing`).
+
+When the trunk is something else, press `B` (or click the
 base name) and pick the branch. Every branch is a row with its age, and a row says when it
 is the open PR's target (`pr base`), the repo's `default`, or the branch checked out here
 (`current`). Type to narrow the list, fuzzily. The pick is stored for this worktree and holds
-until you pick again. Other worktrees on the same clone keep their own pick. Pick the default
-branch to go back to it.
+until you pick again, over the PR's target too. Other worktrees on the same clone keep their
+own pick. To go back, pick the branch reviewr would choose on its own: the stacked PR's
+target when there is one, else the default branch.
 
 You can also type any revision, like `HEAD~2`, a tag, or a SHA prefix. It appears as one more
 row under the matches, and the header shows what resolved: `vs HEAD~2 (a1b2c3d)`.
 
-`--base <ref>` sets the base for this pane. It wins over the pick and disables the picker.
+`--base <ref>` sets the base for this pane. It wins over the pick and the PR's target, and
+disables the picker.
+
+### Stacked PRs
+
+On GitHub, the PR tab's navigator lists the stack a PR sits in: the PRs below it, down to the
+one that targets the default branch, and the open PRs stacked on top of it — the chains
+`gh stack` builds, or any PR whose base is another PR's
+branch. Each row shows the number, state, and title, top of the stack first, with this PR
+marked `▸` and the trunk last:
+
+```text
+stack · 3
+   #12 open   Add the settings page
+ ▸ #11 open   Add the settings API
+   #10 merged Add the settings table
+   └ main
+```
+
+A PR that stacks on nothing shows no stack section. Reading the stack costs one extra GitHub
+query per refresh, plus one per further level. GitLab and Azure DevOps show no stack, but their
+MR or PR target still sets the [base](#base-branch).
 
 ### Editor
 

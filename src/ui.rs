@@ -1360,8 +1360,10 @@ fn base_label(app: &App) -> Option<(String, String, String, String)> {
         None => String::new(),
     };
     Some(match &app.branch_base.winner {
+        // A stacked PR's target names its source, so the base never reads as configured.
         Some(git::ResolvedBase::Branch { name, .. }) => {
-            ("vs ".to_string(), name.clone(), String::new(), tail)
+            let marker = if app.branch_base.from_pr { " (pr base)" } else { "" };
+            ("vs ".to_string(), name.clone(), marker.to_string(), tail)
         }
         Some(git::ResolvedBase::Rev { spelling, oid }) => {
             let (shown, mark) = git::rev_paint(spelling, oid);
@@ -4293,6 +4295,10 @@ fn pr_nav_rows(app: &App, width: usize, now: std::time::SystemTime) -> Vec<PrNav
         });
         rows.push(PrNavRow { spans: Vec::new(), cursor: None });
     }
+    if !s.stack.is_empty() {
+        push_stack_rows(&mut rows, app, s, width);
+        rows.push(PrNavRow { spans: Vec::new(), cursor: None });
+    }
     rows.push(PrNavRow { spans: vec![Span::styled(pr_checks_header(s), dim)], cursor: None });
     for check in &s.checks {
         let (glyph, color) = check_glyph(p, check.status);
@@ -4315,6 +4321,57 @@ fn pr_nav_rows(app: &App, width: usize, now: std::time::SystemTime) -> Vec<PrNav
         cursor: Some(index + offset),
     }));
     rows
+}
+
+/// The stack section: its header, then one row per PR top of the stack first — the way
+/// `gh stack` and a branch graph read — with this PR marked, and the trunk the bottom PR
+/// targets as the last row. Read-only, so no row is a cursor stop.
+fn push_stack_rows(rows: &mut Vec<PrNavRow>, app: &App, s: &forge::PrSnapshot, width: usize) {
+    let p = app.palette();
+    let dim = Style::default().fg(p.dim2);
+    rows.push(PrNavRow {
+        spans: vec![Span::styled(format!("stack · {}", s.stack.len()), dim)],
+        cursor: None,
+    });
+    for entry in s.stack.iter().rev() {
+        let current = entry.level == 0;
+        let (word, color) = stack_state(p, entry);
+        let lead = if current { " ▸ " } else { "   " };
+        let number = format!("{}{} ", app.pr_forge.sigil(), entry.number);
+        let state = format!("{word:<6} ");
+        let used = lead.width() + number.width() + state.width();
+        let title = truncate_width(&entry.title, width.saturating_sub(used));
+        let title_style = if current {
+            text_style(p).add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(p.dim0)
+        };
+        rows.push(PrNavRow {
+            spans: vec![
+                Span::styled(lead, Style::default().fg(p.blue)),
+                Span::styled(number, Style::default().fg(p.yellow)),
+                Span::styled(state, Style::default().fg(color)),
+                Span::styled(title, title_style),
+            ],
+            cursor: None,
+        });
+    }
+    if let Some(bottom) = s.stack.first().filter(|e| !e.base_ref.is_empty()) {
+        rows.push(PrNavRow {
+            spans: vec![Span::styled(format!("   └ {}", bottom.base_ref), dim)],
+            cursor: None,
+        });
+    }
+}
+
+/// A stack row's lifecycle word and accent, in the header chip's vocabulary.
+fn stack_state(p: &Palette, e: &forge::StackEntry) -> (&'static str, Color) {
+    match e.state {
+        forge::PrState::Merged => ("merged", p.purple),
+        forge::PrState::Closed => ("closed", p.red),
+        forge::PrState::Open if e.is_draft => ("draft", p.yellow),
+        forge::PrState::Open => ("open", p.green),
+    }
 }
 
 fn settle_pr_nav_scroll(

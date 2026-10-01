@@ -5836,6 +5836,115 @@ fn the_pr_target_row_sorts_first_and_says_so() {
     assert_eq!(bp.rows[bp.cursor].name(), "main", "the highlight still opens on the base");
 }
 
+/// `based_repo` with a stack on top: `feature` is the parent PR's head, `child` stacks on
+/// it, and the child's own work touches `b.rs` only.
+fn stacked_repo() -> Repo {
+    let r = based_repo();
+    r.git(&["checkout", "-q", "-b", "child"]);
+    r.write("b.rs", "child\n");
+    r.commit_all("child work");
+    r
+}
+
+fn stacked_pr(state: herdr_reviewr::forge::PrState) -> herdr_reviewr::forge::PrView {
+    herdr_reviewr::forge::PrView::Pr(Box::new(herdr_reviewr::forge::PrSnapshot {
+        state,
+        head_ref: "child".to_string(),
+        base_ref: "feature".to_string(),
+        ..common::pr_snapshot()
+    }))
+}
+
+#[test]
+fn an_open_stacked_pr_moves_the_branch_base_to_its_target_by_reconcile() {
+    let r = stacked_repo();
+    let mut app = app_on(&r);
+    app.set_scope(Scope::Branch).unwrap();
+    let paths = |app: &App| app.entries.iter().map(|e| e.path.clone()).collect::<Vec<_>>();
+    assert_eq!(paths(&app), ["a.rs", "b.rs"], "against main: the parent's work too");
+    app.move_cursor(1).unwrap();
+    assert_eq!(app.diff_path.as_deref(), Some("b.rs"));
+    app.world_request = None;
+    let stale = app.world_input();
+
+    // The landing only re-tags the world and asks for a build; nothing moves yet.
+    app.apply_pr(stacked_pr(herdr_reviewr::forge::PrState::Open));
+    assert_eq!(app.pr_base(), Some("feature"));
+    assert!(app.world_request.is_some(), "the base move rides a world refresh");
+    assert_ne!(app.world_input(), stale, "a build that read the old target cannot land");
+    assert_eq!(app.diff_path.as_deref(), Some("b.rs"));
+
+    // The build lands through the reconcile: the base and its changeset together, the
+    // open file kept by path.
+    app.reload().unwrap();
+    let base = &app.branch_base;
+    assert_eq!(base.winner.as_ref().map(herdr_reviewr::git::ResolvedBase::name), Some("feature"));
+    assert!(base.from_pr, "the header says the base is the PR's");
+    assert_eq!(paths(&app), ["b.rs"], "only the child's own work");
+    assert_eq!(app.diff_path.as_deref(), Some("b.rs"), "the open file survives the move");
+
+    // A refetch that changed nothing leaves the world alone.
+    app.world_request = None;
+    app.apply_pr(stacked_pr(herdr_reviewr::forge::PrState::Open));
+    assert!(app.world_request.is_none());
+
+    // Once the PR merges, its target is history: back to the default.
+    app.apply_pr(stacked_pr(herdr_reviewr::forge::PrState::Merged));
+    assert_eq!(app.pr_base(), None);
+    app.reload().unwrap();
+    assert_eq!(paths(&app), ["a.rs", "b.rs"]);
+}
+
+#[test]
+fn a_pick_and_the_flag_outrank_the_stacked_prs_target() {
+    let r = stacked_repo();
+    let mut app = app_on(&r);
+    app.set_scope(Scope::Branch).unwrap();
+    app.apply_pr(stacked_pr(herdr_reviewr::forge::PrState::Open));
+    app.reload().unwrap();
+    let winner = |app: &App| {
+        app.branch_base.winner.as_ref().map(|w| w.name().to_string()).unwrap_or_default()
+    };
+    assert_eq!(winner(&app), "feature");
+
+    // The picker opens on the PR's target, and picking the default sticks over it.
+    app.open_base_picker();
+    let bp = app.base_picker.as_ref().unwrap();
+    assert_eq!(bp.rows[bp.cursor].name(), "feature", "the highlight opens on the base");
+    assert!(bp.rows[bp.cursor].pr_base());
+    goto_row(&mut app, "main");
+    app.base_picker_pick().unwrap();
+    assert_eq!(winner(&app), "main");
+    assert!(!app.branch_base.from_pr);
+    assert_eq!(herdr_reviewr::git::read_base_pick(r.path()).unwrap().as_deref(), Some("main"));
+
+    // Picking the target clears the pick: the pane follows the PR again.
+    app.open_base_picker();
+    goto_row(&mut app, "feature");
+    app.base_picker_pick().unwrap();
+    assert_eq!(herdr_reviewr::git::read_base_pick(r.path()).unwrap(), None);
+    assert_eq!(winner(&app), "feature");
+
+    // `--base` wins over everything.
+    let mut flagged = App::new(r.path_buf(), Scope::Branch, Some("main".to_string()));
+    flagged.apply_pr(stacked_pr(herdr_reviewr::forge::PrState::Open));
+    flagged.reload().unwrap();
+    assert_eq!(winner(&flagged), "main");
+}
+
+#[test]
+fn a_fork_prs_target_never_moves_the_base() {
+    let r = stacked_repo();
+    let mut app = app_on(&r);
+    app.set_scope(Scope::Branch).unwrap();
+    app.apply_pr(herdr_reviewr::forge::PrView::Pr(Box::new(herdr_reviewr::forge::PrSnapshot {
+        head_is_fork: true,
+        base_ref: "feature".to_string(),
+        ..common::pr_snapshot()
+    })));
+    assert_eq!(app.pr_base(), None);
+}
+
 #[test]
 fn a_detached_head_opens_the_picker_with_no_current_row() {
     let r = based_repo();

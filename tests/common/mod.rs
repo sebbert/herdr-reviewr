@@ -184,6 +184,7 @@ pub fn pr_snapshot() -> herdr_reviewr::forge::PrSnapshot {
         comments: Vec::new(),
         comments_truncated: false,
         checks_truncated: false,
+        stack: Vec::new(),
     }
 }
 

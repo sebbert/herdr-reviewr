@@ -485,6 +485,7 @@ fn build_snapshot(
         comments: merge_comments(rows, pr),
         comments_truncated,
         checks_truncated,
+        stack: Vec::new(),
     }
 }
 

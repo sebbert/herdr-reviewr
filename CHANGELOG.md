@@ -9,6 +9,15 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ### Added
 - **`split_ratio` sizes the split reviewr opens in**, e.g. `0.33` for a third. The toggle, open, and
   auto-open all resize their fresh split to it; a failed resize never fails the open.
+- **A stacked PR diffs against its parent branch.** When the branch's open PR targets another
+  branch than the default, the **branch** scope uses that branch as its base, and the header
+  reads `vs feature-a (pr base)`. A pick and `--base` still win. Picking the PR's target is the
+  way back from a pick; while a PR target is in play, picking the default branch records an
+  explicit pick. Merged, closed, and fork PRs leave the default in place. Works on every forge,
+  since it reads only the PR's target branch.
+- **The PR tab lists the stack** (GitHub): the PRs below this one down to the trunk and the open
+  PRs stacked on top, each with number, state, and title, this one marked. One batched GraphQL
+  query per stack level, so a PR that stacks on nothing costs one extra query per refresh.
 
 ### Changed
 - **The PR tab reads as one conversation.** The read pane shows the description, then every

@@ -33,6 +33,9 @@ pub struct WorldInput {
     /// landing's input-equality gate instead of reverting the picked base. Another pane's
     /// pick leaves it alone — see `base` above.
     pub base_epoch: u64,
+    /// The open stacked PR's target (`App::pr_base`), below the flag and the pick. Part of
+    /// the identity: a build that read the previous target fails the landing gate.
+    pub pr_base: Option<String>,
     /// The `last-turn` baseline tree the changed set diffs against; `None` before a turn.
     pub turn_baseline: Option<String>,
     /// The `commits` scope's pick. Part of the identity, so a build for a replaced pick
@@ -138,8 +141,12 @@ pub fn build_changed(input: &WorldInput) -> Result<ScopeBuild> {
             // frame and reports — degrading to an empty snapshot would blank a populated
             // view over a transient error (Continuity). A chain where
             // nothing resolves is not a failure: it returns the legible no-base state.
-            let resolution = git::resolve_base(&input.repo, input.base.as_deref())
-                .map_err(|e| anyhow::anyhow!("{}", e.0))?;
+            let resolution = git::resolve_base_with(
+                &input.repo,
+                input.base.as_deref(),
+                input.pr_base.as_deref(),
+            )
+            .map_err(|e| anyhow::anyhow!("{}", e.0))?;
             let base_oid = resolution.status.winner.as_ref().map(|w| w.oid().to_string());
             let changed = git::changed_files(&input.repo, input.scope, base_oid.as_deref())?;
             Ok(ScopeBuild { branch_base: resolution.status, pick_status: None, changed })

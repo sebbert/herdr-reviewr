@@ -681,6 +681,9 @@ impl ResolvedBase {
 pub struct BaseStatus {
     pub winner: Option<ResolvedBase>,
     pub skipped: Option<String>,
+    /// The winner is the open PR's target ([`resolve_base_with`]'s `pr_base`), so the
+    /// header names where the base came from.
+    pub from_pr: bool,
 }
 
 /// One pass over the base chain. `candidates` keeps every source that resolved, in
@@ -704,15 +707,27 @@ impl BaseResolution {
     }
 }
 
-/// Resolve the base chain: the `--base` flag, then this worktree's pick, then the default
-/// branch ([`default_branch_name`]). A source that does not
+/// Resolve the base chain without a PR base: the `--base` flag, then this worktree's pick,
+/// then the default branch. See [`resolve_base_with`].
+pub fn resolve_base(repo: &Path, base_flag: Option<&str>) -> Result<BaseResolution, GitFail> {
+    resolve_base_with(repo, base_flag, None)
+}
+
+/// Resolve the base chain: the `--base` flag, then this worktree's pick, then the open PR's
+/// target (`pr_base`, a stacked PR's parent branch), then the default
+/// branch ([`default_branch_name`]). A PR base spelling the default branch is no stack
+/// and steps aside for the default itself. A source that does not
 /// resolve to a commit is skipped, never an error; a skipped flag or pick that would have
 /// outranked the winner is recorded for the header.
 ///
 /// A pick spelling the default branch (one an earlier release wrote, or one the repo
 /// re-defaulted onto) resolves to the same base the default step would, so it needs no
 /// special case here; [`write_base_pick`] keeps such a ref from being written.
-pub fn resolve_base(repo: &Path, base_flag: Option<&str>) -> Result<BaseResolution, GitFail> {
+pub fn resolve_base_with(
+    repo: &Path,
+    base_flag: Option<&str>,
+    pr_base: Option<&str>,
+) -> Result<BaseResolution, GitFail> {
     let mut candidates: Vec<ResolvedBase> = Vec::new();
     let mut recorded: Vec<String> = Vec::new();
     let mut skipped: Option<String> = None;
@@ -746,6 +761,19 @@ pub fn resolve_base(repo: &Path, base_flag: Option<&str>) -> Result<BaseResoluti
             None => {}
         }
     }
+    let mut from_pr = false;
+    if let Some(name) = pr_base.filter(|name| Some(*name) != default.as_deref()) {
+        record(name.to_string(), &mut recorded);
+        match resolve_base_entry(repo, name)? {
+            Some(oid) => {
+                from_pr = candidates.is_empty();
+                push(ResolvedBase::branch(name.to_string(), oid), &mut candidates);
+            }
+            // An unfetched parent branch says so in the header, like a dormant pick.
+            None if candidates.is_empty() => skipped = skipped.or(Some(name.to_string())),
+            None => {}
+        }
+    }
     if let Some(name) = &default {
         record(name.clone(), &mut recorded);
         if let Some(oid) = resolve_base_entry(repo, name)? {
@@ -753,7 +781,12 @@ pub fn resolve_base(repo: &Path, base_flag: Option<&str>) -> Result<BaseResoluti
         }
     }
     let winner = candidates.first().cloned();
-    Ok(BaseResolution { status: BaseStatus { winner, skipped }, default, candidates, recorded })
+    Ok(BaseResolution {
+        status: BaseStatus { winner, skipped, from_pr },
+        default,
+        candidates,
+        recorded,
+    })
 }
 
 /// The repo's default branch: what `origin/HEAD` names, else `init.defaultBranch`, else
@@ -1341,14 +1374,30 @@ fn branch_name_shaped(value: &str) -> bool {
         && value.bytes().all(|byte| byte > b' ' && byte != 0x7f)
 }
 
+/// Record `name` as this worktree's pick, with no open PR's target in play. See
+/// [`write_base_pick_with`].
+pub fn write_base_pick(repo: &Path, name: &str) -> Result<(), GitFail> {
+    write_base_pick_with(repo, name, None)
+}
+
 /// Record `name` as this worktree's pick. The ref write lands before the pick applies,
 /// so a crash between the two loses nothing.
 ///
-/// A name spelling the default branch is no pick: the ref is deleted instead, so the pane
-/// follows the repo's next re-default. The default is read here, at the write, so a
-/// picker row marked at open cannot go stale under a fetch that moved `origin/HEAD`.
-pub fn write_base_pick(repo: &Path, name: &str) -> Result<(), GitFail> {
-    if Some(name) == default_branch_name(repo)?.as_deref() {
+/// A name spelling the chain's own choice — the open PR's target (`pr_base`) when it
+/// resolves, else the default branch — is no pick: the ref is deleted instead, so the pane
+/// follows the PR's next retarget or the repo's next re-default. While a PR target is in
+/// play, the default branch is an explicit pick like any other. The default is read here,
+/// at the write, so a picker row marked at open cannot go stale under a fetch that moved
+/// `origin/HEAD`.
+pub fn write_base_pick_with(repo: &Path, name: &str, pr_base: Option<&str>) -> Result<(), GitFail> {
+    let default = default_branch_name(repo)?;
+    let mut automatic = default.clone();
+    if let Some(pr) = pr_base.filter(|pr| Some(*pr) != default.as_deref())
+        && resolve_base_entry(repo, pr)?.is_some()
+    {
+        automatic = Some(pr.to_string());
+    }
+    if Some(name) == automatic.as_deref() {
         return delete_base_pick(repo);
     }
     let blob = git_stdin(repo, &["hash-object", "-w", "--stdin"], name)?;

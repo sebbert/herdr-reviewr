@@ -642,6 +642,7 @@ fn build_snapshot(
         comments: merge_comments(rows, approvals),
         comments_truncated,
         checks_truncated,
+        stack: Vec::new(),
     }
 }
 

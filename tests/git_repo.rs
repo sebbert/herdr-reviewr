@@ -10,7 +10,8 @@ use herdr_reviewr::git::{
     ResolvedBase, abbreviate_oid, all_files, changed_against_tree,
     changed_files as changed_files_oid, checked_out_branch, default_branch_name, delete_base_pick,
     file_content, list_branches, merge_base as merge_base_oid, read_base_pick, read_baseline_ref,
-    resolve_base, resolve_commit, snapshot_worktree, write_base_pick, write_baseline_ref,
+    resolve_base, resolve_base_with, resolve_commit, snapshot_worktree, write_base_pick,
+    write_base_pick_with, write_baseline_ref,
 };
 use herdr_reviewr::model::{ChangeKind, ChangedFile, Scope};
 
@@ -203,6 +204,86 @@ fn the_chain_is_flag_then_pick_then_default() {
     // The flag outranks the pick.
     let winner = resolve_base(r.path(), Some("flagged-base")).unwrap().status.winner.unwrap();
     assert_eq!(winner.name(), "flagged-base");
+}
+
+#[test]
+fn a_stacked_prs_target_ranks_below_the_pick_and_above_the_default() {
+    let r = Repo::init();
+    r.write("base.rs", "1\n");
+    r.commit_all("base");
+    r.set_origin_default("main", "HEAD");
+    r.git(&["checkout", "-q", "-b", "feature-a"]);
+    r.write("a.rs", "a\n");
+    r.commit_all("parent work");
+    r.git(&["branch", "picked-base"]);
+    r.git(&["checkout", "-q", "-b", "feature-b"]);
+    r.write("b.rs", "b\n");
+    r.commit_all("child work");
+
+    // The PR's target outranks the default, and the status says where it came from.
+    let status = resolve_base_with(r.path(), None, Some("feature-a")).unwrap().status;
+    assert_eq!(status.winner.unwrap().name(), "feature-a");
+    assert!(status.from_pr);
+    let changed = changed_files_oid(
+        r.path(),
+        Scope::Branch,
+        resolve_base_with(r.path(), None, Some("feature-a"))
+            .unwrap()
+            .status
+            .winner
+            .as_ref()
+            .map(ResolvedBase::oid),
+    )
+    .unwrap();
+    let paths: Vec<&str> = changed.iter().map(|f| f.path.as_str()).collect();
+    assert_eq!(paths, ["b.rs"], "only the child's own work, not the parent's");
+
+    // A target spelling the default is no stack.
+    let status = resolve_base_with(r.path(), None, Some("main")).unwrap().status;
+    assert_eq!(status.winner.unwrap().name(), "main");
+    assert!(!status.from_pr);
+
+    // An unfetched target falls through to the default and says it is missing.
+    let status = resolve_base_with(r.path(), None, Some("not-fetched")).unwrap().status;
+    assert_eq!(status.winner.unwrap().name(), "main");
+    assert_eq!(status.skipped.as_deref(), Some("not-fetched"));
+    assert!(!status.from_pr);
+
+    // A pick and the flag both outrank it.
+    write_base_pick(r.path(), "picked-base").unwrap();
+    let status = resolve_base_with(r.path(), None, Some("feature-a")).unwrap().status;
+    assert_eq!(status.winner.unwrap().name(), "picked-base");
+    assert!(!status.from_pr);
+    let status = resolve_base_with(r.path(), Some("main"), Some("feature-a")).unwrap().status;
+    assert_eq!(status.winner.unwrap().name(), "main");
+    assert!(!status.from_pr);
+}
+
+#[test]
+fn with_a_pr_target_in_play_the_default_is_a_pick_and_the_target_is_the_way_back() {
+    let r = Repo::init();
+    r.write("base.rs", "1\n");
+    r.commit_all("base");
+    r.set_origin_default("main", "HEAD");
+    r.git(&["branch", "feature-a"]);
+    r.git(&["branch", "dev"]);
+    r.git(&["checkout", "-q", "-b", "feature-b"]);
+
+    // Picking the default over a stacked PR's target must stick: a deleted ref would
+    // fall back to the target, not the default.
+    write_base_pick_with(r.path(), "main", Some("feature-a")).unwrap();
+    assert_eq!(read_base_pick(r.path()).unwrap().as_deref(), Some("main"));
+    let status = resolve_base_with(r.path(), None, Some("feature-a")).unwrap().status;
+    assert_eq!(status.winner.unwrap().name(), "main");
+
+    // Picking the target itself clears the pick, so the pane follows the PR's next retarget.
+    write_base_pick_with(r.path(), "feature-a", Some("feature-a")).unwrap();
+    assert_eq!(read_base_pick(r.path()).unwrap(), None);
+
+    // A target that does not resolve is not in play: the default is the way back again.
+    write_base_pick_with(r.path(), "dev", Some("gone")).unwrap();
+    write_base_pick_with(r.path(), "main", Some("gone")).unwrap();
+    assert_eq!(read_base_pick(r.path()).unwrap(), None);
 }
 
 #[test]

@@ -649,6 +649,10 @@ pub struct App {
     /// Bumped by each pick made in this pane, so an in-flight build that read the old pick
     /// fails the landing's input match instead of reverting the pick (`crate::world::WorldInput`).
     base_epoch: u64,
+    /// The open PR's target when it is a stacked PR's parent branch ([`Self::apply_pr`]),
+    /// the `branch` scope's base below the flag and the pick (`git::resolve_base_with`).
+    /// Moved only by a landed PR snapshot, so a refetch that failed or held keeps it.
+    pr_base: Option<String>,
     pub scope: Scope,
     /// The active tab; it drives both panes and selects the per-tab state in play.
     pub tab: Tab,
@@ -930,6 +934,7 @@ impl App {
             pick_status: None,
             commit_picker: None,
             base_epoch: 0,
+            pr_base: None,
             scope,
             tab: Tab::Changes,
             active_file_tab: Tab::Changes,
@@ -1141,6 +1146,9 @@ impl App {
         // below may reinstate the stale stashed frame, so the pending request must survive
         // the swap or that frame never refreshes until the next poll.
         self.world_request = old.world_request.take();
+        // The recovered app refetches its PR; until that lands the base stays where the
+        // painted frame put it, rather than dropping to the default for one round trip.
+        self.pr_base = old.pr_base.take();
         let old_mode = old.mode.clone();
         match old_mode {
             // `set_config_error` closes the search overlay, the find band, and the agent picker
@@ -1331,6 +1339,9 @@ impl App {
             scope: self.scope,
             base: self.base.clone(),
             base_epoch: self.base_epoch,
+            // Only the `branch` scope reads it, so it stays out of every other scope's tag —
+            // a PR landing there must not invalidate an in-flight build.
+            pr_base: if self.scope == Scope::Branch { self.pr_base.clone() } else { None },
             turn_baseline: self.turn_baseline.clone(),
             commit_pick: self.commit_pick.clone(),
             // `Changes` never reads the toggled set, so it stays out of that tab's tag —
@@ -2521,6 +2532,24 @@ impl App {
         self.pr_nav_scroll.set(0);
         self.reveal_pr_nav.set(true);
         self.pr_expanded_details.clear();
+        self.set_pr_base(None);
+    }
+
+    /// The stacked-PR base the `branch` scope falls back to before the default branch.
+    #[must_use]
+    pub fn pr_base(&self) -> Option<&str> {
+        self.pr_base.as_deref()
+    }
+
+    /// Follow the PR's target. A move is a world event like another pane's pick: the next
+    /// build re-resolves the base and its landing reconciles by identity (Continuity).
+    fn set_pr_base(&mut self, base: Option<String>) {
+        if self.pr_base != base {
+            self.pr_base = base;
+            if self.scope == Scope::Branch {
+                self.request_world_refresh(false, false);
+            }
+        }
     }
 
     /// Apply a snapshot fetched off-thread (`forge::fetch` runs on a worker so the UI never
@@ -2562,6 +2591,15 @@ impl App {
             .pr_selected_comment()
             .map(|c| (c.author.clone(), c.created_at.clone(), c.anchor.clone()));
         self.pr = view;
+        // An open PR's target is the stack's parent. A fork PR's target names a branch of
+        // another repository than `origin`, so it never moves the base; a finished PR's
+        // target is history.
+        let pr_base = self
+            .pr_snapshot()
+            .filter(|s| s.state == forge::PrState::Open && !s.head_is_fork)
+            .map(|s| s.base_ref.clone())
+            .filter(|b| !b.is_empty());
+        self.set_pr_base(pr_base);
         let offset = self.pr_description_offset();
         let restored = if on_description {
             self.pr_has_description()
@@ -4637,9 +4675,9 @@ impl App {
     }
 
     /// Open the base picker: one row per branch, the open PR's target first, the default
-    /// branch next, the rest by tip recency, each with its trail facts. Picking the
-    /// default row is the way back to the default: its name deletes the pick instead of
-    /// recording it. A current non-branch pick is inserted as a row. The highlight opens
+    /// branch next, the rest by tip recency, each with its trail facts. Picking the row the
+    /// chain would choose on its own — the stacked PR's target, else the default — is the way
+    /// back: its name deletes the pick instead of recording it. A current non-branch pick is inserted as a row. The highlight opens
     /// on the current base, else the first row. Still opens when that list is empty, so a
     /// revision can be typed.
     pub fn open_base_picker(&mut self) {
@@ -4649,13 +4687,15 @@ impl App {
         // The base is re-resolved here, not read from `branch_base`: that lands only while
         // `branch` is showing, and the picker opens from every scope. One pass serves both
         // the winner and the default row's mark.
-        let resolution = match git::resolve_base(&self.repo, self.base.as_deref()) {
-            Ok(r) => r,
-            Err(e) => {
-                self.status = e.0;
-                return;
-            }
-        };
+        let resolution =
+            match git::resolve_base_with(&self.repo, self.base.as_deref(), self.pr_base.as_deref())
+            {
+                Ok(r) => r,
+                Err(e) => {
+                    self.status = e.0;
+                    return;
+                }
+            };
         let (winner, default) = (resolution.status.winner, resolution.default);
         let listed = git::list_branches(&self.repo).and_then(|rows| {
             let current = git::checked_out_branch(&self.repo)?;
@@ -4727,8 +4767,9 @@ impl App {
     }
 
     /// Pick the highlighted row: persist its spelling, then rebuild the changeset
-    /// against it. The default row is the way back: its spelling deletes the ref instead
-    /// (`git::write_base_pick`), so the pane follows the repo's default again. With no
+    /// against it. The chain's own choice is the way back: its spelling deletes the ref
+    /// instead (`git::write_base_pick_with`), so the pane follows the PR's target, else the
+    /// repo's default, again. With no
     /// visible row, Enter checks the query immediately and records it if it resolves.
     pub fn base_picker_pick(&mut self) -> Result<()> {
         let Some(bp) = &self.base_picker else { return Ok(()) };
@@ -4744,7 +4785,7 @@ impl App {
         };
         let Some(choice) = choice else { return Ok(()) };
         self.close_base_picker();
-        let write = git::write_base_pick(&self.repo, choice.name());
+        let write = git::write_base_pick_with(&self.repo, choice.name(), self.pr_base.as_deref());
         if let Err(e) = write {
             self.status = e.0;
             return Ok(());
@@ -4797,13 +4838,14 @@ impl App {
     /// a base with no merge-base (unrelated histories, a shallow cut) lists the last 50.
     fn list_commit_rows(&self) -> Result<CommitPicker, String> {
         let head = git::head_oid(&self.repo);
-        let base = git::resolve_base(&self.repo, self.base.as_deref())
-            .map_err(|e| e.0)?
-            .status
-            .winner
-            .and_then(|b| git::merge_base(&self.repo, b.oid()).map(|mb| (b, mb)))
-            // On the base branch itself the range is empty: the last 50 is the universe.
-            .filter(|(_, mb)| head.as_deref() != Some(mb.as_str()));
+        let base =
+            git::resolve_base_with(&self.repo, self.base.as_deref(), self.pr_base.as_deref())
+                .map_err(|e| e.0)?
+                .status
+                .winner
+                .and_then(|b| git::merge_base(&self.repo, b.oid()).map(|mb| (b, mb)))
+                // On the base branch itself the range is empty: the last 50 is the universe.
+                .filter(|(_, mb)| head.as_deref() != Some(mb.as_str()));
         let rows = git::list_commits(&self.repo, base.as_ref().map(|(_, mb)| mb.as_str()))
             .map_err(|e| e.to_string())?;
         // A base with a merge-base behind `HEAD` always lists something, so the only empty
@@ -5260,7 +5302,7 @@ mod tests {
                 name: "main".to_string(),
                 oid: "0".repeat(40),
             }),
-            skipped: None,
+            ..Default::default()
         };
 
         let mut recovered = App::new(PathBuf::from("."), Scope::Branch, None);
