@@ -2784,6 +2784,10 @@ fn action_key_label(app: &App, action: FooterAction) -> (String, String) {
         // `enter` opens the highlight in every list: a search result, a base, a commit run.
         A::OpenResult | A::PickBaseRow => ("enter".into(), "open"),
         A::OpenPr => (hint(K::OpenPr), "open ↗"),
+        A::ToggleThread => {
+            let folded = app.pr_selected_comment().is_some_and(|cm| app.pr_card_collapsed(cm));
+            (hint(K::ToggleThread), if folded { "expand" } else { "collapse" })
+        }
         A::Refresh => (hint(K::Refresh), "refresh"),
         A::Tabs => {
             (format!("{}·{}·{}", hint(K::TabChanges), hint(K::TabAllFiles), hint(K::TabPr)), "tabs")
@@ -4754,6 +4758,9 @@ struct PrReadContent {
     /// Each turn byline's display line and its author's avatar URL — the painted ones start
     /// their downloads first.
     avatars: Vec<(usize, String)>,
+    /// The display lines a click folds or unfolds a card on — a foldable card's header, and a
+    /// folded card's summary — each with the comment it names.
+    toggles: Vec<(usize, forge::CommentKey)>,
 }
 
 /// Below this pane width a comment box would leave too little room for its text, so the
@@ -4898,20 +4905,8 @@ fn push_card(
     let base = content.lines.len();
     // Box chrome: `│ ` + the 2-column timeline before the text, ` │` after it.
     let (left, cw) = if boxed { (4, width - 6) } else { (0, width) };
-    let border = Style::default().fg(if selected { p.blue } else { p.dim2 });
-    if boxed {
-        let (header, used) = fit_spans(header, width - 6);
-        let mut top = vec![Span::styled("╭─ ", border)];
-        top.extend(header);
-        top.push(Span::styled(format!(" {}╮", "─".repeat(width - 5 - used)), border));
-        content.lines.push(Line::from(top));
-        content.cols.push((3, Some(used)));
-    } else {
-        let mark = Span::styled(if selected { "▌ " } else { "  " }, Style::default().fg(p.blue));
-        let (header, _) = fit_spans(std::iter::once(mark).chain(header).collect(), width);
-        content.lines.push(Line::from(header));
-        content.cols.push((0, None));
-    }
+    let border = card_border(selected, p);
+    push_card_edge(content, true, header, width, selected, p);
     let first = base + 1;
     if boxed {
         content.avatars.extend(card.avatars.into_iter().map(|(row, url)| (first + row, url)));
@@ -4955,6 +4950,75 @@ fn push_card(
         content.cols.push((0, Some(0)));
     }
     content.body_meta.extend(card.bodies.into_iter().map(|(row, r)| (first + row, left, r)));
+}
+
+/// A card's border style: the accent on the selected card, dim on the others.
+fn card_border(selected: bool, p: &Palette) -> Style {
+    Style::default().fg(if selected { p.blue } else { p.dim2 })
+}
+
+/// One edge line of a card carrying `spans` — the top border with the header, or a folded
+/// card's bottom border with its summary — between its rounded corners. Below
+/// [`MIN_BOX_WIDTH`] a top edge is the flat header line, marked when selected, and a bottom
+/// edge is its indented summary line.
+fn push_card_edge(
+    content: &mut PrReadContent,
+    top: bool,
+    spans: Vec<Span<'static>>,
+    width: usize,
+    selected: bool,
+    p: &Palette,
+) {
+    if width >= MIN_BOX_WIDTH {
+        let border = card_border(selected, p);
+        let (open, close) = if top { ("╭─ ", "╮") } else { ("╰─ ", "╯") };
+        let (spans, used) = fit_spans(spans, width - 6);
+        let mut line = vec![Span::styled(open, border)];
+        line.extend(spans);
+        line.push(Span::styled(format!(" {}{close}", "─".repeat(width - 5 - used)), border));
+        content.lines.push(Line::from(line));
+        content.cols.push((3, Some(used)));
+    } else {
+        let lead = if top && selected { "▌ " } else { "  " };
+        let mark = Span::styled(lead, Style::default().fg(p.blue));
+        let (line, _) = fit_spans(std::iter::once(mark).chain(spans).collect(), width);
+        content.lines.push(Line::from(line));
+        content.cols.push((if top { 0 } else { 2 }, None));
+    }
+}
+
+/// A folded card: its header in the top border and a one-line summary — the root's author
+/// and first line, dimmed — in the bottom border, so the closed thread still says what it was.
+fn push_folded_card(
+    content: &mut PrReadContent,
+    header: Vec<Span<'static>>,
+    cm: &forge::Comment,
+    width: usize,
+    selected: bool,
+    p: &Palette,
+) {
+    push_card_edge(content, true, header, width, selected, p);
+    let author_color = if cm.author_is_bot { p.dim1 } else { p.orange };
+    let mut summary =
+        vec![Span::styled(format!("@{}", cm.author), Style::default().fg(author_color))];
+    if let Some(first) = cm.body.lines().map(str::trim).find(|l| !l.is_empty()) {
+        summary.push(Span::styled(format!(" {first}"), Style::default().fg(p.dim2)));
+    }
+    // A summary cut at the border ends in an ellipsis, so it reads as cut.
+    let room = if width >= MIN_BOX_WIDTH { width - 6 } else { width.saturating_sub(2) };
+    let text: String = summary.iter().map(|sp| sp.content.as_ref()).collect();
+    if text.width() > room {
+        let (mut cut, _) = fit_spans(summary, room.saturating_sub(1));
+        cut.push(Span::styled("…", Style::default().fg(p.dim2)));
+        summary = cut;
+    }
+    push_card_edge(content, false, summary, width, selected, p);
+}
+
+/// The fold marker opening a foldable card's header: `▸` folded, `▾` open.
+fn fold_marker(collapsed: bool, selected: bool, p: &Palette) -> Span<'static> {
+    let style = Style::default().fg(if selected { p.blue } else { p.dim1 });
+    Span::styled(if collapsed { "▸ " } else { "▾ " }, style)
 }
 
 /// A full-width heavy rule opening with a `label` — the line that parts the unboxed
@@ -5041,6 +5105,7 @@ fn pr_read_content(app: &App, inner: Rect) -> PrReadContent {
         cols: Vec::new(),
         tops: Vec::new(),
         avatars: Vec::new(),
+        toggles: Vec::new(),
     };
     let Some(s) = app.pr_snapshot().filter(|s| app.pr_has_description() || !s.comments.is_empty())
     else {
@@ -5083,9 +5148,23 @@ fn pr_read_content(app: &App, inner: Rect) -> PrReadContent {
         // The box's top line is the card's top: a selection scrolls its border to the edge.
         content.tops.push(content.lines.len());
         let selected = app.pr_cursor == i + offset;
-        let card = build_card(app, cm, cw, p);
-        let header = card_header(cm, selected, p);
-        push_card(&mut content, header, card, width, selected, app.avatar_geometry(), p);
+        let mut header = card_header(cm, selected, p);
+        if !cm.is_collapsible() {
+            let card = build_card(app, cm, cw, p);
+            push_card(&mut content, header, card, width, selected, app.avatar_geometry(), p);
+            continue;
+        }
+        let collapsed = app.pr_card_collapsed(cm);
+        header.insert(0, fold_marker(collapsed, selected, p));
+        let head = content.lines.len();
+        content.toggles.push((head, cm.key()));
+        if collapsed {
+            push_folded_card(&mut content, header, cm, width, selected, p);
+            content.toggles.push((head + 1, cm.key()));
+        } else {
+            let card = build_card(app, cm, cw, p);
+            push_card(&mut content, header, card, width, selected, app.avatar_geometry(), p);
+        }
     }
     content
 }
@@ -5139,6 +5218,7 @@ fn render_pr_read(frame: &mut Frame, app: &App, pane: Pane) {
         let shifted = Rect::new(body.x + col, body.y, body.width - col, body.height);
         note_markdown_regions(app, rendered, shifted, scroll, *row);
     }
+    note_pr_read_folds(app, &content, body, scroll);
     frame.render_widget(Paragraph::new(content.lines).scroll((saturating_row(scroll), 0)), body);
     render_overflow_scrollbar(
         frame,
@@ -5147,6 +5227,28 @@ fn render_pr_read(frame: &mut Frame, app: &App, pane: Pane) {
         scroll,
         p,
     );
+}
+
+/// Note what this frame painted for the cards' folds: each on-screen fold toggle's row, and
+/// every cursor item with a line on screen — the cards a refresh must not fold under the reader.
+fn note_pr_read_folds(app: &App, content: &PrReadContent, body: Rect, scroll: usize) {
+    let viewport = scroll..scroll + body.height as usize;
+    for (line, key) in &content.toggles {
+        if viewport.contains(line) {
+            let y = body.y + (line - scroll) as u16;
+            app.note_painted_card_toggle(body.x, body.x + body.width, y, key.clone());
+        }
+    }
+    let ends = content.tops.iter().skip(1).copied().chain(std::iter::once(content.lines.len()));
+    let items = content
+        .tops
+        .iter()
+        .zip(ends)
+        .enumerate()
+        .filter(|(_, (top, end))| **top < viewport.end && *end > viewport.start)
+        .map(|(i, _)| i)
+        .collect();
+    app.note_pr_read_painted_items(items);
 }
 
 /// The one-line message for a loading, empty, or degraded PR view, in the resolved forge's

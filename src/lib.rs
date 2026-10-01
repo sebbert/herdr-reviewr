@@ -1936,6 +1936,7 @@ pub fn handle_key(app: &mut App, key: KeyEvent, area: Rect, keymap: &Keymap) -> 
             (Some(K::TabChanges), _) => app.set_tab(crate::app::Tab::Changes)?,
             (Some(K::TabAllFiles), _) => app.set_tab(crate::app::Tab::AllFiles)?,
             (Some(K::OpenPr), _) => app.pr_open(),
+            (Some(K::ToggleThread), _) => app.toggle_selected_pr_card(),
             (Some(K::Search), _) => app.open_search(),
             (Some(K::NavigatorPosition), _) => app.cycle_navigator_position(),
             (Some(K::NavigatorGrow), _) => app.resize_navigator(4),
@@ -2037,9 +2038,9 @@ pub fn handle_key(app: &mut App, key: KeyEvent, area: Rect, keymap: &Keymap) -> 
             K::Search => app.open_search(),
             K::Find => app.open_find(),
             K::Keys => app.toggle_keys(),
-            // `delete` off the diff and `open-pr` off the `PR` tab are inert. `edit` is not:
-            // it reaches the navigator's file rows too.
-            K::Delete | K::OpenPr => {}
+            // `delete` off the diff, and `open-pr` and `toggle-thread` off the `PR` tab, are
+            // inert. `edit` is not: it reaches the navigator's file rows too.
+            K::Delete | K::OpenPr | K::ToggleThread => {}
         }
         return Ok(());
     }
@@ -2453,6 +2454,9 @@ fn perform_click(
             } else if let Some(summary) = app.painted_details_at(m.column, m.row) {
                 app.focus = Focus::Diff;
                 app.toggle_details(&summary);
+            } else if let Some(key) = app.painted_card_toggle_at(m.column, m.row) {
+                app.focus = Focus::Diff;
+                app.toggle_pr_card(&key);
             } else if app.tab == crate::app::Tab::Pr || app.preview_active() {
                 // The painted surfaces have no cursor: a click only focuses the pane.
                 if ui::in_diff_pane(area, app, m.column, m.row) {

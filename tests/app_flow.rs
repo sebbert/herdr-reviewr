@@ -7930,3 +7930,220 @@ fn the_folder_dot_appears_under_a_poll_without_moving_the_cursor() {
     assert_eq!(app.file_cursor, dir_row + 1, "the folder's row moved down one");
     assert!(marked(&app), "the folder is marked and still collapsed");
 }
+
+/// The screen cell where `needle` first paints on a fresh [`SEL_AREA`] frame.
+fn painted_cell(app: &App, needle: &str) -> Option<(u16, u16)> {
+    let backend = ratatui::backend::TestBackend::new(SEL_AREA.width, SEL_AREA.height);
+    let mut terminal = ratatui::Terminal::new(backend).unwrap();
+    terminal.draw(|f| herdr_reviewr::ui::render(f, app)).unwrap();
+    let buf = terminal.backend().buffer();
+    (0..SEL_AREA.height).find_map(|y| {
+        let line: String = (0..SEL_AREA.width).map(|x| buf[(x, y)].symbol().to_string()).collect();
+        let at = line.find(needle)?;
+        Some((u16::try_from(line[..at].chars().count()).unwrap(), y))
+    })
+}
+
+/// A click: a same-cell press and release, each over a freshly painted frame.
+fn click(app: &mut App, (col, row): (u16, u16)) {
+    sel_mouse(app, MouseEventKind::Down(MouseButton::Left), col, row);
+    sel_mouse(app, MouseEventKind::Up(MouseButton::Left), col, row);
+}
+
+/// A PR tab over `comments`, landed the way a fetch lands.
+fn pr_app(r: &Repo, comments: Vec<herdr_reviewr::forge::Comment>) -> App {
+    use herdr_reviewr::forge::{PrSnapshot, PrView};
+    let mut app = app_on(r);
+    app.set_tab(herdr_reviewr::app::Tab::Pr).unwrap();
+    app.apply_pr(PrView::Pr(Box::new(PrSnapshot { comments, ..common::pr_snapshot() })));
+    app
+}
+
+fn land_comments(app: &mut App, comments: Vec<herdr_reviewr::forge::Comment>) {
+    use herdr_reviewr::forge::{PrSnapshot, PrView};
+    app.apply_pr(PrView::Pr(Box::new(PrSnapshot { comments, ..common::pr_snapshot() })));
+}
+
+fn folded(app: &App, author: &str) -> bool {
+    let s = app.pr_snapshot().unwrap();
+    app.pr_card_collapsed(s.comments.iter().find(|c| c.author == author).unwrap())
+}
+
+#[test]
+fn a_click_on_a_thread_header_folds_and_unfolds_it_with_or_without_outer_borders() {
+    let r = Repo::init();
+    r.write("x.rs", "y\n");
+    r.commit_all("init");
+    for borders in [true, false] {
+        let mut app = pr_app(&r, vec![common::thread("ann", 3, 9, true)]);
+        if !borders {
+            let dir = tempfile::tempdir().unwrap();
+            std::fs::write(dir.path().join("config.toml"), "pane_outer_borders = false\n").unwrap();
+            app.set_plugin_config(herdr_reviewr::config::plugin_config_in(dir.path()).unwrap());
+        }
+        assert!(folded(&app, "ann"), "a resolved thread starts folded");
+        app.focus = Focus::Files;
+
+        let header = painted_cell(&app, "▸ x.rs:3").expect("the folded header paints");
+        click(&mut app, header);
+        assert!(!folded(&app, "ann"), "a header click unfolds (borders {borders})");
+        assert_eq!(app.focus, Focus::Diff, "and focuses the read pane");
+        assert!(painted_cell(&app, "ann reply").is_some(), "the turns paint");
+
+        // The open header folds it back; a click past the header's text still hits the row.
+        let (x, y) = painted_cell(&app, "▾ x.rs:3").expect("the open header paints");
+        click(&mut app, (x + 40, y));
+        assert!(folded(&app, "ann"), "a second header click folds (borders {borders})");
+
+        // The folded card's summary line is part of its header.
+        let (x, y) = painted_cell(&app, "@ann ann root").expect("the summary paints");
+        click(&mut app, (x, y));
+        assert!(!folded(&app, "ann"), "a summary click unfolds too");
+
+        // A click in an open card's body is not a fold toggle.
+        let body = painted_cell(&app, "ann root more").unwrap();
+        click(&mut app, body);
+        assert!(!folded(&app, "ann"), "a body click leaves the card open");
+    }
+}
+
+#[test]
+fn the_toggle_thread_key_folds_the_selected_thread_and_rebinds() {
+    use herdr_reviewr::forge::Comment;
+    let r = Repo::init();
+    r.write("x.rs", "y\n");
+    r.commit_all("init");
+    let mut app = pr_app(
+        &r,
+        vec![
+            common::thread("ann", 3, 9, true),
+            Comment { author: "bob".into(), ..common::comment() },
+        ],
+    );
+    let keymap = Keymap::default();
+    let row1 = |app: &App| -> Vec<FooterAction> {
+        app.footer_bands().iter().filter(|(_, b)| *b == Band::Do).map(|(a, _)| *a).collect()
+    };
+    assert!(row1(&app).contains(&FooterAction::ToggleThread), "a thread offers the toggle");
+    let footer = painted_cell(&app, "a expand");
+    assert!(footer.is_some(), "a folded thread's hint names the next act");
+
+    press(&mut app, &keymap, KeyCode::Char('a'));
+    assert!(!folded(&app, "ann"), "the key unfolds the selected thread");
+    assert!(painted_cell(&app, "a collapse").is_some(), "and the hint flips");
+    press(&mut app, &keymap, KeyCode::Char('a'));
+    assert!(folded(&app, "ann"), "and folds it again");
+
+    // A plain comment has nothing to fold: no hint, and the key is inert.
+    app.pr_move(1);
+    assert!(!row1(&app).contains(&FooterAction::ToggleThread));
+    press(&mut app, &keymap, KeyCode::Char('a'));
+    assert!(folded(&app, "ann"), "the key acts on the selection only");
+
+    // Rebound, the new key folds and the old one is free.
+    let keymap = Keymap::resolve(&[(Action::ToggleThread, vec![Key::plain('h')])]).unwrap();
+    app.pr_move(-1);
+    press(&mut app, &keymap, KeyCode::Char('a'));
+    assert!(folded(&app, "ann"), "the default is unbound");
+    press(&mut app, &keymap, KeyCode::Char('h'));
+    assert!(!folded(&app, "ann"), "the rebound key toggles");
+}
+
+#[test]
+fn a_fold_toggle_follows_its_thread_by_identity_across_a_refresh_and_a_reorder() {
+    let r = Repo::init();
+    r.write("x.rs", "y\n");
+    r.commit_all("init");
+    let ann = common::thread("ann", 3, 9, true);
+    let bob = common::thread("bob", 5, 10, false);
+    let mut app = pr_app(&r, vec![ann.clone(), bob.clone()]);
+    // Unfold the resolved thread, fold the open one.
+    app.toggle_pr_card(&ann.key());
+    app.toggle_pr_card(&bob.key());
+    assert!(!folded(&app, "ann") && folded(&app, "bob"));
+
+    // A refresh inserts an older thread ahead of both and reverses them: each toggle stays
+    // on its own thread, never its old row.
+    let dan = common::thread("dan", 1, 8, true);
+    land_comments(&mut app, vec![dan, bob.clone(), ann.clone()]);
+    assert!(!folded(&app, "ann"), "ann's unfold follows her");
+    assert!(folded(&app, "bob"), "bob's fold follows him");
+    assert!(folded(&app, "dan"), "the new resolved thread takes the default");
+
+    // The toggle outlives the thread's own state change: bob resolved stays as toggled, and
+    // so does ann reopened.
+    let bob_resolved = herdr_reviewr::forge::Comment { is_resolved: true, ..bob };
+    let ann_open = herdr_reviewr::forge::Comment { is_resolved: false, ..ann };
+    land_comments(&mut app, vec![bob_resolved, ann_open]);
+    assert!(folded(&app, "bob") && !folded(&app, "ann"));
+}
+
+#[test]
+fn a_thread_resolved_under_the_reader_stays_open_until_they_move() {
+    let r = Repo::init();
+    r.write("x.rs", "y\n");
+    r.commit_all("init");
+    let ann = common::thread("ann", 3, 9, false);
+    let bob = common::thread("bob", 5, 10, false);
+    let mut app = pr_app(&r, vec![ann.clone(), bob.clone()]);
+    let _ = painted_cell(&app, "");
+    assert_eq!(app.pr_selected_comment().map(|c| c.author.as_str()), Some("ann"));
+
+    // The selected thread is resolved by a refresh: its card holds open under the reader,
+    // its header already saying `resolved`.
+    let resolved = |c: &herdr_reviewr::forge::Comment| herdr_reviewr::forge::Comment {
+        is_resolved: true,
+        ..c.clone()
+    };
+    land_comments(&mut app, vec![resolved(&ann), bob.clone()]);
+    assert!(!folded(&app, "ann"), "the read card does not fold under the reader");
+    assert!(painted_cell(&app, "▾ x.rs:3 · resolved").is_some());
+    assert!(painted_cell(&app, "ann reply").is_some());
+
+    // Repeated polls keep holding it.
+    land_comments(&mut app, vec![resolved(&ann), bob.clone()]);
+    assert!(!folded(&app, "ann"), "a later poll keeps the hold");
+
+    // The reader moves on: the hold releases, and ann shows her resolved default.
+    app.pr_move(1);
+    assert!(folded(&app, "ann"), "the next move releases the hold");
+
+    // Reopened under the reader (bob is selected and painted), ann's card is on screen too:
+    // it stays folded until the reader moves.
+    let _ = painted_cell(&app, "");
+    land_comments(&mut app, vec![ann.clone(), bob.clone()]);
+    assert!(folded(&app, "ann"), "an on-screen card keeps its painted fold");
+    app.pr_move(-1);
+    assert!(!folded(&app, "ann"), "the move releases it to the open default");
+
+    // The reader's own toggle beats a hold.
+    let _ = painted_cell(&app, "");
+    land_comments(&mut app, vec![resolved(&ann), bob]);
+    assert!(!folded(&app, "ann"));
+    app.toggle_selected_pr_card();
+    assert!(folded(&app, "ann"), "the toggle folds the held card");
+}
+
+#[test]
+fn folding_a_thread_the_reader_scrolled_into_brings_its_header_to_the_top() {
+    use herdr_reviewr::forge::Comment;
+    let r = Repo::init();
+    r.write("x.rs", "y\n");
+    r.commit_all("init");
+    let body = (0..30).map(|n| format!("ann-line-{n:02}")).collect::<Vec<_>>().join("\n\n");
+    let ann = Comment { body, ..common::thread("ann", 3, 9, false) };
+    // A long card follows, so the pane could stay scrolled past the folded header.
+    let bob = (0..30).map(|n| format!("bob-line-{n:02}")).collect::<Vec<_>>().join("\n\n");
+    let bob = Comment { author: "bob".into(), body: bob, ..common::comment() };
+    let mut app = pr_app(&r, vec![ann, bob]);
+    let top = painted_cell(&app, "▾ x.rs:3").expect("the open header").1;
+    for _ in 0..3 {
+        sel_mouse(&mut app, MouseEventKind::ScrollDown, 5, 10);
+    }
+    assert!(painted_cell(&app, "▾ x.rs:3").is_none(), "the reader scrolled past the header");
+
+    press(&mut app, &Keymap::default(), KeyCode::Char('a'));
+    let folded_at = painted_cell(&app, "▸ x.rs:3").expect("the folded header paints");
+    assert!(folded_at.1 <= top, "the header comes back into view at the top");
+    assert!(painted_cell(&app, "@bob").is_some(), "with what follows it below");
+}

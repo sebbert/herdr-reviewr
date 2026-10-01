@@ -239,6 +239,31 @@ pub struct Comment {
     pub avatar_url: Option<String>,
 }
 
+/// A comment's identity across snapshots: who posted it, when, and where. A refresh that
+/// reorders or inserts rows still finds the same comment by it (Continuity).
+pub type CommentKey = (String, String, String);
+
+impl Comment {
+    /// The identity the read pane's selection and collapse state follow across refreshes.
+    #[must_use]
+    pub fn key(&self) -> CommentKey {
+        (self.author.clone(), self.created_at.clone(), self.anchor.clone())
+    }
+
+    /// Whether `key` names this comment.
+    #[must_use]
+    pub fn has_key(&self, key: &CommentKey) -> bool {
+        self.author == key.0 && self.created_at == key.1 && self.anchor == key.2
+    }
+
+    /// Whether the read pane can fold this card to its header: an inline review thread, the
+    /// one kind every forge can resolve.
+    #[must_use]
+    pub fn is_collapsible(&self) -> bool {
+        self.kind == CommentKind::Finding
+    }
+}
+
 /// One reply on a thread. The root lives on [`Comment`].
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Reply {

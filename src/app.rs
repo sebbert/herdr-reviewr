@@ -603,6 +603,8 @@ pub enum FooterAction {
     /// scope already showing would offer a no-op there.
     ScopeOther,
     OpenPr,
+    /// Fold or unfold the selected PR thread card; the label names what the key does next.
+    ToggleThread,
     Refresh,
     Tabs,
     Quit,
@@ -756,6 +758,17 @@ pub struct App {
     painted_details: std::cell::RefCell<Vec<PaintedDetails>>,
     /// Open `<details>` on the selected PR description or thread.
     pr_expanded_details: HashSet<String>,
+    /// The reader's own fold toggles on the PR read pane's cards, by comment identity — a
+    /// card without one shows its default, folded exactly when the thread is resolved.
+    pr_card_toggles: HashMap<forge::CommentKey, bool>,
+    /// Cards a refresh would have folded or unfolded under the reader (their thread was
+    /// resolved or reopened while selected or on screen), held at their painted state until
+    /// the reader's next selection move.
+    pr_card_held: HashMap<forge::CommentKey, bool>,
+    /// Card header hit boxes painted this frame, each naming the card it folds.
+    painted_card_toggles: std::cell::RefCell<Vec<PaintedCardToggle>>,
+    /// The cursor items whose lines the last frame painted on screen.
+    pr_read_painted_items: std::cell::RefCell<Vec<usize>>,
     /// Open `<details>` in the file-tab markdown preview. Stashed per file tab.
     preview_expanded_details: HashSet<String>,
     /// The PR read pane's maximum useful scroll, noted the same way for
@@ -914,6 +927,15 @@ struct PaintedDetails {
     summary: std::sync::Arc<str>,
 }
 
+/// One painted card-header region: `x_start..x_end` on screen row `y`, folding `key`'s card.
+#[derive(Clone, Debug)]
+struct PaintedCardToggle {
+    x_start: u16,
+    x_end: u16,
+    y: u16,
+    key: forge::CommentKey,
+}
+
 #[derive(Debug)]
 enum PluginConfigState {
     Ready(crate::config::PluginConfig),
@@ -983,6 +1005,10 @@ impl App {
             painted_anchors: std::cell::RefCell::new(Vec::new()),
             painted_details: std::cell::RefCell::new(Vec::new()),
             pr_expanded_details: HashSet::new(),
+            pr_card_toggles: HashMap::new(),
+            pr_card_held: HashMap::new(),
+            painted_card_toggles: std::cell::RefCell::new(Vec::new()),
+            pr_read_painted_items: std::cell::RefCell::new(Vec::new()),
             preview_expanded_details: HashSet::new(),
             pr_read_max_scroll: std::cell::Cell::new(usize::MAX),
             navigator_position: crate::config::NavigatorPosition::Right,
@@ -1166,6 +1192,8 @@ impl App {
         // The recovered app refetches its PR; until that lands the base stays where the
         // painted frame put it, rather than dropping to the default for one round trip.
         self.pr_base = old.pr_base.take();
+        // Fold toggles are keyed by comment identity, so they apply to the refetched PR.
+        self.pr_card_toggles = std::mem::take(&mut old.pr_card_toggles);
         let old_mode = old.mode.clone();
         match old_mode {
             // `set_config_error` closes the search overlay, the find band, and the agent picker
@@ -2006,6 +2034,7 @@ impl App {
         self.painted_links.borrow_mut().clear();
         self.painted_anchors.borrow_mut().clear();
         self.painted_details.borrow_mut().clear();
+        self.painted_card_toggles.borrow_mut().clear();
         self.painted_slots.borrow_mut().clear();
     }
 
@@ -2621,6 +2650,9 @@ impl App {
         self.pr_nav_scroll.set(0);
         self.reveal_pr_nav.set(true);
         self.pr_expanded_details.clear();
+        self.pr_card_toggles.clear();
+        self.pr_card_held.clear();
+        self.pr_read_painted_items.borrow_mut().clear();
         self.set_pr_base(None);
     }
 
@@ -2676,10 +2708,10 @@ impl App {
         let on_description = self.pr_on_description();
         let old_cursor = self.pr_cursor;
         let old_number = self.pr_snapshot().map(|s| s.number);
-        let selected = self
-            .pr_selected_comment()
-            .map(|c| (c.author.clone(), c.created_at.clone(), c.anchor.clone()));
+        let selected = self.pr_selected_comment().map(forge::Comment::key);
+        let painted_folds = self.painted_card_folds();
         self.pr = view;
+        self.hold_painted_folds(painted_folds);
         // An open PR's target is the stack's parent. A fork PR's target names a branch of
         // another repository than `origin`, so it never moves the base; a finished PR's
         // target is history.
@@ -2695,10 +2727,8 @@ impl App {
                 .then_some(0)
                 .filter(|_| self.pr_snapshot().map(|s| s.number) == old_number)
         } else {
-            selected.as_ref().and_then(|(author, created, anchor)| {
-                let i = self.pr_snapshot()?.comments.iter().position(|c| {
-                    c.author == *author && c.created_at == *created && c.anchor == *anchor
-                })?;
+            selected.as_ref().and_then(|key| {
+                let i = self.pr_snapshot()?.comments.iter().position(|c| c.has_key(key))?;
                 Some(i + offset)
             })
         };
@@ -2808,6 +2838,110 @@ impl App {
         self.pr_read_reveal.set(Some(0));
         self.reveal_pr_nav.set(true);
         self.pr_expanded_details.clear();
+        // The reader moved: a card held through a refresh now shows its own state.
+        self.pr_card_held.clear();
+    }
+
+    /// Whether `cm`'s card paints folded to its header: a state held through a refresh first,
+    /// then the reader's own toggle, else the default — folded exactly when it is resolved.
+    #[must_use]
+    pub fn pr_card_collapsed(&self, cm: &forge::Comment) -> bool {
+        if !cm.is_collapsible() {
+            return false;
+        }
+        let key = cm.key();
+        self.pr_card_held
+            .get(&key)
+            .or_else(|| self.pr_card_toggles.get(&key))
+            .copied()
+            .unwrap_or(cm.is_resolved)
+    }
+
+    /// Fold or unfold the card of the comment named `key`, as the reader's own toggle. A card
+    /// that cannot fold, or a comment the snapshot no longer has, is inert.
+    pub fn toggle_pr_card(&mut self, key: &forge::CommentKey) {
+        let Some(cm) = self.pr_snapshot().and_then(|s| s.comments.iter().find(|c| c.has_key(key)))
+        else {
+            return;
+        };
+        if !cm.is_collapsible() {
+            return;
+        }
+        let folded = !self.pr_card_collapsed(cm);
+        self.pr_card_held.remove(key);
+        self.pr_card_toggles.insert(key.clone(), folded);
+    }
+
+    /// The `toggle-thread` key: fold or unfold the selected card. Folding a card the reader
+    /// had scrolled into brings its header to the pane's top, so the fold never leaves the
+    /// pane showing whatever followed it.
+    pub fn toggle_selected_pr_card(&mut self) {
+        let Some(key) = self.pr_selected_comment().map(forge::Comment::key) else {
+            return;
+        };
+        self.toggle_pr_card(&key);
+        if let Some((cursor, top)) = self.pr_read_painted_top.get()
+            && cursor == self.pr_cursor
+            && self.pr_read_scroll.get() > top
+        {
+            self.pr_read_reveal.set(Some(0));
+        }
+    }
+
+    /// Note one painted card header, in absolute screen cells.
+    pub(crate) fn note_painted_card_toggle(
+        &self,
+        x_start: u16,
+        x_end: u16,
+        y: u16,
+        key: forge::CommentKey,
+    ) {
+        self.painted_card_toggles.borrow_mut().push(PaintedCardToggle { x_start, x_end, y, key });
+    }
+
+    /// The card whose painted header is under `(col, row)`, if any.
+    #[must_use]
+    pub fn painted_card_toggle_at(&self, col: u16, row: u16) -> Option<forge::CommentKey> {
+        self.painted_card_toggles
+            .borrow()
+            .iter()
+            .find(|t| t.y == row && col >= t.x_start && col < t.x_end)
+            .map(|t| t.key.clone())
+    }
+
+    /// Note the cursor items whose lines this frame painted on screen.
+    pub(crate) fn note_pr_read_painted_items(&self, items: Vec<usize>) {
+        *self.pr_read_painted_items.borrow_mut() = items;
+    }
+
+    /// The fold state of every card the reader can see — the selected one and those last
+    /// painted on screen — before a refresh replaces the snapshot.
+    fn painted_card_folds(&self) -> Vec<(forge::CommentKey, bool)> {
+        let Some(s) = self.pr_snapshot() else {
+            return Vec::new();
+        };
+        let offset = self.pr_description_offset();
+        let items = self.pr_read_painted_items.borrow();
+        std::iter::once(self.pr_cursor)
+            .chain(items.iter().copied())
+            .filter_map(|i| s.comments.get(i.checked_sub(offset)?))
+            .map(|cm| (cm.key(), self.pr_card_collapsed(cm)))
+            .collect()
+    }
+
+    /// Hold each card the reader could see at its painted fold when the new snapshot's
+    /// default would flip it — a thread resolved under the reader stays open until they move
+    /// (Continuity: a world event never folds what the reader is looking at).
+    fn hold_painted_folds(&mut self, folds: Vec<(forge::CommentKey, bool)>) {
+        let flipped: Vec<_> = folds
+            .into_iter()
+            .filter(|(key, was)| {
+                self.pr_snapshot()
+                    .and_then(|s| s.comments.iter().find(|c| c.has_key(key)))
+                    .is_some_and(|cm| self.pr_card_collapsed(cm) != *was)
+            })
+            .collect();
+        self.pr_card_held.extend(flipped);
     }
 
     pub(crate) fn pr_scroll_nav(&mut self, delta: isize) {
@@ -4507,6 +4641,9 @@ impl App {
             let mut out = Vec::new();
             if self.pr_snapshot().is_some() {
                 out.push((A::OpenPr, Primary));
+            }
+            if self.pr_selected_comment().is_some_and(forge::Comment::is_collapsible) {
+                out.push((A::ToggleThread, Do));
             }
             out.push((A::Search, Go));
             out.push((A::TogglePane, Go));

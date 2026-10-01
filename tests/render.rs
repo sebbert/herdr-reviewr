@@ -77,7 +77,10 @@ fn read_column(out: &str) -> Vec<String> {
 /// The border colour of the read-pane box whose top border opens with `header`.
 fn corner_of(buf: &Buffer, header: &str) -> Option<ratatui::style::Color> {
     let read = read_column(&dump(buf));
-    let y = read.iter().position(|l| l.starts_with(&format!("╭─ {header}")))?;
+    // A foldable card's header opens with its fold marker.
+    let y = read.iter().position(|l| {
+        ["", "▸ ", "▾ "].iter().any(|mark| l.starts_with(&format!("╭─ {mark}{header}")))
+    })?;
     Some(buf[(1, y as u16)].fg)
 }
 
@@ -1713,6 +1716,18 @@ fn the_read_pane_shows_the_description_then_every_comment_oldest_first() {
         ..common::pr_snapshot()
     }));
 
+    // The resolved thread paints folded: its header, then its root's first line in the
+    // bottom border, the turns hidden.
+    let out = render(&app);
+    let read = read_column(&out);
+    let head = read.iter().position(|l| l.starts_with("╭─ ▸ x.rs:1 · resolved · 1 reply "));
+    let head = head.unwrap_or_else(|| panic!("the folded header:\n{out}"));
+    assert!(read[head + 1].starts_with("╰─ @bob THREAD_ROOT ─"), "the summary edge:\n{out}");
+    assert!(read[head + 1].trim_end().ends_with('╯'), "the folded box closes:\n{out}");
+    assert!(!out.contains("THREAD_REPLY"), "the turns stay hidden:\n{out}");
+    let thread = app.pr_snapshot().unwrap().comments[1].key();
+    app.toggle_pr_card(&thread);
+
     let out = render(&app);
     let at = |needle: &str| out.find(needle).unwrap_or_else(|| panic!("{needle} missing:\n{out}"));
     // One conversation: the description, a labelled separator, then each card oldest first,
@@ -1738,7 +1753,7 @@ fn the_read_pane_shows_the_description_then_every_comment_oldest_first() {
     let flush =
         read.windows(2).filter(|w| w[0].starts_with("╰─") && w[1].starts_with("╭─ ")).count();
     assert_eq!(flush, 2, "no blank line between boxes:\n{out}");
-    assert!(read.iter().any(|l| l.starts_with("╭─ x.rs:1 · resolved · 1 reply ")), "{out}");
+    assert!(read.iter().any(|l| l.starts_with("╭─ ▾ x.rs:1 · resolved · 1 reply ")), "{out}");
     let thread: Vec<&String> = read
         .iter()
         .skip_while(|l| !l.contains("x.rs:1 · resolved"))
@@ -4992,4 +5007,164 @@ fn a_landed_avatar_covers_the_dots_cells_and_its_blank_neighbours_only() {
         let bob_row = row_of(&today, "● @bob") as u16;
         assert_ne!(buf[(border_x as u16 + 2, bob_row)].fg, id, "each author their own image");
     }
+}
+
+/// The frame cell where `needle` first paints, scanning row by row.
+fn find_cell(buf: &Buffer, needle: &str) -> Option<(u16, u16)> {
+    let out = dump(buf);
+    out.lines().enumerate().find_map(|(y, line)| {
+        let at = line.find(needle)?;
+        Some((line[..at].chars().count() as u16, y as u16))
+    })
+}
+
+#[test]
+fn a_resolved_thread_folds_to_a_two_line_box_and_its_header_hit_tests_where_it_paints() {
+    use herdr_reviewr::forge::{PrSnapshot, PrView};
+    let r = Repo::init();
+    r.write("x.rs", "y\n");
+    r.commit_all("init");
+    let long = (0..30).map(|n| format!("word{n}")).collect::<Vec<_>>().join(" ");
+    for borders in [true, false] {
+        let mut app = app_on(&r);
+        if !borders {
+            borderless(&mut app);
+        }
+        app.set_tab(Tab::Pr).unwrap();
+        // A long description wraps above the cards, so the hit rows sit past wrapped lines.
+        app.apply_pr(PrView::Pr(Box::new(PrSnapshot {
+            body: long.clone(),
+            comments: vec![common::thread("ann", 3, 9, true), common::thread("bob", 5, 10, false)],
+            ..common::pr_snapshot()
+        })));
+        let buf = render_buffer(&app);
+        let out = dump(&buf);
+        let read: Vec<&str> = out.lines().collect();
+        let head = read
+            .iter()
+            .position(|l| l.contains("╭─ ▸ x.rs:3 · resolved · 1 reply "))
+            .unwrap_or_else(|| panic!("the folded header (borders {borders}):\n{out}"));
+        assert!(
+            read[head + 1].contains("╰─ @ann ann root first line ─"),
+            "the summary edge (borders {borders}):\n{out}"
+        );
+        assert!(read[head + 2].contains("╭─ ▾ x.rs:5"), "the open thread follows flush:\n{out}");
+        assert!(!out.contains("ann reply"), "a folded thread hides its turns:\n{out}");
+        assert!(out.contains("bob reply"), "an unresolved thread stays open:\n{out}");
+
+        // The click boxes sit exactly on the painted header and summary rows.
+        let ann = app.pr_snapshot().unwrap().comments[0].key();
+        let bob = app.pr_snapshot().unwrap().comments[1].key();
+        let (x, y) = find_cell(&buf, "▸ x.rs:3").unwrap();
+        assert_eq!(app.painted_card_toggle_at(x, y), Some(ann.clone()));
+        assert_eq!(app.painted_card_toggle_at(x + 20, y + 1), Some(ann.clone()), "the summary");
+        assert_eq!(app.painted_card_toggle_at(x, y - 1), None, "nothing above the card");
+        let (x, y) = find_cell(&buf, "▾ x.rs:5").unwrap();
+        assert_eq!(app.painted_card_toggle_at(x, y), Some(bob));
+        assert_eq!(app.painted_card_toggle_at(x, y + 1), None, "an open card's body is text");
+
+        // Unfolded, the resolved thread paints whole under an open marker.
+        app.toggle_pr_card(&ann);
+        let out = render(&app);
+        assert!(out.contains("▾ x.rs:3 · resolved"), "{out}");
+        assert!(out.contains("ann reply"), "the turns are back:\n{out}");
+    }
+}
+
+#[test]
+fn a_folded_thread_paints_flat_in_a_narrow_pane_and_hit_tests_there() {
+    use herdr_reviewr::forge::{PrSnapshot, PrView};
+    let r = Repo::init();
+    r.write("x.rs", "y\n");
+    r.commit_all("init");
+    let mut app = app_on(&r);
+    app.set_tab(Tab::Pr).unwrap();
+    app.navigator_hidden = true;
+    app.apply_pr(PrView::Pr(Box::new(PrSnapshot {
+        comments: vec![common::thread("ann", 3, 9, true)],
+        ..common::pr_snapshot()
+    })));
+    let buf = render_size(&app, 22, 20);
+    let out = dump(&buf);
+    assert!(!out.contains('╭'), "too narrow for a box:\n{out}");
+    let (x, y) = find_cell(&buf, "▸ x.rs:3").unwrap_or_else(|| panic!("flat header:\n{out}"));
+    let summary = out.lines().nth(y as usize + 1).unwrap();
+    assert!(summary.contains("  @ann ann"), "the indented summary line:\n{out}");
+    assert!(summary.contains('…'), "a summary cut at the edge says so:\n{out}");
+    assert!(!out.contains("ann reply"), "{out}");
+    let ann = app.pr_snapshot().unwrap().comments[0].key();
+    assert_eq!(app.painted_card_toggle_at(x, y), Some(ann.clone()));
+    assert_eq!(app.painted_card_toggle_at(x, y + 1), Some(ann));
+    assert_eq!(app.painted_card_toggle_at(x, y + 2), None);
+}
+
+#[test]
+fn a_thread_resolved_above_the_reader_folds_without_moving_their_view() {
+    use herdr_reviewr::forge::{Comment, PrSnapshot, PrView};
+    let r = Repo::init();
+    r.write("x.rs", "y\n");
+    r.commit_all("init");
+    let mut app = app_on(&r);
+    app.set_tab(Tab::Pr).unwrap();
+    let long = |author: &str, line: u32, created: u8, resolved: bool| Comment {
+        body: (0..12).map(|n| format!("{author}-line-{n:02}")).collect::<Vec<_>>().join("\n\n"),
+        ..common::thread(author, line, created, resolved)
+    };
+    let snapshot = |first_resolved: bool, third_resolved: bool| {
+        PrView::Pr(Box::new(PrSnapshot {
+            comments: vec![
+                long("ann", 1, 9, first_resolved),
+                long("bob", 2, 10, false),
+                long("cat", 3, 11, third_resolved),
+            ],
+            ..common::pr_snapshot()
+        }))
+    };
+    app.apply_pr(snapshot(false, false));
+    let read = |app: &App| -> Vec<String> {
+        read_column(&render(app)).iter().map(|l| l.trim_end().to_string()).collect()
+    };
+    // Select bob and scroll into his card; ann's card is above, off screen.
+    app.pr_move(1);
+    let _ = read(&app);
+    for _ in 0..2 {
+        handle_mouse(
+            &mut app,
+            MouseEvent {
+                kind: MouseEventKind::ScrollDown,
+                column: 5,
+                row: 10,
+                modifiers: KeyModifiers::NONE,
+            },
+            Rect::new(0, 0, 140, 40),
+            &[],
+            &Keymap::default(),
+            &herdr_reviewr::export::Clipboard,
+        )
+        .unwrap();
+    }
+    let before = read(&app);
+    assert!(!before.iter().any(|l| l.contains("ann-line-")), "ann is off screen:\n{before:#?}");
+
+    // A refresh resolves ann, above the reader and off screen: her card folds by default, and
+    // the reader's lines stay put (the offset anchoring absorbs the shrink above).
+    app.apply_pr(snapshot(true, false));
+    let after = read(&app);
+    assert_eq!(before, after, "the reader's view does not move");
+    assert!(app.pr_card_collapsed(&app.pr_snapshot().unwrap().comments[0]), "ann folded");
+
+    // A refresh resolves cat, whose card is on screen: it says so, but stays open under the
+    // reader, and so does every line above it.
+    app.apply_pr(snapshot(true, true));
+    let after = read(&app);
+    let cat = after.iter().position(|l| l.contains("x.rs:3 · resolved")).expect("cat's header");
+    assert!(after[cat].contains("▾"), "held open:\n{after:#?}");
+    assert_eq!(before[..cat], after[..cat], "nothing above it moves");
+    assert!(after.iter().any(|l| l.contains("cat-line-00")), "its turns stay:\n{after:#?}");
+
+    // The reader's next move releases the hold: cat shows its resolved default.
+    app.pr_move(1);
+    let moved = read(&app);
+    assert!(app.pr_card_collapsed(app.pr_selected_comment().unwrap()), "cat folds");
+    assert!(!moved.iter().any(|l| l.contains("cat-line-01")), "{moved:#?}");
 }

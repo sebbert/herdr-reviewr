@@ -209,6 +209,33 @@ pub fn comment() -> herdr_reviewr::forge::Comment {
     }
 }
 
+/// An inline review thread on `x.rs:<line>` with one reply — the foldable card kind.
+/// `created` is the hour it was posted, part of its identity.
+pub fn thread(
+    author: &str,
+    line: u32,
+    created: u8,
+    resolved: bool,
+) -> herdr_reviewr::forge::Comment {
+    use herdr_reviewr::forge::{Comment, CommentKind, Reply};
+    Comment {
+        kind: CommentKind::Finding,
+        author: author.into(),
+        anchor: format!("x.rs:{line}"),
+        body: format!("{author} root first line\n\n{author} root more"),
+        created_at: format!("2026-06-27T{created:02}:00:00Z"),
+        is_resolved: resolved,
+        replies: vec![Reply {
+            author: "rex".into(),
+            author_is_bot: false,
+            body: format!("{author} reply"),
+            created_at: format!("2026-06-27T{created:02}:30:00Z"),
+            avatar_url: None,
+        }],
+        ..comment()
+    }
+}
+
 /// Switch to `tab` and service the deferred reload the switch schedules, so assertions run
 /// against the freshly reloaded state — the same sequence the event loop performs.
 pub fn enter_tab(app: &mut App, tab: herdr_reviewr::app::Tab) {

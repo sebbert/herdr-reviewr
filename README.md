@@ -159,12 +159,13 @@ jumps, and `Ctrl+W` / `Ctrl+U` / `Ctrl+K` deletes.
 | --- | --- |
 | `j` `k` | Jump to the description or a comment |
 | `PageUp` `PageDown` | Scroll focused pane |
+| `a` | Fold or unfold the selected thread |
 | `o` | Open PR in browser |
 | `r` | Refresh |
 
 The mouse works too. Drag over any text to select and copy it, double-click a word,
 triple-click a line. Click or drag the line-number gutter to comment. Click files, tabs, and
-links, and scroll with the wheel.
+links, and scroll with the wheel. On the PR tab, click a thread's header to fold or unfold it.
 
 ## The three tabs
 
@@ -177,7 +178,11 @@ links, and scroll with the wheel.
   pane is one conversation: the description, then every comment oldest first, each in its own
   box. Conversation comments, review verdicts (`✓ approved`, `✗ changes requested`), and inline
   threads (`path:line`) share the one list. A thread's replies sit in its root's box along a
-  timeline. reviewr never writes to the forge.
+  timeline. A resolved thread starts folded to two lines, `▸ path:line · resolved` and its
+  root's first line. Click the header or press `a` to unfold it (`▾`), and again to fold it.
+  Any thread folds this way, on every forge. Your folds stick to their threads across
+  refreshes. A thread resolved while you read it stays open until you move to another one.
+  reviewr never writes to the forge.
 
 ## Diff scopes
 
@@ -429,6 +434,7 @@ The action names and their defaults:
 | `send` | `s`, `S` |
 | `copy` | `y`, `Y` |
 | `open-pr` | `o` |
+| `toggle-thread` | `a` |
 | `refresh` | `r` |
 | `quit` | `q` |
 

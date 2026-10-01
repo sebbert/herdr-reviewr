@@ -36,6 +36,22 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   PRs stacked on top, each with number, state, and title, this one marked. One batched GraphQL
   query per stack level, so a PR that stacks on nothing costs one extra query per refresh.
 
+- **Resolved threads fold.** On the PR tab, a resolved inline thread starts folded to a
+  two-line box: its `▸ path:line · resolved · N replies` header, and the root's author and
+  first line in the bottom border. Click the header (or the summary line) or press `a`
+  (`toggle-thread`, rebindable) to unfold it, marked `▾`. Any inline thread folds the same
+  way. Reviews and plain comments don't fold. The navigator keeps every thread's row, and
+  selecting a folded thread scrolls to it without unfolding it: unfolding is always your own
+  click or key. The `?` help names the key with what it does next, `expand` or `collapse`.
+  GitHub, GitLab, and Azure DevOps threads all fold, since each maps its resolved state onto
+  the same flag. Folds follow the thread by identity (author, time, anchor), the same identity
+  the selection follows. A refresh that reorders or inserts comments keeps each fold on its
+  thread, and an explicit fold outlives the thread being resolved or reopened. A refresh that
+  resolves or reopens a thread only changes its default. A card you're reading (the selected
+  one, or any on screen) keeps its painted state until your next move in the navigator.
+  Off-screen cards take the new default at once, and the reading position stays put. Folding
+  the selected thread from inside it brings its header back to the top of the pane.
+
 ### Changed
 - **A split gives reviewr 40% by default**, not herdr's even halves: `split_ratio` defaults to
   `0.4` when the key is omitted. Set `split_ratio = 0.5` for the old even split.

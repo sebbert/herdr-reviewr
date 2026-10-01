@@ -46,6 +46,7 @@ pub enum Action {
     Send,
     Copy,
     OpenPr,
+    ToggleThread,
     Refresh,
     Quit,
 }
@@ -156,7 +157,7 @@ impl Key {
 
 /// Every action with its config name and default keys — the single source the default keymap,
 /// the name lookup, and the config error message are built from.
-const ACTIONS: [(Action, &str, &[Key]); 42] = [
+const ACTIONS: [(Action, &str, &[Key]); 43] = [
     (Action::Down, "down", &[Key::plain('j'), Key::named(KeyCode::Down)]),
     (Action::Up, "up", &[Key::plain('k'), Key::named(KeyCode::Up)]),
     (Action::NextHunk, "next-hunk", &[Key::plain(']')]),
@@ -197,6 +198,7 @@ const ACTIONS: [(Action, &str, &[Key]); 42] = [
     (Action::Send, "send", &[Key::plain('s'), Key::plain('S')]),
     (Action::Copy, "copy", &[Key::plain('y'), Key::plain('Y')]),
     (Action::OpenPr, "open-pr", &[Key::plain('o')]),
+    (Action::ToggleThread, "toggle-thread", &[Key::plain('a')]),
     (Action::Refresh, "refresh", &[Key::plain('r')]),
     (Action::Quit, "quit", &[Key::plain('q')]),
 ];
@@ -330,6 +332,7 @@ mod tests {
         assert_eq!(keymap.action_for(Key::plain('p')), Some(Action::NavigatorPosition));
         assert_eq!(keymap.action_for(Key::plain('z')), Some(Action::NavigatorHide));
         assert_eq!(keymap.action_for(Key::plain('x')), None);
+        assert_eq!(keymap.action_for(Key::plain('a')), Some(Action::ToggleThread));
         assert_eq!(keymap.action_for(Key::plain('g')), Some(Action::ScopeCommits));
         assert_eq!(keymap.action_for(Key::plain('G')), Some(Action::CommitPick));
         assert_eq!(keymap.action_for(Key::plain('?')), Some(Action::Keys));
