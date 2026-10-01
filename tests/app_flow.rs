@@ -7072,6 +7072,44 @@ fn a_preview_drag_selects_and_copies_the_painted_text() {
 }
 
 #[test]
+fn a_drag_across_a_comment_box_copies_its_text_without_the_border() {
+    use herdr_reviewr::app::Tab;
+    use herdr_reviewr::forge::{Comment, PrSnapshot, PrView, Reply};
+    let r = Repo::init();
+    r.write("x.rs", "y\n");
+    r.commit_all("init");
+    let mut app = app_on(&r);
+    app.set_tab(Tab::Pr).unwrap();
+    app.apply_pr(PrView::Pr(Box::new(PrSnapshot {
+        comments: vec![Comment {
+            body: "alpha beta".into(),
+            replies: vec![Reply {
+                author: "bob".into(),
+                author_is_bot: false,
+                body: "gamma".into(),
+                created_at: "2026-06-27T11:00:00Z".into(),
+            }],
+            ..common::comment()
+        }],
+        ..common::pr_snapshot()
+    })));
+    let inner = herdr_reviewr::ui::read_inner_rect(SEL_AREA, &app);
+
+    // Rows: the `━━ 1 comment` rule, a blank, the box top, then the turns; drag from the
+    // box's top-left corner past its bottom-right one.
+    sel_mouse(&mut app, MouseEventKind::Down(MouseButton::Left), inner.x, inner.y + 2);
+    sel_mouse(&mut app, MouseEventKind::Drag(MouseButton::Left), inner.x + 100, inner.y + 9);
+    sel_mouse(&mut app, MouseEventKind::Up(MouseButton::Left), inner.x + 100, inner.y + 9);
+    let copied = last_copy().expect("the drag copies");
+    for text in ["comment · 1 reply", "@ann", "alpha beta", "@bob", "gamma"] {
+        assert!(copied.contains(text), "{text} copies: {copied:?}");
+    }
+    for chrome in ['╭', '╮', '╰', '╯', '│', '●', '─'] {
+        assert!(!copied.contains(chrome), "the box's {chrome} never copies: {copied:?}");
+    }
+}
+
+#[test]
 fn a_pr_navigator_drag_gates_the_pr_drains() {
     use herdr_reviewr::app::Tab;
     use herdr_reviewr::forge::{Comment, PrSnapshot, PrView};

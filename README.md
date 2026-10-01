@@ -174,10 +174,10 @@ links, and scroll with the wheel.
 - **PR** — a read-only mirror of the branch's pull request (GitHub, Azure DevOps) or merge
   request (GitLab): state, checks, description, and comments, rendered as markdown. A GitHub
   PR that is part of a stack lists the stack too ([Stacked PRs](#stacked-prs)). The read
-  pane is one conversation: the description, then every comment oldest first, with a rule
-  between each. Conversation comments, review verdicts (`✓ approved`, `✗ changes requested`),
-  and inline threads (`path:line`, replies grouped under the root) share the one list. reviewr
-  never writes to the forge.
+  pane is one conversation: the description, then every comment oldest first, each in its own
+  box. Conversation comments, review verdicts (`✓ approved`, `✗ changes requested`), and inline
+  threads (`path:line`) share the one list. A thread's replies sit in its root's box along a
+  timeline. reviewr never writes to the forge.
 
 ## Diff scopes
 

@@ -781,6 +781,17 @@ fn char_at_col(text: &str, col: usize) -> usize {
 
 /// `text` with its first `cols` display columns dropped — the painted chrome prefix a
 /// selection never copies.
+/// The leading `cols` display columns of `text`.
+fn take_display_cols(text: &str, cols: usize) -> String {
+    let mut acc = 0usize;
+    text.chars()
+        .take_while(|ch| {
+            acc += UnicodeWidthChar::width(*ch).unwrap_or(0);
+            acc <= cols
+        })
+        .collect()
+}
+
 fn skip_display_cols(text: &str, cols: usize) -> String {
     let mut acc = 0usize;
     text.chars()
@@ -901,14 +912,18 @@ pub(crate) fn painted_sel(app: &App, area: Rect) -> Option<PaintedSel> {
         );
         let max = content.lines.len().saturating_sub(rect.height as usize);
         let scroll = app.pr_read_scroll().min(max);
-        let offsets: Vec<usize> = (0..content.lines.len())
-            .map(|i| content.snippets.iter().find(|(r, _)| r.contains(&i)).map_or(0, |(_, w)| *w))
-            .collect();
+        let offsets: Vec<usize> = content.cols.iter().map(|(left, _)| *left).collect();
         let texts = content
             .lines
             .iter()
-            .enumerate()
-            .map(|(i, l)| painted_text(&skip_display_cols(&line_text(l), offsets[i])))
+            .zip(&content.cols)
+            .map(|(l, (left, text_w))| {
+                let text = skip_display_cols(&line_text(l), *left);
+                painted_text(&match text_w {
+                    Some(w) => take_display_cols(&text, *w),
+                    None => text,
+                })
+            })
             .collect();
         return Some(PaintedSel { rect, scroll, texts, offsets });
     }
@@ -4608,52 +4623,194 @@ struct PrReadContent {
     notice: Vec<String>,
     /// The body's display lines.
     lines: Vec<Line<'static>>,
-    /// Each markdown body's render metadata and its first display row, for hit-testing.
-    body_meta: Vec<(usize, crate::markdown::Rendered)>,
-    /// Each snippet quote's line range and its gutter prefix width, whose cells a selection
-    /// never copies.
-    snippets: Vec<(std::ops::Range<usize>, usize)>,
+    /// Each markdown body's first display row, its first display column (a box's left
+    /// chrome), and its render metadata, for hit-testing.
+    body_meta: Vec<(usize, usize, crate::markdown::Rendered)>,
+    /// Per display line, the chrome a selection never copies: the columns before the text
+    /// (a box border and timeline, a snippet's gutter) and the text's width when chrome
+    /// follows it (`None`: the text runs to the line's end).
+    cols: Vec<(usize, Option<usize>)>,
     /// Each cursor item's first display line (`tops[cursor]`), where a selection scrolls to.
     tops: Vec<usize>,
 }
 
-/// A full-width heavy rule, optionally opening with a `label` — the separator between
-/// conversation items, distinct from the light rule between a thread's replies.
-fn push_heavy_rule(lines: &mut Vec<Line<'static>>, label: Option<&str>, width: usize, p: &Palette) {
-    let width = width.max(1);
-    let style = Style::default().fg(p.dim1);
-    let line = match label {
-        Some(label) => {
-            let head = format!("━━ {label} ");
-            let fill = width.saturating_sub(head.width());
-            Line::from(vec![
-                Span::styled("━━ ", style),
-                Span::styled(format!("{label} "), style.add_modifier(Modifier::BOLD)),
-                Span::styled("━".repeat(fill), style),
-            ])
-        }
-        None => Line::from(Span::styled("━".repeat(width), style)),
+/// Below this pane width a comment box would leave too little room for its text, so the
+/// cards paint flat: the header as a line, the turns unboxed.
+const MIN_BOX_WIDTH: usize = 24;
+
+/// One timeline cell beside a card line: a turn's dot, the rail running between dots, or
+/// nothing (above the first dot and below the last).
+#[derive(Clone, Copy)]
+enum Rail {
+    Blank,
+    Dot(Color),
+    Line,
+}
+
+/// One conversation card's lines before boxing, each with its timeline cell, plus where its
+/// markdown bodies and snippet quotes sit among them.
+struct Card {
+    lines: Vec<(Line<'static>, Rail)>,
+    bodies: Vec<(usize, crate::markdown::Rendered)>,
+    snippets: Vec<(std::ops::Range<usize>, usize)>,
+}
+
+/// Build one comment's card at content width `cw`: the finding's quote, then each turn — the
+/// root, then every reply — as a dotted byline over its body. The rail joins the dots, so a
+/// thread reads as one conversation; a lone comment has one dot and no rail.
+fn build_card(app: &App, cm: &forge::Comment, cw: usize, p: &Palette) -> Card {
+    let mut quote = Vec::new();
+    let snippet = push_finding_quote(&mut quote, app, cm, cw, p);
+    let mut card = Card {
+        lines: quote.into_iter().map(|l| (l, Rail::Blank)).collect(),
+        bodies: Vec::new(),
+        snippets: snippet.into_iter().collect(),
     };
-    lines.push(line);
+    let now = std::time::SystemTime::now();
+    let root = (cm.author.as_str(), cm.author_is_bot, cm.created_at.as_str(), cm.body.as_str());
+    let turns: Vec<_> =
+        std::iter::once(root)
+            .chain(cm.replies.iter().map(|r| {
+                (r.author.as_str(), r.author_is_bot, r.created_at.as_str(), r.body.as_str())
+            }))
+            .collect();
+    let last = turns.len() - 1;
+    for (t, (author, bot, created, body)) in turns.into_iter().enumerate() {
+        let after = if t < last { Rail::Line } else { Rail::Blank };
+        if t > 0 {
+            card.lines.push((Line::raw(""), Rail::Line));
+        }
+        // Every turn is byline then body. The byline names who spoke and when, including
+        // the root, so a reply cannot look like the next paragraph of the same comment.
+        let mut byline = Vec::new();
+        push_comment_byline(&mut byline, author, bot, created, now, p);
+        let dot = if bot { p.dim1 } else { p.orange };
+        card.lines.extend(byline.into_iter().map(|l| (l, Rail::Dot(dot))));
+        if !body.is_empty() {
+            let mut rendered = app.markdown_render(body, cw.max(1));
+            let lines = std::mem::take(&mut rendered.lines);
+            card.bodies.push((card.lines.len(), rendered));
+            card.lines.extend(lines.into_iter().map(|l| (l, after)));
+        }
+    }
+    card
+}
+
+/// `spans` cut to at most `max` display columns, and the width they then occupy.
+fn fit_spans(spans: Vec<Span<'static>>, max: usize) -> (Vec<Span<'static>>, usize) {
+    let mut out = Vec::with_capacity(spans.len());
+    let mut used = 0;
+    for span in spans {
+        let w = span.content.width();
+        if used + w <= max {
+            used += w;
+            out.push(span);
+            continue;
+        }
+        let mut cut = String::new();
+        for ch in span.content.chars() {
+            let cw = UnicodeWidthChar::width(ch).unwrap_or(0);
+            if used + cw > max {
+                break;
+            }
+            used += cw;
+            cut.push(ch);
+        }
+        out.push(Span::styled(cut, span.style));
+        break;
+    }
+    (out, used)
+}
+
+/// Paint one card into `content`: a rounded box whose top border carries the header, with
+/// the timeline down its left edge — or, below [`MIN_BOX_WIDTH`], the flat header and
+/// lines. The selected card's border takes the accent.
+fn push_card(
+    content: &mut PrReadContent,
+    header: Vec<Span<'static>>,
+    card: Card,
+    width: usize,
+    selected: bool,
+    p: &Palette,
+) {
+    let boxed = width >= MIN_BOX_WIDTH;
+    let base = content.lines.len();
+    // Box chrome: `│ ` + the 2-column timeline before the text, ` │` after it.
+    let (left, cw) = if boxed { (4, width - 6) } else { (0, width) };
+    let border = Style::default().fg(if selected { p.blue } else { p.dim2 });
+    if boxed {
+        let (header, used) = fit_spans(header, width - 6);
+        let mut top = vec![Span::styled("╭─ ", border)];
+        top.extend(header);
+        top.push(Span::styled(format!(" {}╮", "─".repeat(width - 5 - used)), border));
+        content.lines.push(Line::from(top));
+        content.cols.push((3, Some(used)));
+    } else {
+        let mark = Span::styled(if selected { "▌ " } else { "  " }, Style::default().fg(p.blue));
+        let (header, _) = fit_spans(std::iter::once(mark).chain(header).collect(), width);
+        content.lines.push(Line::from(header));
+        content.cols.push((0, None));
+    }
+    let first = base + 1;
+    for (row, (line, rail)) in card.lines.into_iter().enumerate() {
+        let snip = card.snippets.iter().find(|(r, _)| r.contains(&row)).map_or(0, |(_, w)| *w);
+        if !boxed {
+            content.lines.push(line);
+            content.cols.push((snip, None));
+            continue;
+        }
+        // A line-wide style (a code block's fill) belongs to the text and its padding,
+        // never to the box's border.
+        let fill = line.style;
+        let patched = line.spans.into_iter().map(|sp| {
+            let style = fill.patch(sp.style);
+            Span::styled(sp.content, style)
+        });
+        let (text, used) = fit_spans(patched.collect(), cw);
+        let rail = match rail {
+            Rail::Blank => Span::raw("  "),
+            Rail::Dot(color) => Span::styled("● ", Style::default().fg(color)),
+            Rail::Line => Span::styled("│ ", Style::default().fg(p.dim2)),
+        };
+        let mut spans = vec![Span::styled("│ ", border), rail];
+        spans.extend(text);
+        spans.push(Span::styled(" ".repeat(cw - used), fill));
+        spans.push(Span::styled(" │", border));
+        content.lines.push(Line::from(spans));
+        content.cols.push((left + snip, Some(cw - snip)));
+    }
+    if boxed {
+        content
+            .lines
+            .push(Line::from(Span::styled(format!("╰{}╯", "─".repeat(width - 2)), border)));
+        content.cols.push((0, Some(0)));
+    }
+    content.body_meta.extend(card.bodies.into_iter().map(|(row, r)| (first + row, left, r)));
+}
+
+/// A full-width heavy rule opening with a `label` — the line that parts the unboxed
+/// description from the boxed comments.
+fn push_heavy_rule(lines: &mut Vec<Line<'static>>, label: &str, width: usize, p: &Palette) {
+    let style = Style::default().fg(p.dim1);
+    let fill = width.saturating_sub(format!("━━ {label} ").width());
+    lines.push(Line::from(vec![
+        Span::styled("━━ ", style),
+        Span::styled(format!("{label} "), style.add_modifier(Modifier::BOLD)),
+        Span::styled("━".repeat(fill), style),
+    ]));
 }
 
 /// One comment card's header: what it is anchored to (a finding's `path:line` with its
 /// thread state, a review's verdict, or `comment`). The selected card's header carries the
-/// accent, so the reader can see which card the navigator points at.
-fn push_card_header(
-    lines: &mut Vec<Line<'static>>,
-    cm: &forge::Comment,
-    selected: bool,
-    p: &Palette,
-) {
+/// accent with its border, so the reader can see which card the navigator points at.
+fn card_header(cm: &forge::Comment, selected: bool, p: &Palette) -> Vec<Span<'static>> {
     let base = if selected {
         Style::default().fg(p.blue).add_modifier(Modifier::BOLD)
     } else {
         text_style(p).add_modifier(Modifier::BOLD)
     };
     let dim = Style::default().fg(p.dim2);
-    let mut spans =
-        vec![Span::styled(if selected { "▌ " } else { "  " }, Style::default().fg(p.blue))];
+    let mut spans = Vec::new();
     match (cm.kind, cm.review_state) {
         (_, Some(state)) => {
             let (glyph, color) = review_glyph(p, state);
@@ -4681,7 +4838,7 @@ fn push_card_header(
         spans.push(Span::styled(SEP, dim));
         spans.push(Span::styled(format!("{replies} {noun}"), dim));
     }
-    lines.push(Line::from(spans));
+    spans
 }
 
 fn pr_read_content(app: &App, inner: Rect) -> PrReadContent {
@@ -4708,69 +4865,54 @@ fn pr_read_content(app: &App, inner: Rect) -> PrReadContent {
             .chain(notice_lines.into_iter().skip(tail))
             .collect()
     };
-    let mut lines: Vec<Line<'static>> = Vec::new();
-    let mut body_meta: Vec<(usize, crate::markdown::Rendered)> = Vec::new();
-    let mut snippets = Vec::new();
-    let mut tops = Vec::new();
+    let mut content = PrReadContent {
+        notice,
+        lines: Vec::new(),
+        body_meta: Vec::new(),
+        cols: Vec::new(),
+        tops: Vec::new(),
+    };
     let Some(s) = app.pr_snapshot().filter(|s| app.pr_has_description() || !s.comments.is_empty())
     else {
         // The empty-state remedy can outgrow a narrow pane; wrap it rather than clip it.
         let refresh = app.keymap().hint(crate::keymap::Action::Refresh);
         for piece in wrap_text(&pr_empty_msg(&app.pr, app.pr_forge, refresh), width.max(1)) {
-            lines.push(Line::from(Span::styled(piece, Style::default().fg(p.dim2))));
+            content.lines.push(Line::from(Span::styled(piece, Style::default().fg(p.dim2))));
+            content.cols.push((0, None));
         }
-        return PrReadContent { notice, lines, body_meta, snippets, tops };
+        return content;
     };
-    let mut push_body = |lines: &mut Vec<Line<'static>>, text: &str| {
-        let mut rendered = app.markdown_render(text, width.max(1));
-        let offset = lines.len();
-        lines.append(&mut rendered.lines);
-        body_meta.push((offset, rendered));
-    };
-    // One conversation: the description, then every comment oldest first. A labelled heavy
-    // rule opens the comments and a plain one parts each card; a thread's replies stay in
-    // their root's card behind the light rule.
+    // One conversation: the description unboxed, a labelled heavy rule, then every comment
+    // oldest first, each in its own box with a thread's replies inside its root's.
     if app.pr_has_description() {
-        tops.push(0);
-        push_body(&mut lines, &s.body);
+        content.tops.push(0);
+        let mut rendered = app.markdown_render(&s.body, width.max(1));
+        content.cols.extend(std::iter::repeat_n((0, None), rendered.lines.len()));
+        content.lines.append(&mut rendered.lines);
+        content.body_meta.push((0, 0, rendered));
     }
-    let now = std::time::SystemTime::now();
     let offset = app.pr_description_offset();
+    let cw = if width >= MIN_BOX_WIDTH { width - 6 } else { width };
     for (i, cm) in s.comments.iter().enumerate() {
-        if !lines.is_empty() {
-            lines.push(Line::raw(""));
-        }
-        tops.push(lines.len());
         if i == 0 {
+            if !content.lines.is_empty() {
+                content.lines.push(Line::raw(""));
+                content.cols.push((0, None));
+            }
             let noun = if s.comments.len() == 1 { "comment" } else { "comments" };
-            push_heavy_rule(&mut lines, Some(&format!("{} {noun}", s.comments.len())), width, p);
-        } else {
-            push_heavy_rule(&mut lines, None, width, p);
+            let label = format!("{} {noun}", s.comments.len());
+            push_heavy_rule(&mut content.lines, &label, width, p);
+            content.cols.push((0, None));
         }
-        push_card_header(&mut lines, cm, app.pr_cursor == i + offset, p);
-        lines.push(Line::raw(""));
-        // The finding's range paints as Diff-view rows; only the prose body is markdown
-        snippets.extend(push_finding_quote(&mut lines, app, cm, width, p));
-        // Every turn is byline then body. The byline names who spoke and when, including
-        // the root, so a reply cannot look like the next paragraph of the same comment.
-        push_comment_byline(&mut lines, &cm.author, cm.author_is_bot, &cm.created_at, now, p);
-        if !cm.body.is_empty() {
-            push_body(&mut lines, &cm.body);
-        }
-        for reply in &cm.replies {
-            push_comment_rule(&mut lines, width, p);
-            push_comment_byline(
-                &mut lines,
-                &reply.author,
-                reply.author_is_bot,
-                &reply.created_at,
-                now,
-                p,
-            );
-            push_body(&mut lines, &reply.body);
-        }
+        content.lines.push(Line::raw(""));
+        content.cols.push((0, None));
+        // The box's top line is the card's top: a selection scrolls its border to the edge.
+        content.tops.push(content.lines.len());
+        let selected = app.pr_cursor == i + offset;
+        let card = build_card(app, cm, cw, p);
+        push_card(&mut content, card_header(cm, selected, p), card, width, selected, p);
     }
-    PrReadContent { notice, lines, body_meta, snippets, tops }
+    content
 }
 
 /// The PR read pane: the whole conversation — description, then every comment oldest
@@ -4814,8 +4956,10 @@ fn render_pr_read(frame: &mut Frame, app: &App, area: Rect) {
     let max = content.lines.len().saturating_sub(body.height as usize);
     app.note_pr_read_max_scroll(max);
     let scroll = app.settle_pr_read_scroll(&content.tops, max);
-    for (offset, rendered) in &content.body_meta {
-        note_markdown_regions(app, rendered, body, scroll, *offset);
+    for (row, col, rendered) in &content.body_meta {
+        let col = (*col as u16).min(body.width);
+        let shifted = Rect::new(body.x + col, body.y, body.width - col, body.height);
+        note_markdown_regions(app, rendered, shifted, scroll, *row);
     }
     frame.render_widget(Paragraph::new(content.lines).scroll((saturating_row(scroll), 0)), body);
     render_overflow_scrollbar(

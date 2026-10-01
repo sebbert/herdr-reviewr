@@ -21,10 +21,12 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 - **The PR tab reads as one conversation.** The read pane shows the description, then every
-  comment, review, and inline thread oldest first. A labelled rule opens the comments and a
-  rule parts each card. Each card's header names its anchor: `path:line` with resolved/outdated
-  for a thread, the verdict for a review. Replies stay grouped under their root. `j`/`k` (or a
-  click) jumps the pane to that card, and a refresh keeps the card you are reading in place.
+  comment, review, and inline thread oldest first. A labelled rule opens the comments, and each
+  one sits in its own rounded box. The box's top border names its anchor: `path:line` with
+  resolved/outdated for a thread, the verdict for a review. A thread is one box, with a timeline
+  down its left edge and a dot at each reply, like GitHub. The selected box's border takes
+  the accent. A pane too narrow for boxes shows the cards flat. `j`/`k` (or a click) jumps the
+  pane to that box, and a refresh keeps the box you are reading in place.
   `→`/`←` expand/collapse every `<details>` in the conversation.
 - **Reviews show their verdict.** `✓ approved`, `✗ changes requested`, `✗ rejected`, or
   `– dismissed` stands in for the bare `review` word in the navigator. A GitHub approval or

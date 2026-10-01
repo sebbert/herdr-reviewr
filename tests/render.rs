@@ -65,6 +65,22 @@ fn right_column(out: &str, pct: usize) -> String {
         .join("\n")
 }
 
+/// The read pane's inner text on every frame row: the columns between the left pane's
+/// outer borders (so never its scrollbar thumb), found from the top border's `┐┌` seam.
+fn read_column(out: &str) -> Vec<String> {
+    let seam = out.lines().nth(1).and_then(|l| l.chars().position(|c| c == '┐')).unwrap_or(0);
+    out.lines()
+        .map(|l| l.chars().skip(1).take(seam.saturating_sub(1)).collect::<String>())
+        .collect()
+}
+
+/// The border colour of the read-pane box whose top border opens with `header`.
+fn corner_of(buf: &Buffer, header: &str) -> Option<ratatui::style::Color> {
+    let read = read_column(&dump(buf));
+    let y = read.iter().position(|l| l.starts_with(&format!("╭─ {header}")))?;
+    Some(buf[(1, y as u16)].fg)
+}
+
 /// The first painted link region anywhere on the test frame, scanned over its grid.
 fn first_painted_link(app: &App) -> Option<std::sync::Arc<str>> {
     (0..40u16)
@@ -1710,10 +1726,33 @@ fn the_read_pane_shows_the_description_then_every_comment_oldest_first() {
         at("review · ✓ approved"),
     ];
     assert!(order.windows(2).all(|w| w[0] < w[1]), "conversation order:\n{out}");
-    // A plain heavy rule parts the cards after the labelled one opens the list.
-    let read: Vec<&str> = out.lines().map(|l| l.split('│').nth(1).unwrap_or("")).collect();
-    let plain_rules = read.iter().filter(|l| l.trim_start().starts_with("━━━━")).count();
-    assert_eq!(plain_rules, 2, "a separator between each pair of cards:\n{out}");
+    // Each card is its own rounded box, its header in the top border; the thread's turns
+    // share one box, a dot at each byline and the rail joining them.
+    let read = read_column(&out);
+    let tops = read.iter().filter(|l| l.starts_with("╭─ ")).count();
+    let bottoms =
+        read.iter().filter(|l| l.starts_with("╰─") && l.trim_end().ends_with('╯')).count();
+    assert_eq!((tops, bottoms), (3, 3), "one box per card:\n{out}");
+    assert!(read.iter().any(|l| l.starts_with("╭─ x.rs:1 · resolved · 1 reply ")), "{out}");
+    let thread: Vec<&String> = read
+        .iter()
+        .skip_while(|l| !l.contains("x.rs:1 · resolved"))
+        .skip(1)
+        .take_while(|l| !l.starts_with("╰"))
+        .collect();
+    let line = |needle: &str| thread.iter().find(|l| l.contains(needle)).unwrap().as_str();
+    assert!(line("@bob").starts_with("│ ● @bob"), "the root's dot:\n{out}");
+    assert!(line("THREAD_ROOT").starts_with("│ │ THREAD_ROOT"), "the rail runs on:\n{out}");
+    assert!(line("@ann").starts_with("│ ● @ann"), "the reply's dot:\n{out}");
+    assert!(line("THREAD_REPLY").starts_with("│   THREAD_REPLY"), "the rail ends:\n{out}");
+    assert!(thread.iter().all(|l| l.trim_end().ends_with('│')), "the box closes:\n{out}");
+
+    // The selected card's border takes the accent; the others stay dim.
+    app.pr_move(2);
+    let buf = render_buffer(&app);
+    let corner = |text: &str| corner_of(&buf, text).expect("the box paints");
+    assert_ne!(corner("x.rs:1"), corner("comment"), "the selected box stands out");
+    assert_eq!(corner("comment"), corner("review"), "unselected boxes share one border");
 
     // The navigator names the review by its verdict, and counts a thread's replies.
     let nav = right_column(&out, 68);
@@ -1747,22 +1786,16 @@ fn selecting_a_comment_scrolls_the_conversation_to_it_and_a_refresh_keeps_it_anc
     };
     app.apply_pr(PrView::Pr(Box::new(snapshot("short description"))));
     let read = |app: &App| -> Vec<String> {
-        // The read pane's text, without the scrollbar thumb painted on its right border.
-        render(app)
-            .lines()
-            .map(|l| {
-                let read = l.split('│').nth(1).unwrap_or("");
-                read.split('┃').next().unwrap_or("").trim_end().to_string()
-            })
-            .collect()
+        read_column(&render(app)).iter().map(|l| l.trim_end().to_string()).collect()
     };
 
     // Selecting the third comment brings its card to the top of the read pane.
     app.pr_move(3);
     assert_eq!(app.pr_selected_comment().map(|c| c.author.as_str()), Some("author-2"));
     let jumped = read(&app);
-    let first = jumped.iter().find(|l| !l.trim().is_empty()).unwrap();
-    assert!(first.starts_with("━━━"), "the card's separator opens the pane: {jumped:#?}");
+    // Below the tab strip and the pane's title border.
+    let first = jumped.iter().skip(2).find(|l| !l.trim().is_empty()).unwrap();
+    assert!(first.starts_with("╭─ comment"), "the card's box top opens the pane: {jumped:#?}");
     assert!(jumped.iter().any(|l| l.contains("c2-line-00")), "{jumped:#?}");
     assert!(!jumped.iter().any(|l| l.contains("c1-line-11")), "earlier cards scroll away");
 
@@ -1792,6 +1825,55 @@ fn selecting_a_comment_scrolls_the_conversation_to_it_and_a_refresh_keeps_it_anc
     assert_eq!(app.pr_selected_comment().map(|c| c.author.as_str()), Some("author-2"));
     assert!(app.pr_read_scroll() > before_scroll, "the absolute scroll absorbs the growth");
     assert_eq!(before, after, "the reader's view does not move");
+}
+
+#[test]
+fn comment_boxes_fit_their_pane_and_go_flat_when_it_is_too_narrow() {
+    use herdr_reviewr::forge::{Comment, PrSnapshot, PrView};
+    let r = Repo::init();
+    r.write("x.rs", "y\n");
+    r.commit_all("init");
+    let mut app = app_on(&r);
+    app.set_tab(Tab::Pr).unwrap();
+    let long = format!(
+        "see [the docs](https://example.com/docs) then `{}`\n\n```\n{}\n```",
+        "y".repeat(150),
+        "z".repeat(150)
+    );
+    app.pr = PrView::Pr(Box::new(PrSnapshot {
+        comments: vec![Comment { body: long, ..common::comment() }],
+        ..common::pr_snapshot()
+    }));
+
+    // Every box row closes on the same column however long its content runs: markdown wraps
+    // to the inner width and an unbreakable run clips inside the border.
+    for width in [40u16, 60, 140] {
+        let read = read_column(&dump(&render_size(&app, width, 40)));
+        let rows: Vec<&String> = read
+            .iter()
+            .skip_while(|l| !l.starts_with("╭─"))
+            .take_while(|l| !l.starts_with("╰"))
+            .collect();
+        assert!(rows.len() > 2, "the box paints at {width}: {read:#?}");
+        let edge = rows[0].trim_end().chars().count();
+        for row in &rows[1..] {
+            let row = row.trim_end();
+            assert!(row.ends_with('│'), "the border closes at {width}: {read:#?}");
+            assert_eq!(row.chars().count(), edge, "one right edge at {width}: {read:#?}");
+        }
+    }
+    // The link inside the box stays clickable at its shifted column.
+    let _ = render(&app);
+    assert_eq!(first_painted_link(&app).as_deref(), Some("https://example.com/docs"));
+
+    // Too narrow for a box: the card paints flat, with no chrome, and nothing panics down to
+    // a sliver of a pane.
+    let read = read_column(&dump(&render_size(&app, 30, 40)));
+    assert!(!read.iter().any(|l| l.contains('╭')), "no box in a narrow pane: {read:#?}");
+    assert!(read.iter().any(|l| l.contains("@ann")), "the card still reads: {read:#?}");
+    for width in 1..30u16 {
+        let _ = render_size(&app, width, 12);
+    }
 }
 
 #[test]
@@ -1873,9 +1955,13 @@ fn a_finding_range_paints_as_diff_rows() {
     let out = render(&app);
     assert!(out.contains("Comment on line 16"), "a context range has no sign:\n{out}");
     assert!(out.contains("OUT_ABOVE"), "the other finding's range paints:\n{out}");
-    // The conversation keeps both cards; the selection marker moves to the second one.
-    assert!(out.contains("▌ x.rs:16"), "the selected card's header is marked:\n{out}");
-    assert!(!out.contains("▌ x.rs:21"), "the first card's header loses the marker:\n{out}");
+    // The conversation keeps both cards; the accent border moves to the second one.
+    let buf = render_buffer(&app);
+    let accent = corner_of(&buf, "x.rs:16");
+    assert!(accent.is_some(), "the selected box paints:\n{out}");
+    assert_ne!(accent, corner_of(&buf, "x.rs:21"), "the selection's border moves with it:\n{out}");
+    app.pr_move(-1);
+    assert_eq!(corner_of(&render_buffer(&app), "x.rs:21"), accent, "and back");
     assert!(out.contains("second finding"), "the selected body follows its range:\n{out}");
 }
 
