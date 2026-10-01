@@ -5,6 +5,7 @@ mod common;
 
 use std::cell::RefCell;
 use std::path::Path;
+use std::time::{Duration, Instant};
 
 use anyhow::{Result, bail};
 use common::{Repo, app_on, enter_tab, typed};
@@ -8192,9 +8193,22 @@ fn shown_number(app: &App) -> Option<u64> {
     app.pr_snapshot().map(|s| s.number)
 }
 
+/// A stack PR's read, as a batch carries it.
+fn stack_view(number: u64, title: &str) -> herdr_reviewr::forge::PrView {
+    let base = format!("head-{}", number - 1);
+    herdr_reviewr::forge::PrView::Pr(Box::new(stack_snapshot(number, &base, title)))
+}
+
+/// Dispatch the due batch at `now` and land `title`d reads for every PR it asks for.
+fn land_batch(app: &mut App, now: Instant, refresh: Option<Duration>, title: &str) -> Vec<u64> {
+    let batch = app.take_stack_batch(now, refresh).expect("a batch is due");
+    let results = batch.numbers.iter().map(|&n| (n, stack_view(n, title))).collect();
+    app.land_stack_batch(batch.tag, results, now);
+    batch.numbers
+}
+
 #[test]
 fn stack_rows_are_cursor_stops_and_enter_views_one_without_checking_it_out() {
-    use herdr_reviewr::forge::PrView;
     let r = stacked_repo();
     let mut app = browsing_app(&r);
     let keymap = Keymap::default();
@@ -8208,18 +8222,18 @@ fn stack_rows_are_cursor_stops_and_enter_views_one_without_checking_it_out() {
     assert!(offers(&app, FooterAction::ViewStackPr));
     press(&mut app, &keymap, KeyCode::Enter);
     assert_eq!(app.pr_viewing(), Some(12));
-    assert!(app.pr_snapshot().is_none(), "the browsed PR loads; nothing else paints meanwhile");
     assert_eq!(app.pr_checked_out_number(), Some(11));
 
-    // Its read is by number, from the repository the stack was read from.
-    let (tag, number, target) = app.take_browse_fetch().expect("a read is dispatched");
-    assert_eq!((number, target.owner(), target.name()), (12, "o", "r"));
-    assert!(app.take_browse_fetch().is_none(), "one read per request");
-    assert!(app.land_browsed_pr(
-        tag,
-        12,
-        PrView::Pr(Box::new(stack_snapshot(12, "head-11", "child")))
-    ));
+    // Never read yet: its own sections wait, the stack stays listed, and its read leads
+    // the next batch, from the repository the stack was read from.
+    assert!(app.pr_snapshot().is_none());
+    assert_eq!(app.pr_stack().len(), 3, "the stack is the checked-out PR's, still listed");
+    let batch = app.take_stack_batch(Instant::now(), None).expect("a read is dispatched");
+    assert_eq!(batch.numbers, [12, 10], "the viewed PR first, then the rest of the stack");
+    assert_eq!((batch.repo.owner(), batch.repo.name()), ("o", "r"));
+    assert!(app.take_stack_batch(Instant::now(), None).is_none(), "one batch in flight");
+    let results = vec![(12, stack_view(12, "child")), (10, stack_view(10, "parent"))];
+    assert!(app.land_stack_batch(batch.tag, results, Instant::now()));
     assert_eq!(shown_number(&app), Some(12));
     assert!(offers(&app, FooterAction::CheckedOutPr));
 
@@ -8230,8 +8244,197 @@ fn stack_rows_are_cursor_stops_and_enter_views_one_without_checking_it_out() {
 }
 
 #[test]
-fn the_checked_out_pr_key_and_its_own_row_go_back_to_where_the_reader_was() {
+fn a_switch_paints_the_cached_pr_at_once_with_the_stack_intact() {
+    let r = stacked_repo();
+    let mut app = browsing_app(&r);
+    // The whole stack is read ahead as soon as it is known, on any tab.
+    assert_eq!(land_batch(&mut app, Instant::now(), None, "cached"), [10, 12]);
+
+    app.pr_view_number(12);
+    assert_eq!(app.pr_snapshot().map(|s| s.title.as_str()), Some("cached"), "no blank frame");
+    assert_eq!(app.pr_stack().len(), 3);
+    app.pr_view_number(10);
+    assert_eq!(app.pr_snapshot().map(|s| s.title.as_str()), Some("cached"));
+    // The switch still refreshes the viewed PR, alone, on its own cadence.
+    let batch = app.take_stack_batch(Instant::now(), None).unwrap();
+    assert_eq!(batch.numbers, [10]);
+}
+
+#[test]
+fn a_background_refresh_lands_without_moving_the_readers_place() {
+    use herdr_reviewr::forge::{Comment, PrSnapshot, PrView};
+    let r = stacked_repo();
+    let mut app = browsing_app(&r);
+    let t0 = Instant::now();
+    land_batch(&mut app, t0, None, "first");
+    app.pr_view_number(12);
+    app.take_stack_batch(t0, None).map(|b| app.land_stack_batch(b.tag, Vec::new(), t0));
+    let comment = |author: &str| Comment { author: author.into(), ..common::comment() };
+    let with = |comments: Vec<Comment>| {
+        PrView::Pr(Box::new(PrSnapshot { comments, ..stack_snapshot(12, "head-11", "child") }))
+    };
+    let batch = app.take_stack_batch(t0, None);
+    assert!(batch.is_none(), "nothing due: the viewed PR was just read");
+    app.request_browse_refresh();
+    let b = app.take_stack_batch(t0, None).unwrap();
+    app.land_stack_batch(b.tag, vec![(12, with(vec![comment("ann"), comment("bob")]))], t0);
+    app.pr_move(10);
+    assert_eq!(app.pr_selected_comment().map(|c| c.author.as_str()), Some("bob"));
+
+    // A newer read adds a comment before the selected one: the cursor stays on `bob`.
+    app.request_browse_refresh();
+    let b = app.take_stack_batch(t0, None).unwrap();
+    let newer = with(vec![comment("ann"), comment("cat"), comment("bob")]);
+    assert!(app.land_stack_batch(b.tag, vec![(12, newer)], t0));
+    assert_eq!(app.pr_selected_comment().map(|c| c.author.as_str()), Some("bob"));
+}
+
+#[test]
+fn stack_prs_nobody_views_refresh_at_the_slower_cadence_only_while_shown() {
+    let r = stacked_repo();
+    let mut app = browsing_app(&r);
+    let slow = Duration::from_mins(5);
+    let t0 = Instant::now();
+    land_batch(&mut app, t0, Some(slow), "first");
+    app.pr_view_number(12);
+    land_batch(&mut app, t0, Some(slow), "viewed");
+
+    // The viewed PR follows the PR tab's cadence; #10 waits for the slow one.
+    app.request_browse_refresh();
+    assert_eq!(land_batch(&mut app, t0 + Duration::from_mins(1), Some(slow), "v"), [12]);
+    assert!(app.take_stack_batch(t0 + Duration::from_secs(299), Some(slow)).is_none());
+    // Off the tab (no `refresh_after`), a stale entry is never refreshed.
+    assert!(app.take_stack_batch(t0 + slow, None).is_none());
+    assert_eq!(land_batch(&mut app, t0 + slow, Some(slow), "late"), [10]);
+}
+
+#[test]
+fn a_failed_background_refresh_keeps_the_cached_snapshot() {
     use herdr_reviewr::forge::PrView;
+    use herdr_reviewr::git::Forge;
+    let r = stacked_repo();
+    let mut app = browsing_app(&r);
+    let t0 = Instant::now();
+    land_batch(&mut app, t0, None, "good");
+    let failed = || PrView::Error(Forge::GitHub, "rate limited".into());
+
+    // #10 fails in the background: switching to it still shows its last good read.
+    let slow = Duration::from_mins(5);
+    let b = app.take_stack_batch(t0 + slow, Some(slow)).unwrap();
+    let results = b.numbers.iter().map(|&n| (n, failed())).collect();
+    app.land_stack_batch(b.tag, results, t0 + slow);
+    app.pr_view_number(10);
+    assert_eq!(app.pr_snapshot().map(|s| s.title.as_str()), Some("good"));
+
+    // The viewed PR's failed refresh keeps it too, with the notice.
+    let b = app.take_stack_batch(t0 + slow, Some(slow)).unwrap();
+    app.land_stack_batch(b.tag, vec![(10, failed())], t0 + slow);
+    assert_eq!(app.pr_snapshot().map(|s| s.title.as_str()), Some("good"));
+    assert!(app.pr_notice().is_some_and(|n| n.contains("rate limited")));
+
+    // A PR never read that fails shows its own failure, never the checked-out PR's data.
+    let r = stacked_repo();
+    let mut app = browsing_app(&r);
+    app.pr_view_number(12);
+    let b = app.take_stack_batch(t0, None).unwrap();
+    let results = b.numbers.iter().map(|&n| (n, failed())).collect();
+    app.land_stack_batch(b.tag, results, t0);
+    assert_eq!(app.pr, failed());
+    assert_eq!(app.pr_checked_out_number(), Some(11));
+}
+
+#[test]
+fn a_superseded_or_left_behind_batch_never_paints() {
+    let r = stacked_repo();
+    let mut app = browsing_app(&r);
+    let t0 = Instant::now();
+    // A background prefetch is in flight when the reader views #12.
+    let prefetch = app.take_stack_batch(t0, None).unwrap();
+    assert_eq!(prefetch.numbers, [10, 12]);
+    app.pr_view_number(12);
+    // It already carries #12, so it is not superseded.
+    assert!(app.take_stack_batch(t0, None).is_none());
+    app.pr_view_number(10);
+    // Viewing #10 again is carried too; leaving for home leaves it in flight.
+    app.pr_view_checked_out();
+    let results = vec![(10, stack_view(10, "p")), (12, stack_view(12, "c"))];
+    assert!(!app.land_stack_batch(prefetch.tag, results, t0), "home is shown, untouched");
+    assert_eq!(shown_number(&app), Some(11));
+
+    // A batch the viewed PR's own read supersedes is dropped whole.
+    app.pr_view_number(12);
+    app.request_browse_refresh();
+    let slow = Duration::from_secs(1);
+    let background = app.take_stack_batch(t0 + slow, Some(slow)).unwrap();
+    assert_eq!(background.numbers, [12, 10]);
+    app.request_browse_refresh();
+    assert!(app.take_stack_batch(t0 + slow, Some(slow)).is_none(), "it carries #12 already");
+    app.pr_view_number(10);
+    app.request_browse_refresh();
+    let results = vec![(12, stack_view(12, "stale")), (10, stack_view(10, "stale"))];
+    let newer = app.take_stack_batch(t0 + slow, Some(slow));
+    assert!(newer.is_none(), "the batch in flight carries #10 as well");
+    assert!(app.land_stack_batch(background.tag, results, t0 + slow));
+    assert_eq!(app.pr_snapshot().map(|s| s.title.as_str()), Some("stale"));
+}
+
+#[test]
+fn the_viewed_pr_falling_due_supersedes_a_batch_that_lacks_it() {
+    use herdr_reviewr::forge::{PrSnapshot, PrState, PrView, StackEntry};
+    let r = stacked_repo();
+    let mut app = browsing_app(&r);
+    // A taller stack, so the prefetch fills its batch bound and leaves #16 out.
+    let entry = |n: u64| StackEntry {
+        number: n,
+        title: format!("pr {n}"),
+        state: PrState::Open,
+        is_draft: false,
+        head_ref: format!("head-{n}"),
+        base_ref: format!("head-{}", n - 1),
+        level: 0,
+    };
+    let stack = (10..=16).map(entry).collect();
+    app.apply_pr(PrView::Pr(Box::new(PrSnapshot { stack, ..stack_snapshot(11, "x", "home") })));
+    let t0 = Instant::now();
+    let first = app.take_stack_batch(t0, None).unwrap();
+    assert_eq!(first.numbers.len(), 5, "bounded");
+    assert!(!first.numbers.contains(&16));
+    app.pr_view_number(16);
+    let second = app.take_stack_batch(t0, None).expect("the viewed PR supersedes");
+    assert_eq!(second.numbers[0], 16);
+    assert!(!app.land_stack_batch(first.tag, Vec::new(), t0), "the superseded tag is dead");
+}
+
+#[test]
+fn entries_for_prs_that_left_the_stack_are_evicted_unless_viewed() {
+    use herdr_reviewr::forge::{PrSnapshot, PrView};
+    let r = stacked_repo();
+    let mut app = browsing_app(&r);
+    let t0 = Instant::now();
+    land_batch(&mut app, t0, None, "cached");
+    app.pr_view_number(12);
+    // #11's next read lists only #10 and itself: #12 left, #10 stays.
+    let mut home = stack_snapshot(11, "feature", "home");
+    home.stack.retain(|e| e.number != 12);
+    app.apply_pr(PrView::Pr(Box::new(home.clone())));
+    app.take_stack_batch(t0, None).map(|b| app.land_stack_batch(b.tag, Vec::new(), t0));
+    app.pr_view_number(10);
+    assert_eq!(app.pr_snapshot().map(|s| s.title.as_str()), Some("cached"));
+    // #12, no longer viewed and out of the stack, is gone: viewing it again starts cold.
+    app.take_stack_batch(t0, None).map(|b| app.land_stack_batch(b.tag, Vec::new(), t0));
+    app.pr_view_number(12);
+    assert!(app.pr_snapshot().is_none(), "evicted");
+    // A repository change empties the cache whole.
+    app.pr_view_checked_out();
+    let moved =
+        PrSnapshot { repo: herdr_reviewr::git::RepoTarget::new("github.com", "x", "y"), ..home };
+    app.apply_pr(PrView::Pr(Box::new(moved)));
+    let b = app.take_stack_batch(t0, None).unwrap();
+    assert_eq!((b.repo.owner(), b.numbers.as_slice()), ("x", [10].as_slice()));
+}
+
+#[test]
+fn the_checked_out_pr_key_and_its_own_row_go_back_to_where_the_reader_was() {
     let r = stacked_repo();
     let mut app = browsing_app(&r);
     let keymap = Keymap::default();
@@ -8247,10 +8450,7 @@ fn the_checked_out_pr_key_and_its_own_row_go_back_to_where_the_reader_was() {
 
     // From a browsed PR, activating the checked-out PR's own row is the way back too.
     app.pr_view_number(12);
-    let (tag, ..) = app.take_browse_fetch().unwrap();
-    app.land_browsed_pr(tag, 12, PrView::Pr(Box::new(stack_snapshot(12, "head-11", "child"))));
-    let row = (0..3)
-        .find(|&i| app.pr_snapshot().unwrap().stack.iter().rev().nth(i).unwrap().number == 11);
+    let row = (0..3).find(|&i| app.pr_stack().iter().rev().nth(i).unwrap().number == 11);
     app.pr_view_stack_row(row.unwrap());
     assert_eq!(app.pr_viewing(), None);
     assert_eq!(shown_number(&app), Some(11));
@@ -8269,9 +8469,8 @@ fn the_checked_out_prs_refresh_lands_behind_a_browsed_pr_without_moving_the_view
     use herdr_reviewr::forge::PrView;
     let r = stacked_repo();
     let mut app = browsing_app(&r);
+    land_batch(&mut app, Instant::now(), None, "child");
     app.pr_view_number(12);
-    let (tag, ..) = app.take_browse_fetch().unwrap();
-    app.land_browsed_pr(tag, 12, PrView::Pr(Box::new(stack_snapshot(12, "head-11", "child"))));
     app.pr_move(1);
 
     // The background refresh of #11 retitles it and retargets it.
@@ -8289,67 +8488,22 @@ fn the_checked_out_prs_refresh_lands_behind_a_browsed_pr_without_moving_the_view
 }
 
 #[test]
-fn a_browsed_read_paints_only_while_its_pr_is_still_viewed_under_its_tag() {
-    use herdr_reviewr::forge::PrView;
-    let r = stacked_repo();
-    let mut app = browsing_app(&r);
-    let child = || PrView::Pr(Box::new(stack_snapshot(12, "head-11", "child")));
-
-    app.pr_view_number(12);
-    let (stale, ..) = app.take_browse_fetch().unwrap();
-    app.request_browse_refresh();
-    let (live, ..) = app.take_browse_fetch().unwrap();
-    assert!(!app.land_browsed_pr(stale, 12, child()), "a superseded read is dropped");
-    assert!(app.pr_snapshot().is_none());
-    assert!(app.land_browsed_pr(live, 12, child()));
-
-    // A read for a PR the reader left never paints over another PR.
-    app.request_browse_refresh();
-    let (left, ..) = app.take_browse_fetch().unwrap();
-    app.pr_view_number(10);
-    assert!(!app.land_browsed_pr(left, 12, child()));
-    assert!(app.pr_snapshot().is_none(), "#10 is still loading, not showing #12");
-    app.pr_view_checked_out();
-    assert!(!app.land_browsed_pr(left, 12, child()));
-    assert_eq!(shown_number(&app), Some(11));
-    assert!(app.take_browse_fetch().is_none(), "nothing is browsed: nothing to read");
-}
-
-#[test]
-fn a_failed_browsed_read_shows_its_own_degraded_state_and_keeps_a_good_one() {
-    use herdr_reviewr::forge::PrView;
-    use herdr_reviewr::git::Forge;
-    let r = stacked_repo();
-    let mut app = browsing_app(&r);
-    app.pr_view_number(12);
-    let (tag, ..) = app.take_browse_fetch().unwrap();
-    let failed = || PrView::Error(Forge::GitHub, "#12 not found".into());
-    assert!(app.land_browsed_pr(tag, 12, failed()));
-    assert_eq!(app.pr, failed(), "its own failure, never the checked-out PR's data");
-    assert_eq!(app.pr_checked_out_number(), Some(11));
-
-    // Once it painted, a failed refresh keeps it with a notice, like the checked-out PR.
-    app.request_browse_refresh();
-    let (tag, ..) = app.take_browse_fetch().unwrap();
-    app.land_browsed_pr(tag, 12, PrView::Pr(Box::new(stack_snapshot(12, "head-11", "child"))));
-    app.request_browse_refresh();
-    let (tag, ..) = app.take_browse_fetch().unwrap();
-    app.land_browsed_pr(tag, 12, PrView::Error(Forge::GitHub, "rate limited".into()));
-    assert_eq!(shown_number(&app), Some(12));
-    assert!(app.pr_notice().is_some_and(|n| n.contains("rate limited")));
-}
-
-#[test]
 fn a_browsed_pr_outlives_leaving_the_stack_and_survives_the_file_tabs() {
     use herdr_reviewr::forge::{PrSnapshot, PrView};
     let r = stacked_repo();
     let mut app = browsing_app(&r);
+    land_batch(&mut app, Instant::now(), None, "child");
     app.pr_view_number(12);
-    let (tag, ..) = app.take_browse_fetch().unwrap();
-    app.land_browsed_pr(tag, 12, PrView::Pr(Box::new(stack_snapshot(12, "head-11", "child"))));
     // #11's next read lists no stack at all: #12 left it.
-    app.apply_pr(PrView::Pr(Box::new(PrSnapshot { number: 11, ..common::pr_snapshot() })));
+    app.apply_pr(PrView::Pr(Box::new(PrSnapshot {
+        repo: herdr_reviewr::git::RepoTarget::new("github.com", "o", "r"),
+        number: 11,
+        ..common::pr_snapshot()
+    })));
     assert_eq!(app.pr_viewing(), Some(12));
+    // Still viewed, so it is kept and still refreshed.
+    let b = app.take_stack_batch(Instant::now(), None).unwrap();
+    assert_eq!(b.numbers, [12]);
     app.set_tab(herdr_reviewr::app::Tab::Changes).unwrap();
     app.set_tab(herdr_reviewr::app::Tab::Pr).unwrap();
     assert_eq!(app.pr_viewing(), Some(12), "a tab round trip is no way back");

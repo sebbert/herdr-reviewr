@@ -728,6 +728,7 @@ fn fetch_inner(
         && let Some(view) = pin_outcome(read_pr(
             repo,
             input.local.head_oid.as_deref(),
+            true,
             &pin.repo,
             pin.number,
             cancelled,
@@ -738,7 +739,7 @@ fn fetch_inner(
     let Some((number, detail_repo)) = lookup_pick(repo, input, repository, cancelled)? else {
         return Ok(PrView::NoPr);
     };
-    Ok(read_pr(repo, input.local.head_oid.as_deref(), detail_repo, number, cancelled)?
+    Ok(read_pr(repo, input.local.head_oid.as_deref(), true, detail_repo, number, cancelled)?
         .unwrap_or(PrView::NoPr))
 }
 
@@ -753,7 +754,74 @@ pub(crate) fn fetch_number(
     number: u64,
     cancelled: &AtomicBool,
 ) -> PrView {
-    number_outcome(read_pr(repo, None, target, number, cancelled), number)
+    number_outcome(read_pr(repo, None, false, target, number, cancelled), number)
+}
+
+/// The most PRs one batched read asks for: each brings up to 100 checks, reviews, comments,
+/// and threads of 100, so a bounded batch keeps one query's cost near a few single reads.
+pub(crate) const STACK_BATCH: usize = 5;
+
+/// Read several stack PRs in one aliased query ([`build_batch_query`]), each landing as
+/// its own view the way [`fetch_number`] reads one. A batch naming a PR the forge no
+/// longer resolves fails whole on GitHub's side, so it falls back to one read per PR and
+/// the rest still land.
+#[must_use]
+pub(crate) fn fetch_numbers(
+    repo: &Path,
+    detail_repo: &crate::git::RepoTarget,
+    numbers: &[u64],
+    cancelled: &AtomicBool,
+) -> Vec<(u64, PrView)> {
+    let target = FetchTarget {
+        repo,
+        host: detail_repo.host(),
+        owner: detail_repo.owner(),
+        name: detail_repo.name(),
+        cancelled,
+    };
+    let vars = vec![
+        ("o".to_string(), target.owner.to_string()),
+        ("n".to_string(), target.name.to_string()),
+    ];
+    match graphql(repo, target.host, &build_batch_query(numbers), &vars, cancelled) {
+        Ok(mut v) => map_batch(&mut v, numbers, detail_repo, |node| {
+            complete_review_thread_comments(&target, node)
+        }),
+        Err(GhError::NotFound(_)) => {
+            numbers.iter().map(|&n| (n, fetch_number(repo, detail_repo, n, cancelled))).collect()
+        }
+        Err(error) => {
+            let view = PrView::from(error);
+            numbers.iter().map(|&n| (n, view.clone())).collect()
+        }
+    }
+}
+
+/// Split a batched response into one view per asked number, in order: `p{i}` is
+/// `numbers[i]`. `complete` pages a node's long threads; its failure fails that PR alone.
+fn map_batch(
+    v: &mut Value,
+    numbers: &[u64],
+    detail_repo: &crate::git::RepoTarget,
+    mut complete: impl FnMut(&mut Value) -> Result<(), GhError>,
+) -> Vec<(u64, PrView)> {
+    numbers
+        .iter()
+        .enumerate()
+        .map(|(i, &number)| {
+            let node = &mut v["data"]["repository"][format!("p{i}").as_str()];
+            let read = if node.is_null() {
+                Ok(None)
+            } else {
+                complete(node).map(|()| {
+                    let mut snapshot = build_snapshot(node, Sync::Unknown);
+                    snapshot.repo = Some(detail_repo.clone());
+                    Some(PrView::Pr(Box::new(snapshot)))
+                })
+            };
+            (number, number_outcome(read, number))
+        })
+        .collect()
 }
 
 /// The view a by-number read lands as ([`fetch_number`]).
@@ -782,6 +850,7 @@ fn pin_outcome(read: Result<Option<PrView>, GhError>) -> Result<Option<PrView>, 
 fn read_pr(
     repo: &Path,
     pin: Option<&str>,
+    with_stack: bool,
     detail_repo: &crate::git::RepoTarget,
     number: u64,
     cancelled: &AtomicBool,
@@ -794,19 +863,22 @@ fn read_pr(
         cancelled,
     };
     let mut detail = pr_detail(&target, number)?;
-    complete_review_thread_comments(&target, &mut detail)?;
-    let node = &detail["data"]["repository"]["pullRequest"];
+    let node = &mut detail["data"]["repository"]["pullRequest"];
     if node.is_null() {
         return Ok(None);
     }
+    complete_review_thread_comments(&target, node)?;
+    let node = &*node;
     // Sync compares the fetch's pinned HEAD to the PR head, so a checkout or commit landing
     // mid-fetch never pairs one branch's PR with another branch's count.
     let pr_head = node["headRefOid"].as_str().unwrap_or_default();
     let sync = local_sync(repo, pin, pr_head).map_err(|error| GhError::LocalGit(error.0))?;
     let mut snapshot = build_snapshot(node, sync);
     snapshot.repo = Some(detail_repo.clone());
-    let cancelled = || target.cancelled.load(Ordering::Acquire);
-    snapshot.stack = stack_outcome(read_stack(&target, node), cancelled)?;
+    if with_stack {
+        let cancelled = || target.cancelled.load(Ordering::Acquire);
+        snapshot.stack = stack_outcome(read_stack(&target, node), cancelled)?;
+    }
     Ok(Some(PrView::Pr(Box::new(snapshot))))
 }
 
@@ -1117,18 +1189,32 @@ fn pr_detail(target: &FetchTarget<'_>, number: u64) -> Result<Value, GhError> {
 fn build_detail_query(number: u64) -> String {
     format!(
         "query($o:String!,$n:String!){{repository(owner:$o,name:$n){{\
-         pullRequest(number:{number}){{\
-         number title url body isDraft state mergeable mergeStateStatus baseRefName headRefName \
-         headRefOid isCrossRepository \
-         commits(last:1){{nodes{{commit{{statusCheckRollup{{contexts(first:100){{pageInfo{{hasNextPage}} nodes{{__typename \
-         ... on CheckRun{{name status conclusion}} ... on StatusContext{{context state}}}}}}}}}}}}}} \
-         reviews(last:100){{pageInfo{{hasPreviousPage}} nodes{{author{{login avatarUrl(size:64)}} body state submittedAt}}}} \
-         comments(last:100){{pageInfo{{hasPreviousPage}} nodes{{author{{login avatarUrl(size:64)}} body createdAt}}}} \
-         reviewThreads(last:100){{pageInfo{{hasPreviousPage}} nodes{{id isResolved isOutdated path \
-         startLine line originalStartLine originalLine diffSide \
-         comments(first:100){{pageInfo{{hasNextPage endCursor}} nodes{{author{{login avatarUrl(size:64)}} body createdAt diffHunk}}}}}}}}}}}}}}"
+         pullRequest(number:{number}){{{PR_DETAIL_FIELDS}}}}}}}"
     )
 }
+
+/// Several PRs' detail in one query, each under its own `p{i}` alias — the stack cache's
+/// background read, so a stack of N costs one round trip, not N.
+fn build_batch_query(numbers: &[u64]) -> String {
+    use std::fmt::Write;
+    let mut q = String::from("query($o:String!,$n:String!){repository(owner:$o,name:$n){");
+    for (i, number) in numbers.iter().enumerate() {
+        let _ = write!(q, "p{i}:pullRequest(number:{number}){{{PR_DETAIL_FIELDS}}} ");
+    }
+    q.push_str("}}");
+    q
+}
+
+/// One PR's detail selection, shared by the single and the batched read.
+const PR_DETAIL_FIELDS: &str = "number title url body isDraft state mergeable mergeStateStatus baseRefName headRefName \
+         headRefOid isCrossRepository \
+         commits(last:1){nodes{commit{statusCheckRollup{contexts(first:100){pageInfo{hasNextPage} nodes{__typename \
+         ... on CheckRun{name status conclusion} ... on StatusContext{context state}}}}}}} \
+         reviews(last:100){pageInfo{hasPreviousPage} nodes{author{login avatarUrl(size:64)} body state submittedAt}} \
+         comments(last:100){pageInfo{hasPreviousPage} nodes{author{login avatarUrl(size:64)} body createdAt}} \
+         reviewThreads(last:100){pageInfo{hasPreviousPage} nodes{id isResolved isOutdated path \
+         startLine line originalStartLine originalLine diffSide \
+         comments(first:100){pageInfo{hasNextPage endCursor} nodes{author{login avatarUrl(size:64)} body createdAt diffHunk}}}}";
 
 /// What a stack read decides for the snapshot. The stack is secondary: a failed read lists
 /// no stack and never costs the PR its snapshot. Only a cancelled fetch propagates, since
@@ -1350,11 +1436,9 @@ fn graphql(
 /// good view stays.
 fn complete_review_thread_comments(
     target: &FetchTarget<'_>,
-    detail: &mut Value,
+    node: &mut Value,
 ) -> Result<(), GhError> {
-    let Some(threads) =
-        detail["data"]["repository"]["pullRequest"]["reviewThreads"]["nodes"].as_array_mut()
-    else {
+    let Some(threads) = node["reviewThreads"]["nodes"].as_array_mut() else {
         return Ok(());
     };
     for thread in threads {
@@ -1957,6 +2041,54 @@ mod tests {
             "isDraft": false, "headRefName": head, "baseRefName": base,
             "isCrossRepository": false,
         })
+    }
+
+    #[test]
+    fn a_batch_reads_each_pr_under_its_own_alias_with_the_full_detail() {
+        let q = build_batch_query(&[10, 12]);
+        assert!(q.starts_with("query($o:String!,$n:String!){repository(owner:$o,name:$n){"));
+        assert!(
+            q.contains("p0:pullRequest(number:10){") && q.contains("p1:pullRequest(number:12){")
+        );
+        assert_eq!(q.matches("pullRequest(number:").count(), 2);
+        // Each alias carries the single read's selection whole: same fields, same caps.
+        let single = build_detail_query(10);
+        assert!(single.contains(PR_DETAIL_FIELDS) && q.contains(PR_DETAIL_FIELDS));
+        assert_eq!(q.matches('{').count(), q.matches('}').count(), "balanced: {q}");
+    }
+
+    #[test]
+    fn a_batch_maps_back_to_its_numbers_in_order_and_fails_per_pr() {
+        let repo = crate::git::RepoTarget::new("github.com", "o", "r").unwrap();
+        let mut v = serde_json::json!({"data": {"repository": {
+            "p0": stack_node(10, "a", "main", "OPEN"),
+            "p1": null,
+            "p2": stack_node(13, "d", "c", "MERGED"),
+        }}});
+        let mut paged = Vec::new();
+        let views = map_batch(&mut v, &[10, 12, 13], &repo, |node| {
+            let n = node["number"].as_u64().unwrap();
+            paged.push(n);
+            if n == 13 { Err(GhError::Other("thread page failed".into())) } else { Ok(()) }
+        });
+        assert_eq!(paged, [10, 13], "a missing PR pages nothing");
+        let numbers: Vec<u64> = views.iter().map(|(n, _)| *n).collect();
+        assert_eq!(numbers, [10, 12, 13]);
+        let PrView::Pr(first) = &views[0].1 else { panic!("{:?}", views[0]) };
+        assert_eq!(
+            (first.number, first.sync, first.repo.as_ref()),
+            (10, Sync::Unknown, Some(&repo))
+        );
+        assert!(
+            first.stack.is_empty(),
+            "a batch reads no stacks: the tab lists the checked-out PR's"
+        );
+        assert_eq!(views[1].1, PrView::Error(crate::git::Forge::GitHub, "#12 not found".into()));
+        assert_eq!(
+            views[2].1,
+            PrView::Error(crate::git::Forge::GitHub, "thread page failed".into()),
+            "one PR's failure is its own"
+        );
     }
 
     #[test]

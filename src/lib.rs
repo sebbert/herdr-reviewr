@@ -393,6 +393,10 @@ const EXIT_DEADLINE: Duration = Duration::from_secs(1);
 /// forge-side changes with no local signal (a reviewer's comment). Local pushes and forge PR
 /// actions refresh sooner, on the worktree's turn-end, so this cadence is the slow safety net
 const PR_POLL: Duration = Duration::from_mins(1);
+/// How often a stack PR nobody is viewing refreshes in the background: five PR polls, so a
+/// stack of a few PRs costs about one extra batched read per PR poll at most, and a switch
+/// to one shows at most five minutes' staleness while its own refresh runs.
+const STACK_REFRESH: Duration = Duration::from_mins(5);
 
 /// How long an in-flight PR fetch may run before a refresh trigger stops waiting on it.
 /// Generous against slow forges, short enough that the fallback poll recovers a wedged
@@ -618,8 +622,8 @@ fn drain_pr_shutdown(
     }
 }
 
-/// The browsed stack PR's one read in flight: its tag, cancel flag, and start, and whether
-/// its loading indicator already lit.
+/// The stack cache's one batch in flight: its tag, cancel flag, and start, and whether the
+/// viewed PR's loading indicator already lit for it.
 #[derive(Default)]
 struct BrowseFetch {
     active: Option<(u64, Arc<AtomicBool>, Instant)>,
@@ -1013,7 +1017,7 @@ fn event_loop(
     let mut recovery_inflight = false;
     let (pr_tx, pr_rx) = mpsc::channel::<TaggedPr>();
     // A browsed stack PR's reads: `(tag, number, view)`, one in flight, latest-wins by tag.
-    let (browse_tx, browse_rx) = mpsc::channel::<(u64, u64, crate::forge::PrView)>();
+    let (browse_tx, browse_rx) = mpsc::channel::<(u64, Vec<(u64, crate::forge::PrView)>)>();
     let mut browse = BrowseFetch::default();
     let mut pr = PrCoordinator::new(app.plugin_config().is_some());
     // The world worker owns every refresh build and the turn tracker; the loop sends
@@ -1276,36 +1280,41 @@ fn event_loop(
                 app.request_browse_refresh();
             }
 
-            // A browsed PR's read paints only while its tag is still the live one: the reader
-            // may have moved on to another PR, or back, while it was in flight.
+            // The stack cache's batch lands whole under its tag; a batch a newer one superseded
+            // is dropped, and the viewed PR's result reconciles into its place.
             if !app.gates_pr_drain()
-                && let Ok((tag, number, view)) = browse_rx.try_recv()
+                && let Ok((tag, results)) = browse_rx.try_recv()
             {
                 if browse.active_tag() == Some(tag) {
                     browse.active = None;
                 }
-                if app.land_browsed_pr(tag, number, view) {
+                if app.land_stack_batch(tag, results, Instant::now()) {
                     continue;
                 }
             }
+            // Every stack PR is read ahead: the viewed one on the PR tab's cadence, the rest
+            // at `STACK_REFRESH` while the tab shows, and each never-read one at once.
+            let background = (app.tab == crate::app::Tab::Pr).then_some(STACK_REFRESH);
             if app.plugin_config().is_some()
-                && let Some((tag, number, target)) = app.take_browse_fetch()
+                && let Some(batch) = app.take_stack_batch(Instant::now(), background)
             {
-                // A newer read supersedes the one in flight.
+                // A newer batch supersedes the one in flight.
                 browse.cancel();
                 let (tx, repo) = (browse_tx.clone(), app.repo.clone());
                 let cancelled = Arc::new(AtomicBool::new(false));
-                browse.active = Some((tag, cancelled.clone(), Instant::now()));
+                browse.active = Some((batch.tag, cancelled.clone(), Instant::now()));
                 browse.indicated = false;
                 thread::spawn(move || {
-                    let view = crate::forge::fetch_number(&repo, &target, number, &cancelled);
-                    let _ = tx.send((tag, number, view));
+                    let results =
+                        crate::forge::fetch_numbers(&repo, &batch.repo, &batch.numbers, &cancelled);
+                    let _ = tx.send((batch.tag, results));
                 });
             }
+            // The loading signal is the viewed PR's own: a background batch never lights it.
             if let Some((tag, _, started)) = &browse.active
                 && !browse.indicated
                 && started.elapsed() >= INDICATOR_DELAY
-                && app.browse_tag() == Some(*tag)
+                && app.stack_batch_in_flight() == Some((*tag, true))
             {
                 app.set_browse_refreshing();
                 browse.indicated = true;

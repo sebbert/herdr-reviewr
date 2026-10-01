@@ -5212,39 +5212,85 @@ fn line_with<'a>(text: &'a str, needle: &str) -> &'a str {
     text.lines().find(|l| l.contains(needle)).unwrap_or_else(|| panic!("no {needle}:\n{text}"))
 }
 
-#[test]
-fn a_browsed_stack_pr_is_marked_apart_from_the_checked_out_one_and_the_header_says_so() {
+/// The background of the first cell of `needle` on screen.
+fn bg_at(buf: &Buffer, needle: &str) -> ratatui::style::Color {
+    let text = dump(buf);
+    let y = text.lines().position(|l| l.contains(needle)).unwrap_or_else(|| panic!("{text}"));
+    let line = text.lines().nth(y).unwrap();
+    let x = line[..line.find(needle).unwrap()].chars().count();
+    buf[(u16::try_from(x).unwrap(), u16::try_from(y).unwrap())].bg
+}
+
+/// Land a batch carrying every stack PR the app asks for.
+fn land_stack(app: &mut App) {
     use herdr_reviewr::forge::PrView;
-    let (_r, mut app) = stack_app("");
-    let text = dump(&render_size(&app, 140, 30));
-    assert!(!text.contains("viewing"), "on the checked-out PR nothing says viewing: {text}");
-    assert!(line_with(&text, "#11 open").contains("● #11"));
+    let now = std::time::Instant::now();
+    while let Some(batch) = app.take_stack_batch(now, None) {
+        let results =
+            batch.numbers.iter().map(|&n| (n, PrView::Pr(Box::new(stack_pr(n))))).collect();
+        app.land_stack_batch(batch.tag, results, now);
+    }
+}
 
-    app.pr_view_number(12);
-    // Still loading: the header already names the PR, never the checked-out one's chip.
-    let text = dump(&render_size(&app, 140, 30));
-    let header = text.lines().next().unwrap();
-    assert!(header.contains("viewing #12 · not checked out"), "{header}");
-    assert!(!header.contains("#11"), "{header}");
+#[test]
+fn the_shown_prs_stack_row_is_filled_and_reads_apart_under_the_cursor() {
+    for borders in ["", "pane_outer_borders = false\n"] {
+        let (_r, mut app) = stack_app(borders);
+        let p = *app.palette();
+        land_stack(&mut app);
+        // On the checked-out PR, its own row carries the fill: it is what you look at.
+        let buf = render_size(&app, 140, 30);
+        assert_eq!(bg_at(&buf, "#11 open"), p.view_bg, "{borders:?}");
+        assert_ne!(bg_at(&buf, "#12 open"), p.view_bg);
+        let text = dump(&buf);
+        assert!(line_with(&text, "#11 open").contains("● #11"));
+        assert!(!text.contains('◆'), "no separate viewing dot: {text}");
 
-    let (tag, ..) = app.take_browse_fetch().unwrap();
-    app.land_browsed_pr(tag, 12, PrView::Pr(Box::new(stack_pr(12))));
-    let text = dump(&render_size(&app, 140, 30));
-    assert!(text.lines().next().unwrap().contains("viewing #12 · not checked out"));
-    let viewed = line_with(&text, "#12 open");
-    assert!(viewed.contains("◆ #12") && viewed.contains("viewing"), "{text}");
-    let home = line_with(&text, "#11 open");
-    assert!(home.contains("● #11") && home.contains("checked out"), "{text}");
-    let bottom = line_with(&text, "#10 open");
-    let lead: String = bottom[..bottom.find("#10").unwrap()].chars().rev().take(3).collect();
-    assert!(!lead.contains('●') && !lead.contains('◆'), "an unmarked row: {bottom}");
-    assert!(!text.contains("sync unknown"), "a browsed PR has no local sync: {text}");
+        // View #12 by clicking its row (top of the stack): the cursor and the fill share it.
+        app.pr_view_stack_row(0);
+        let buf = render_size(&app, 140, 30);
+        assert_eq!(bg_at(&buf, "#12 open"), p.view_cursor_bg, "{borders:?}");
+        assert_ne!(p.view_cursor_bg, p.cursor_bg(true));
+        assert_ne!(bg_at(&buf, "#11 open"), p.view_bg, "the fill moved with the view");
+        let header = dump(&buf).lines().next().unwrap().to_string();
+        assert!(header.contains("viewing #12 · not checked out"), "{header}");
 
-    // Narrow, the tags give way and the marks stay.
-    let text = dump(&render_size(&app, 70, 30));
-    assert!(line_with(&text, "#12 open").contains("◆ #12"), "{text}");
-    assert!(line_with(&text, "#11 open").contains("● #11"), "{text}");
-    assert!(text.lines().next().unwrap().contains("viewing #12"), "{text}");
+        // The cursor moves on: the viewed row keeps its fill, the cursor row its own.
+        app.pr_move(1);
+        let buf = render_size(&app, 140, 30);
+        assert_eq!(bg_at(&buf, "#12 open"), p.view_bg);
+        assert_eq!(bg_at(&buf, "#11 open"), p.cursor_bg(true));
+        let text = dump(&buf);
+        let home = line_with(&text, "#11 open");
+        assert!(home.contains("● #11") && home.contains("checked out"), "{text}");
+        assert!(!text.contains("sync unknown"), "a browsed PR has no local sync: {text}");
+    }
+}
+
+#[test]
+fn a_never_read_stack_pr_keeps_the_stack_and_header_painted_while_it_loads() {
+    for borders in ["", "pane_outer_borders = false\n"] {
+        let (_r, mut app) = stack_app(borders);
+        app.pr_view_number(12);
+        let text = dump(&render_size(&app, 140, 30));
+        let header = text.lines().next().unwrap();
+        assert!(header.contains("viewing #12 · not checked out"), "{header}");
+        assert!(!header.contains("#11 ↗"), "never the checked-out PR's chip: {header}");
+        assert!(text.contains("stack · 3"), "the stack stays: {text}");
+        assert!(line_with(&text, "#11 open").contains("● #11"));
+        assert!(text.contains("loading #12…"), "its own sections wait in one line: {text}");
+        let footer = footer_line(&text);
+        assert!(!footer.trim_start().starts_with('·'), "no dangling separator: {footer:?}");
+        assert!(footer.contains("0 checked out"), "{footer:?}");
+
+        // Narrow, the tags give way and the marks stay.
+        land_stack(&mut app);
+        let buf = render_size(&app, 70, 30);
+        let text = dump(&buf);
+        assert!(line_with(&text, "#11 open").contains("● #11"), "{text}");
+        assert!(text.lines().next().unwrap().contains("viewing #12"), "{text}");
+        assert_eq!(bg_at(&buf, "#12 open"), app.palette().view_bg);
+    }
 }
 
 /// The navigator rows above and below the `checks` header, from its own column.

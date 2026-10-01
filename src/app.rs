@@ -142,7 +142,6 @@ pub(crate) struct PrPlace {
     notice: Option<String>,
     refreshing: bool,
     cursor: usize,
-    stack_cursor: Option<usize>,
     read_scroll: std::cell::Cell<usize>,
     read_reveal: std::cell::Cell<Option<isize>>,
     read_painted_top: std::cell::Cell<Option<(usize, usize)>>,
@@ -161,7 +160,6 @@ impl Default for PrPlace {
             notice: None,
             refreshing: false,
             cursor: 0,
-            stack_cursor: None,
             read_scroll: std::cell::Cell::new(0),
             read_reveal: std::cell::Cell::new(None),
             read_painted_top: std::cell::Cell::new(None),
@@ -181,13 +179,38 @@ impl Default for PrPlace {
 #[derive(Debug)]
 pub(crate) struct PrBrowse {
     number: u64,
-    /// Where it is read from: the repository of the PR whose stack listed it.
-    repo: crate::git::RepoTarget,
     /// The checked-out PR's place, kept current by its own refreshes while away.
     home: PrPlace,
-    /// The tag a by-number fetch carries; a landing paints only while it still matches.
-    generation: u64,
+    /// The viewed PR is due a read on the checked-out PR's cadence.
     fetch_needed: bool,
+}
+
+/// Every stack PR's last read, so viewing one paints at once (stale but right) while its
+/// refresh runs behind. Keyed by number within one repository — the checked-out PR's — and
+/// emptied when that repository changes. The checked-out PR itself is never cached here: it
+/// has its own read and alone drives the branch base.
+#[derive(Debug, Default)]
+pub(crate) struct StackCache {
+    repo: Option<crate::git::RepoTarget>,
+    entries: HashMap<u64, CachedPr>,
+    /// The one batch in flight: its tag and the numbers it reads.
+    in_flight: Option<(u64, Vec<u64>)>,
+}
+
+/// One stack PR's last read: a snapshot, or — only until a first snapshot lands — the
+/// failure that read ended in. A failed refresh keeps the snapshot.
+#[derive(Debug)]
+struct CachedPr {
+    view: forge::PrView,
+    fetched: std::time::Instant,
+}
+
+/// One batched read of stack PRs to dispatch ([`App::take_stack_batch`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StackBatch {
+    pub tag: u64,
+    pub repo: crate::git::RepoTarget,
+    pub numbers: Vec<u64>,
 }
 
 /// The base picker's state while it is open. The rows freeze
@@ -929,8 +952,10 @@ pub struct App {
     pr_stack_cursor: Option<usize>,
     /// The stack PR being browsed, if any ([`PrBrowse`]).
     pr_browse: Option<PrBrowse>,
-    /// The last browse fetch tag handed out, monotonic across browse sessions.
-    pr_browse_generation: u64,
+    /// The stack PRs' background cache ([`StackCache`]).
+    stack_cache: StackCache,
+    /// The last stack batch tag handed out, monotonic for the session.
+    stack_batch_tag: u64,
     /// Set while the checked-out PR's update is applied to its stashed place: nothing it
     /// does is on screen, so it must not blank the visible PR's settled highlight.
     pr_offscreen: bool,
@@ -1129,7 +1154,8 @@ impl App {
             reveal_pr_nav: std::cell::Cell::new(true),
             pr_stack_cursor: None,
             pr_browse: None,
-            pr_browse_generation: 0,
+            stack_cache: StackCache::default(),
+            stack_batch_tag: 0,
             pr_offscreen: false,
             pr_pending: None,
             world_request: None,
@@ -1278,12 +1304,18 @@ impl App {
         self.pr_base = old.pr_base.take();
         // A browsed stack PR is place state, so recovery keeps looking at it; both PRs
         // refetch into fresh places, as the checked-out one always does here.
-        self.pr_browse_generation = old.pr_browse_generation;
+        // The stack cache rides along, so the browsed PR repaints from it at once.
+        self.stack_batch_tag = old.stack_batch_tag;
+        self.stack_cache = std::mem::take(&mut old.stack_cache);
+        self.stack_cache.in_flight = None;
         self.pr_browse = old.pr_browse.take().map(|b| PrBrowse {
             home: PrPlace::default(),
             fetch_needed: true,
             ..b
         });
+        if let Some(number) = self.pr_viewing() {
+            self.pr = self.cached_view(number);
+        }
         // Fold toggles are keyed by comment identity, so they apply to the refetched PR.
         self.pr_card_toggles = std::mem::take(&mut old.pr_card_toggles);
         let old_mode = old.mode.clone();
@@ -2769,7 +2801,6 @@ impl App {
         std::mem::swap(&mut self.pr_notice, &mut place.notice);
         std::mem::swap(&mut self.pr_refreshing, &mut place.refreshing);
         std::mem::swap(&mut self.pr_cursor, &mut place.cursor);
-        std::mem::swap(&mut self.pr_stack_cursor, &mut place.stack_cursor);
         self.pr_read_scroll.swap(&place.read_scroll);
         self.pr_read_reveal.swap(&place.read_reveal);
         self.pr_read_painted_top.swap(&place.read_painted_top);
@@ -2816,11 +2847,26 @@ impl App {
         }
     }
 
+    /// The stack the `PR` tab lists: always the checked-out PR's, whichever PR is shown —
+    /// viewing another one never changes the stack's identity, so it never blanks it.
+    #[must_use]
+    pub fn pr_stack(&self) -> &[forge::StackEntry] {
+        match self.pr_checked_out_view() {
+            forge::PrView::Pr(s) => &s.stack,
+            _ => &[],
+        }
+    }
+
     /// The highlighted stack row's entry, if the highlight is on the stack.
     #[must_use]
     pub fn pr_stack_selected(&self) -> Option<&forge::StackEntry> {
-        let s = self.pr_snapshot()?;
-        s.stack.iter().rev().nth(self.pr_stack_cursor?)
+        self.pr_stack().iter().rev().nth(self.pr_stack_cursor?)
+    }
+
+    /// The PR the tab is showing: the browsed one, else the checked-out one.
+    #[must_use]
+    pub fn pr_shown_number(&self) -> Option<u64> {
+        self.pr_viewing().or_else(|| self.pr_checked_out_number())
     }
 
     /// The navigator's stack-row highlight, top of the stack first.
@@ -2838,9 +2884,7 @@ impl App {
 
     /// Highlight stack row `i` and view its PR — a click on the row.
     pub fn pr_view_stack_row(&mut self, i: usize) {
-        let Some(number) =
-            self.pr_snapshot().and_then(|s| s.stack.iter().rev().nth(i)).map(|e| e.number)
-        else {
+        let Some(number) = self.pr_stack().iter().rev().nth(i).map(|e| e.number) else {
             return;
         };
         self.pr_stack_cursor = Some(i);
@@ -2848,8 +2892,9 @@ impl App {
     }
 
     /// Show stack PR `number` on the `PR` tab without checking anything out. The checked-out
-    /// PR's own number is the way back. A browsed PR opens fresh at its top, loading until
-    /// its read lands; the checked-out PR's place is kept to return to.
+    /// PR's own number is the way back. A browsed PR opens at its top, painted at once from
+    /// the stack cache and refreshed behind; only a PR never read yet shows its own loading
+    /// state. The checked-out PR's place is kept to return to.
     pub fn pr_view_number(&mut self, number: u64) {
         if self.pr_checked_out_number() == Some(number) {
             self.pr_view_checked_out();
@@ -2858,29 +2903,149 @@ impl App {
         if self.pr_viewing() == Some(number) {
             return;
         }
-        let repo = self
-            .pr_snapshot()
-            .and_then(|s| s.repo.clone())
-            .or_else(|| self.pr_browse.as_ref().map(|b| b.repo.clone()));
-        let Some(repo) = repo else { return };
+        self.sync_stack_cache_repo();
+        if self.stack_cache.repo.is_none() {
+            return;
+        }
         self.blank_pr_settled();
-        self.pr_browse_generation = self.pr_browse_generation.wrapping_add(1);
-        let generation = self.pr_browse_generation;
-        let mut fresh = PrPlace::default();
+        let mut fresh = PrPlace { pr: self.cached_view(number), ..PrPlace::default() };
         self.swap_pr_place(&mut fresh);
         match self.pr_browse.as_mut() {
             // Already away: the previous browsed PR's place is dropped, home stays stashed.
             Some(browse) => {
                 browse.number = number;
-                browse.repo = repo;
-                browse.generation = generation;
                 browse.fetch_needed = true;
             }
-            None => {
-                self.pr_browse =
-                    Some(PrBrowse { number, repo, home: fresh, generation, fetch_needed: true });
+            None => self.pr_browse = Some(PrBrowse { number, home: fresh, fetch_needed: true }),
+        }
+    }
+
+    /// The cached view of stack PR `number`, or `Pending` for one never read.
+    fn cached_view(&self, number: u64) -> forge::PrView {
+        self.stack_cache.entries.get(&number).map_or(forge::PrView::Pending, |c| c.view.clone())
+    }
+
+    /// Point the cache at the checked-out PR's repository, emptying it on a change: a number
+    /// names a PR only within one repository.
+    fn sync_stack_cache_repo(&mut self) {
+        let repo = match self.pr_checked_out_view() {
+            forge::PrView::Pr(s) => s.repo.clone(),
+            _ => return,
+        };
+        if repo.is_some() && self.stack_cache.repo != repo {
+            self.stack_cache = StackCache { repo, ..StackCache::default() };
+        }
+    }
+
+    /// The numbers the cache keeps: the checked-out PR's stack (itself aside) and the
+    /// viewed PR, even once it left the stack. `None` while the checked-out PR is unresolved,
+    /// when nothing is known to have left.
+    fn stack_members(&self) -> Option<Vec<u64>> {
+        let forge::PrView::Pr(home) = self.pr_checked_out_view() else { return None };
+        let mut members: Vec<u64> =
+            home.stack.iter().map(|e| e.number).filter(|&n| n != home.number).collect();
+        if let Some(viewed) = self.pr_viewing().filter(|n| !members.contains(n)) {
+            members.push(viewed);
+        }
+        Some(members)
+    }
+
+    /// Drop the entries of PRs that left the stack and are not viewed.
+    fn evict_stack_cache(&mut self) {
+        if let Some(members) = self.stack_members() {
+            self.stack_cache.entries.retain(|n, _| members.contains(n));
+        }
+    }
+
+    /// The next stack batch to read, if one is due: the viewed PR first when its own cadence
+    /// asks (or it was never read), then every member never read, then — when
+    /// `refresh_after` is given (the tab is showing) — every member read longer ago than
+    /// that, bounded at `forge::STACK_BATCH`. One batch is in flight at a time; the viewed
+    /// PR falling due supersedes a batch that does not carry it, and the caller cancels that
+    /// one. Each batch takes a new tag, so a superseded read can never land.
+    pub fn take_stack_batch(
+        &mut self,
+        now: std::time::Instant,
+        refresh_after: Option<std::time::Duration>,
+    ) -> Option<StackBatch> {
+        self.sync_stack_cache_repo();
+        self.evict_stack_cache();
+        let repo = self.stack_cache.repo.clone()?;
+        let members = self.stack_members()?;
+        let viewed = self.pr_viewing();
+        let viewed_due = viewed.filter(|n| {
+            self.pr_browse.as_ref().is_some_and(|b| b.fetch_needed)
+                || !self.stack_cache.entries.contains_key(n)
+        });
+        if let Some((_, reading)) = &self.stack_cache.in_flight
+            && viewed_due.is_none_or(|n| reading.contains(&n))
+        {
+            return None;
+        }
+        let due = |n: &u64| match self.stack_cache.entries.get(n) {
+            None => true,
+            Some(c) => refresh_after.is_some_and(|after| now.duration_since(c.fetched) >= after),
+        };
+        let mut numbers: Vec<u64> = viewed_due.into_iter().collect();
+        numbers.extend(members.iter().copied().filter(|n| Some(*n) != viewed_due && due(n)));
+        numbers.truncate(forge::STACK_BATCH);
+        if numbers.is_empty() {
+            return None;
+        }
+        if viewed_due.is_some()
+            && let Some(browse) = self.pr_browse.as_mut()
+        {
+            browse.fetch_needed = false;
+        }
+        self.stack_batch_tag = self.stack_batch_tag.wrapping_add(1);
+        let tag = self.stack_batch_tag;
+        self.stack_cache.in_flight = Some((tag, numbers.clone()));
+        Some(StackBatch { tag, repo, numbers })
+    }
+
+    /// The batch in flight, as its tag and whether it carries the viewed PR.
+    #[must_use]
+    pub fn stack_batch_in_flight(&self) -> Option<(u64, bool)> {
+        let (tag, numbers) = self.stack_cache.in_flight.as_ref()?;
+        Some((*tag, self.pr_viewing().is_some_and(|n| numbers.contains(&n))))
+    }
+
+    /// Land a stack batch. Each PR's result refreshes its cache entry — a failure keeps a
+    /// cached snapshot — and the viewed PR's lands on screen through the one per-PR
+    /// reconcile, so a refresh never moves the reader's place. A batch a newer one
+    /// superseded is dropped whole. Returns whether the shown PR changed.
+    pub fn land_stack_batch(
+        &mut self,
+        tag: u64,
+        results: Vec<(u64, forge::PrView)>,
+        now: std::time::Instant,
+    ) -> bool {
+        if self.stack_cache.in_flight.as_ref().is_none_or(|(t, _)| *t != tag) {
+            return false;
+        }
+        self.stack_cache.in_flight = None;
+        let mut shown = false;
+        for (number, view) in results {
+            let kept_snapshot = matches!(
+                self.stack_cache.entries.get(&number),
+                Some(CachedPr { view: forge::PrView::Pr(_), .. })
+            );
+            let entry = self
+                .stack_cache
+                .entries
+                .entry(number)
+                .or_insert(CachedPr { view: forge::PrView::Pending, fetched: now });
+            entry.fetched = now;
+            if matches!(view, forge::PrView::Pr(_)) || !kept_snapshot {
+                entry.view = view.clone();
+            }
+            if self.pr_viewing() == Some(number) {
+                self.apply_pr_here(view, false);
+                shown = true;
             }
         }
+        self.evict_stack_cache();
+        shown
     }
 
     /// Back to the checked-out PR, where the reader left it, with whatever its refreshes
@@ -2896,36 +3061,6 @@ impl App {
         if let Some(browse) = self.pr_browse.as_mut() {
             browse.fetch_needed = true;
         }
-    }
-
-    /// The browsed PR's read to dispatch, as `(tag, number, repository)`, if one is needed.
-    /// Each dispatch takes a new tag, so an older read still in flight can never paint.
-    pub fn take_browse_fetch(&mut self) -> Option<(u64, u64, crate::git::RepoTarget)> {
-        let browse = self.pr_browse.as_mut().filter(|b| b.fetch_needed)?;
-        self.pr_browse_generation = self.pr_browse_generation.wrapping_add(1);
-        browse.generation = self.pr_browse_generation;
-        browse.fetch_needed = false;
-        Some((browse.generation, browse.number, browse.repo.clone()))
-    }
-
-    /// The tag a browse read must carry to paint, while a stack PR is browsed.
-    #[must_use]
-    pub fn browse_tag(&self) -> Option<u64> {
-        self.pr_browse.as_ref().map(|b| b.generation)
-    }
-
-    /// Land a browsed PR's read: it paints only while that PR is still the one viewed under
-    /// the same tag — a read for a PR the reader left, or one a newer read superseded, is
-    /// dropped. Returns whether it painted.
-    pub fn land_browsed_pr(&mut self, generation: u64, number: u64, view: forge::PrView) -> bool {
-        let live = self
-            .pr_browse
-            .as_ref()
-            .is_some_and(|b| b.generation == generation && b.number == number);
-        if live {
-            self.apply_pr_here(view, false);
-        }
-        live
     }
 
     /// The browsed PR's read crossed the loading delay.
@@ -2994,16 +3129,15 @@ impl App {
         let old_cursor = self.pr_cursor;
         let old_number = self.pr_snapshot().map(|s| s.number);
         let selected = self.pr_selected_comment().map(forge::Comment::key);
-        let stack_selected = self.pr_stack_selected().map(|e| e.number);
+        let stack_selected =
+            checked_out.then(|| self.pr_stack_selected().map(|e| e.number)).flatten();
         let painted_folds = self.painted_card_folds();
         self.pr = view;
         self.hold_painted_folds(painted_folds);
-        // The stack highlight follows its PR by number, else the nearest surviving row.
-        if self.pr_stack_cursor.is_some() {
-            let stack: Vec<u64> = self
-                .pr_snapshot()
-                .map(|s| s.stack.iter().rev().map(|e| e.number).collect())
-                .unwrap_or_default();
+        // The stack highlight follows its PR by number, else the nearest surviving row. Only
+        // the checked-out PR's read carries the stack the tab lists.
+        if checked_out && self.pr_stack_cursor.is_some() {
+            let stack: Vec<u64> = self.pr_stack().iter().rev().map(|e| e.number).collect();
             self.pr_stack_cursor = stack_selected
                 .and_then(|n| stack.iter().position(|&m| m == n))
                 .or_else(|| self.pr_stack_cursor.map(|i| i.min(stack.len().saturating_sub(1))))
@@ -3149,11 +3283,11 @@ impl App {
     /// The navigator's cursor stops in screen order: the description, the stack rows top
     /// first, then the comments.
     fn pr_stops(&self) -> Vec<PrStop> {
-        let Some(s) = self.pr_snapshot() else { return Vec::new() };
         let offset = self.pr_description_offset();
+        let comments = self.pr_snapshot().map_or(0, |s| s.comments.len());
         let mut stops: Vec<PrStop> = (0..offset).map(PrStop::Item).collect();
-        stops.extend((0..s.stack.len()).map(PrStop::Stack));
-        stops.extend((0..s.comments.len()).map(|i| PrStop::Item(i + offset)));
+        stops.extend((0..self.pr_stack().len()).map(PrStop::Stack));
+        stops.extend((0..comments).map(|i| PrStop::Item(i + offset)));
         stops
     }
 

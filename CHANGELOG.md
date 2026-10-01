@@ -8,13 +8,18 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 - **Browse a PR stack without checking anything out.** Stack rows on the PR tab are cursor
-  stops. `Enter` or a click views that PR's state, checks, description, and conversation, read
-  from GitHub by number. The header reads `viewing #12 · not checked out`, the stack marks it
-  `◆ viewing`, and `o` opens it. `0` (`checked-out-pr`, rebindable), or the checked-out PR's
-  own row, goes back to where you were on it. The file tabs, the branch base, and your comments
-  stay with the checked-out branch. The viewed PR refreshes on the PR tab's cadence. The
-  checked-out PR's refreshes land behind it and never take you back, and a failed read shows its
-  own error.
+  stops. `Enter` or a click views that PR's state, checks, description, and conversation. The
+  header reads `viewing #12 · not checked out`, and `o` opens it. The shown PR's stack row is
+  filled with a violet tint, a step stronger under the cursor. `0` (`checked-out-pr`,
+  rebindable), or the checked-out PR's own row, goes back to where you were on it. The file
+  tabs, the branch base, and your comments stay with the checked-out branch, and the list is
+  always the checked-out PR's stack.
+- **Every stack PR is read ahead and kept in memory**, so a switch paints at once. Only a PR never
+  read yet shows `loading`, in its own sections alone; the stack and the header stay. The
+  viewed PR refreshes on the PR tab's cadence and the others every 5 minutes while the tab
+  shows, in batched GitHub queries of up to 5 PRs, one batch at a time. A refresh lands without
+  moving your place. A failed one keeps the last good read. The checked-out PR's own refreshes
+  never take you back.
 - **`pr_nav_separators = true` rules the PR navigator's sections apart** (off by default): a
   horizontal line between the stack, checks, and comments sections in place of the blank row.
   Off, the navigator looks as before.

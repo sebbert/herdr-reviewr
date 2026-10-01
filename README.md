@@ -362,20 +362,26 @@ stack · 3
 ```
 
 Move onto a stack row with `j`/`k` and press `Enter` (or click it) to view that PR: its state,
-checks, description, and conversation, read from GitHub by number. Nothing is checked out,
-and nothing outside the PR tab changes. The file tabs, the branch scope's base, and your
-comments stay with the checked-out branch. The header says `viewing #12 · not checked out`
-while you look, and the stack marks the viewed PR `◆ … viewing` beside the checked-out `●`.
-`o` opens the PR you are viewing. `0` (`checked-out-pr`), or the checked-out PR's own row,
-takes you back to where you were on it.
+checks, description, and conversation. Nothing is checked out, and nothing outside the PR tab
+changes. The file tabs, the branch scope's base, and your comments stay with the checked-out
+branch. The header says `viewing #12 · not checked out` while you look. The row of the PR on
+screen, checked out or not, is filled with a violet tint, a step stronger when the cursor
+sits on it. The list stays the checked-out PR's stack whichever PR you view. `o` opens the PR
+you are viewing. `0` (`checked-out-pr`), or the checked-out PR's own row, takes you back to
+where you were on it.
 
-The viewed PR refreshes on its own, on the PR tab's cadence. The checked-out PR keeps
-refreshing behind it, but that never takes you back. A viewed PR stays on screen until you
-leave it, even if it drops out of the stack. Each PR you open from the stack starts at its
-top. A failed read shows its own error, never the checked-out PR's data.
+reviewr reads every PR in the stack ahead of time and keeps it in memory, so a switch shows
+the PR at once. Only a PR never read yet shows `loading`, and then only in its own sections:
+the stack and the header stay. The PR you view refreshes on the PR tab's cadence. The others
+refresh every 5 minutes while the PR tab is showing. A refresh lands in place without moving
+your cursor or scroll. A failed refresh keeps the last good read, with a notice when it is the
+PR you are viewing. The checked-out PR keeps its own refresh, which never takes you back. A
+viewed PR stays on screen until you leave it, even if it drops out of the stack. Each PR you
+open from the stack starts at its top.
 
 A PR that stacks on nothing shows no stack section. Reading the stack costs one extra GitHub
-query per refresh, plus one per further level. GitLab and Azure DevOps show no stack, but their
+query per refresh, plus one per further level. The stack's PRs are read in batches of up to 5
+per GitHub query, one batch at a time. GitLab and Azure DevOps show no stack, but their
 MR or PR target still sets the [base](#base-branch).
 
 ### Navigator separators

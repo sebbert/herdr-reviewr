@@ -2985,6 +2985,9 @@ fn footer_row1(app: &App, w: usize) -> (Vec<Span<'static>>, Vec<FooterAction>) {
     // spill to the `do` band.
     let mut overflow = Vec::new();
     let mut trimming = false;
+    // Nothing before the first entry (no primary, no PR state — a PR still loading): it
+    // takes no leading separator.
+    let mut bare = primary.is_none() && pr_state.is_none();
     for a in do_acts {
         let ew = entry_width(app, a);
         if trimming || used + ew + send_w + status_w + reserve > w {
@@ -2993,14 +2996,18 @@ fn footer_row1(app: &App, w: usize) -> (Vec<Span<'static>>, Vec<FooterAction>) {
             continue;
         }
         used += ew;
-        spans.push(Span::styled(SEP, Style::default().fg(p.dim2)));
+        if !std::mem::take(&mut bare) {
+            spans.push(Span::styled(SEP, Style::default().fg(p.dim2)));
+        }
         spans.extend(action_entry(app, a, Band::Do));
     }
 
     // `send` closes the actions and never drops.
     if let Some(a) = send {
         used += send_w;
-        spans.push(Span::styled(SEP, Style::default().fg(p.dim2)));
+        if !bare {
+            spans.push(Span::styled(SEP, Style::default().fg(p.dim2)));
+        }
         spans.extend(action_entry(app, a, Band::Send));
     }
 
@@ -4430,8 +4437,15 @@ fn render_pr_nav(frame: &mut Frame, app: &App, pane: Pane) {
                     Style::default().fg(p.surface2),
                 )));
             }
-            let selected = row.selected(app);
-            selectable_row(p, row.spans, width, selected.then(|| p.cursor_bg(true)))
+            // The shown PR's stack row keeps its violet under the cursor too, a step stronger,
+            // so the cursor and "this is what you're looking at" both read on one row.
+            let fill = match (row.selected(app), row.viewed) {
+                (true, true) => Some(p.view_cursor_bg),
+                (true, false) => Some(p.cursor_bg(true)),
+                (false, true) => Some(p.view_bg),
+                (false, false) => None,
+            };
+            selectable_row(p, row.spans, width, fill)
         })
         .collect();
     frame.render_widget(List::new(items), inner);
@@ -4447,6 +4461,8 @@ struct PrNavRow {
     stack: Option<usize>,
     /// A section rule, painted across the pane; its copied text is empty.
     rule: bool,
+    /// The stack row of the PR the tab is showing, filled across the row.
+    viewed: bool,
 }
 
 impl PrNavRow {
@@ -4466,8 +4482,25 @@ impl PrNavRow {
 
 /// The complete PR navigator layout, shared by painting and click hit-testing.
 fn pr_nav_rows(app: &App, width: usize, now: std::time::SystemTime) -> Vec<PrNavRow> {
-    let Some(s) = app.pr_snapshot() else { return Vec::new() };
     let p = app.palette();
+    let stack = app.pr_stack();
+    let Some(s) = app.pr_snapshot() else {
+        // A browsed PR never read yet: the stack stays — its identity did not change — and
+        // only the PR's own sections wait, in one line; the read pane says the rest.
+        let Some(number) = app.pr_viewing().filter(|_| !stack.is_empty()) else {
+            return Vec::new();
+        };
+        let mut rows = Vec::new();
+        push_stack_rows(&mut rows, app, stack, width);
+        rows.push(PrNavRow::default());
+        let sigil = app.pr_forge.sigil();
+        let line = match &app.pr {
+            forge::PrView::Pending | forge::PrView::Loading => format!("loading {sigil}{number}…"),
+            _ => format!("{sigil}{number} unavailable"),
+        };
+        rows.push(PrNavRow::text(vec![Span::styled(line, Style::default().fg(p.dim2))]));
+        return rows;
+    };
     let dim = Style::default().fg(p.dim2);
     // Between the stack, checks, and comments sections: a gap, or a rule when configured.
     let parting = || {
@@ -4486,8 +4519,8 @@ fn pr_nav_rows(app: &App, width: usize, now: std::time::SystemTime) -> Vec<PrNav
         });
         rows.push(PrNavRow::default());
     }
-    if !s.stack.is_empty() {
-        push_stack_rows(&mut rows, app, s, width);
+    if !stack.is_empty() {
+        push_stack_rows(&mut rows, app, stack, width);
         rows.push(parting());
     }
     rows.push(PrNavRow::text(vec![Span::styled(pr_checks_header(s), dim)]));
@@ -4509,33 +4542,37 @@ fn pr_nav_rows(app: &App, width: usize, now: std::time::SystemTime) -> Vec<PrNav
     rows
 }
 
-/// The stack section: its header, then one row per PR top of the stack first — the way
-/// `gh stack` and a branch graph read — and the trunk the bottom PR targets as the last
-/// row. The checked-out PR wears a filled `●` and a `checked out` tag; a browsed one, when
-/// it is another, a `◆` and `viewing`. The tag drops first in a narrow pane, the marks
-/// never. Each PR row is a cursor stop, and `Enter` or a click views it.
-fn push_stack_rows(rows: &mut Vec<PrNavRow>, app: &App, s: &forge::PrSnapshot, width: usize) {
+/// The stack section — always the checked-out PR's stack: its header, then one row per PR
+/// top of the stack first — the way `gh stack` and a branch graph read — and the trunk the
+/// bottom PR targets as the last row. The checked-out PR wears a filled `●` and a
+/// `checked out` tag, which drops first in a narrow pane; the mark never does. The row of
+/// the PR the tab is showing, checked out or browsed, is filled across ([`PrNavRow::viewed`]).
+/// Each PR row is a cursor stop, and `Enter` or a click views it.
+fn push_stack_rows(rows: &mut Vec<PrNavRow>, app: &App, stack: &[forge::StackEntry], width: usize) {
     let p = app.palette();
     let dim = Style::default().fg(p.dim2);
-    rows.push(PrNavRow::text(vec![Span::styled(format!("stack · {}", s.stack.len()), dim)]));
+    rows.push(PrNavRow::text(vec![Span::styled(format!("stack · {}", stack.len()), dim)]));
     let checked_out = app.pr_checked_out_number();
-    let viewing = app.pr_viewing();
-    for (i, entry) in s.stack.iter().rev().enumerate() {
+    let shown = app.pr_shown_number();
+    for (i, entry) in stack.iter().rev().enumerate() {
         let (word, color) = stack_state(p, entry);
         let (mark, mark_color, tag) = if checked_out == Some(entry.number) {
             ("●", p.green, "checked out")
-        } else if viewing == Some(entry.number) {
-            ("◆", p.blue, "viewing")
         } else {
             (" ", p.dim2, "")
         };
-        let marked = !tag.is_empty();
+        let viewed = shown == Some(entry.number);
+        let marked = !tag.is_empty() || viewed;
         let lead = format!(" {mark} ");
         let number = format!("{}{} ", app.pr_forge.sigil(), entry.number);
         let state = format!("{word:<6} ");
         let used = lead.width() + number.width() + state.width();
         // The tag keeps its room only while the title still gets a readable minimum.
-        let tag_w = if marked && width >= used + 2 + tag.width() + 8 { 2 + tag.width() } else { 0 };
+        let tag_w = if !tag.is_empty() && width >= used + 2 + tag.width() + 8 {
+            2 + tag.width()
+        } else {
+            0
+        };
         let title = truncate_width(&entry.title, width.saturating_sub(used + tag_w));
         let title_style = if marked {
             text_style(p).add_modifier(Modifier::BOLD)
@@ -4551,9 +4588,9 @@ fn push_stack_rows(rows: &mut Vec<PrNavRow>, app: &App, s: &forge::PrSnapshot, w
         if tag_w > 0 {
             spans.push(Span::styled(format!("  {tag}"), Style::default().fg(mark_color)));
         }
-        rows.push(PrNavRow { spans, stack: Some(i), ..PrNavRow::default() });
+        rows.push(PrNavRow { spans, stack: Some(i), viewed, ..PrNavRow::default() });
     }
-    if let Some(bottom) = s.stack.first().filter(|e| !e.base_ref.is_empty()) {
+    if let Some(bottom) = stack.first().filter(|e| !e.base_ref.is_empty()) {
         rows.push(PrNavRow::text(vec![Span::styled(format!("   └ {}", bottom.base_ref), dim)]));
     }
 }

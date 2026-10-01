@@ -69,6 +69,13 @@ pub struct Palette {
     /// The text-selection highlight, live and settled: a cool fill distinct by hue from the
     /// `surface1`/`surface2` row fills, so a selection reads inside a cursor row in any pane
     pub sel_bg: Color,
+    /// The row of the PR the `PR` tab is showing, in the navigator's stack: a violet tint
+    /// apart by hue from the neutral cursor fills, the blue selection, the diff fills, and
+    /// the warm search match.
+    pub view_bg: Color,
+    /// The same row under the navigator cursor: the violet at full strength, so the cursor
+    /// still reads there and the row still says it is the one showing.
+    pub view_cursor_bg: Color,
 }
 
 impl Palette {
@@ -198,10 +205,18 @@ fn catppuccin() -> Theme {
             emph_ins_bg: Color::Rgb(0x30, 0x55, 0x3f),
             match_hl: Color::Rgb(0x5c, 0x51, 0x2b),
             sel_bg: Color::Rgb(0x35, 0x3d, 0x7d),
+            // Later slots, derived the way every other theme derives them.
+            view_bg: row_tint(MOCHA_BASE, MOCHA_PURPLE, MOCHA_TEXT, VIEW_TINT),
+            view_cursor_bg: row_tint(MOCHA_SURFACE2, MOCHA_PURPLE, MOCHA_TEXT, VIEW_CURSOR_TINT),
         },
         syntax: SyntaxChoice::Bundled(MOCHA_TM),
     }
 }
+
+const MOCHA_BASE: Color = Color::Rgb(0x1e, 0x1e, 0x2e);
+const MOCHA_TEXT: Color = Color::Rgb(0xcd, 0xd6, 0xf4);
+const MOCHA_PURPLE: Color = Color::Rgb(0xcb, 0xa6, 0xf7);
+const MOCHA_SURFACE2: Color = Color::Rgb(0x58, 0x5b, 0x70);
 
 /// A theme whose palette is derived from `anchors`, paired with a bundled `.tmTheme`'s bytes.
 fn bundled(
@@ -331,6 +346,8 @@ fn derive(a: Anchors, appearance: Appearance) -> Palette {
         emph_ins_bg: readable_tint(a.green, a.base, a.text, appearance, true),
         match_hl: readable_tint(a.yellow, a.base, a.text, appearance, true),
         sel_bg: readable_tint(saturated(a.blue), a.base, a.text, appearance, true),
+        view_bg: row_tint(a.base, a.purple, a.text, VIEW_TINT),
+        view_cursor_bg: row_tint(surface(0.14), a.purple, a.text, VIEW_CURSOR_TINT),
     }
 }
 
@@ -390,6 +407,32 @@ fn readable_tint(
         t -= 0.02;
     }
     base
+}
+
+/// The viewed-row fill's tint strength, over the background.
+const VIEW_TINT: f64 = 0.22;
+/// The viewed row's tint under the cursor, over the cursor's own fill.
+const VIEW_CURSOR_TINT: f64 = 0.30;
+/// The weakest tint a row marker steps down to: the mark must never vanish into the fill it
+/// tints, which would leave the viewed row indistinguishable from its neighbours or the cursor.
+const MIN_ROW_TINT: f64 = 0.08;
+/// The contrast a row marker keeps for the row's text — the bar the surface fills meet, not
+/// the diff fills' higher one, since a marked row holds bold UI text, not code.
+const MIN_ROW_CONTRAST: f64 = 3.0;
+
+/// A row-marker fill: `from` tinted toward the saturated `accent`, as strong as `start`
+/// while `fg` keeps [`MIN_ROW_CONTRAST`], never weaker than [`MIN_ROW_TINT`].
+fn row_tint(from: Color, accent: Color, fg: Color, start: f64) -> Color {
+    let accent = saturated(accent);
+    let mut t = start;
+    while t > MIN_ROW_TINT {
+        let fill = blend(from, accent, t);
+        if contrast(fg, fill) >= MIN_ROW_CONTRAST {
+            return fill;
+        }
+        t -= 0.02;
+    }
+    blend(from, accent, MIN_ROW_TINT)
 }
 
 /// Halfway between an accent and its colorful core — the shared gray component removed and
@@ -588,6 +631,28 @@ mod tests {
                 assert!(
                     contrast(p.text, fill) >= MIN_FILL_CONTRAST,
                     "{name}: fill {fill:?} drops below the legibility floor",
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_viewed_row_reads_apart_from_the_cursor_and_from_itself_under_it() {
+        for &(name, _) in NAMED {
+            let p = resolve(Some(name)).palette;
+            let fills = [p.cursor_bg(true), p.cursor_bg(false), p.view_bg, p.view_cursor_bg];
+            for (i, a) in fills.iter().enumerate() {
+                for b in &fills[i + 1..] {
+                    assert_ne!(a, b, "{name}: two row treatments share a fill");
+                }
+            }
+            // 3:1 like the surface fills, or within a tenth of the fill it tints where that
+            // fill itself sits near the floor.
+            for (fill, under) in [(p.view_bg, p.base), (p.view_cursor_bg, p.surface2)] {
+                let floor = super::MIN_ROW_CONTRAST.min(0.9 * contrast(p.text, under));
+                assert!(
+                    contrast(p.text, fill) >= floor,
+                    "{name}: the viewed row's text drops below its legibility floor",
                 );
             }
         }
