@@ -221,6 +221,7 @@ default_scope = "branch"
 navigator_position = "right"
 toggle_placement = "overlay"
 toggle_direction = "down"
+split_ratio = 0.33
 auto_open = false
 github_host = "github.example.com"
 editor = "code -g {file}:{line}"
@@ -386,9 +387,11 @@ shape:
 ```toml
 toggle_placement = "overlay"   # split | overlay | zoomed | tab   (default: split)
 toggle_direction = "down"      # right | down — split only        (default: right)
+split_ratio = 0.33             # reviewr's share, 0.1–0.9 — split only (default: 0.5)
 ```
 
 - **`split`** sits next to your agent. `toggle_direction` puts reviewr on the right (default) or below.
+  `split_ratio` sizes it: the split opens even, then resizes to reviewr's share. Auto-open sizes it too.
 - **`overlay`** covers the tab. Toggle again to drop back.
 - **`zoomed`** fills the tab.
 - **`tab`** opens its own tab.

@@ -13,9 +13,10 @@ fn reviewr_bin() -> &'static str {
 /// `pane list` serves `panes.json` (else one plain pane), `pane process-info` serves the
 /// per-pane `procinfo-<id>.json` (else a plain shell, which is not a reviewr pane) or fails
 /// with `procfail-<id>.json` on stderr, `pane close` succeeds unless `closefail-<id>`
-/// exists (whose content becomes the failure's stderr), `plugin config-dir` names the
-/// fixture dir itself (after a 5s hang when `configdir-hang` exists), and everything else
-/// answers as a successful `plugin pane open`.
+/// exists (whose content becomes the failure's stderr), `pane layout` serves `layout.json`
+/// (else fails), `pane resize` succeeds unless `resizefail` exists, `plugin config-dir`
+/// names the fixture dir itself (after a 5s hang when `configdir-hang` exists), and
+/// everything else answers as a successful `plugin pane open`.
 fn fake_herdr(dir: &Path) -> (PathBuf, PathBuf) {
     let path = dir.join("herdr");
     let log = dir.join("herdr.log");
@@ -36,6 +37,11 @@ fn fake_herdr(dir: &Path) -> (PathBuf, PathBuf) {
                 "    else printf '%s\\n' '{{\"result\":{{\"process_info\":{{\"foreground_process_group_id\":7,\"foreground_processes\":[{{\"pid\":7,\"name\":\"zsh\",\"argv0\":\"zsh\",\"argv\":[\"-zsh\"],\"cwd\":\"/\"}}],\"pane_id\":\"'\"$4\"'\",\"shell_pid\":1}}}}}}'; fi ;;\n",
                 "  'pane close '*)\n",
                 "    if [ -f \"$dir/closefail-$3\" ]; then cat \"$dir/closefail-$3\" >&2; exit 1; fi\n",
+                "    printf '%s\\n' '{{\"result\":{{}}}}' ;;\n",
+                "  'pane layout '*)\n",
+                "    if [ -f \"$dir/layout.json\" ]; then cat \"$dir/layout.json\"; else exit 1; fi ;;\n",
+                "  'pane resize '*)\n",
+                "    if [ -f \"$dir/resizefail\" ]; then exit 1; fi\n",
                 "    printf '%s\\n' '{{\"result\":{{}}}}' ;;\n",
                 "  'plugin config-dir '*)\n",
                 "    if [ -f \"$dir/configdir-hang\" ]; then sleep 5; fi\n",
@@ -895,4 +901,143 @@ fn split_placement_open_renames_no_tab() {
     assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
     let calls = fs::read_to_string(&log).unwrap();
     assert!(!calls.contains("tab rename"), "{calls}");
+}
+
+// --- Split ratio: a split open resizes its own split to `split_ratio`.
+
+/// The `pane layout` answer right after a split open, in the live 0.9.3 shape: the opened
+/// pane `w1:p9` beside its target `w1:p1` at herdr's even halves, both inside the left
+/// half of an outer `right` split with `w1:p2`. The outer split is what a resize naming
+/// the wrong pane would move.
+fn split_layout(dir: &Path, direction: &str) {
+    let (p1, p9) = match direction {
+        "right" => {
+            (r#"{"x":0,"y":0,"width":85,"height":98}"#, r#"{"x":85,"y":0,"width":85,"height":98}"#)
+        }
+        _ => (
+            r#"{"x":0,"y":0,"width":170,"height":49}"#,
+            r#"{"x":0,"y":49,"width":170,"height":49}"#,
+        ),
+    };
+    fs::write(
+        dir.join("layout.json"),
+        format!(
+            concat!(
+                r#"{{"result":{{"layout":{{"focused_pane_id":"w1:p1","panes":["#,
+                r#"{{"pane_id":"w1:p1","rect":{p1}}},{{"pane_id":"w1:p9","rect":{p9}}},"#,
+                r#"{{"pane_id":"w1:p2","rect":{{"x":170,"y":0,"width":169,"height":98}}}}],"#,
+                r#""splits":[{{"direction":"right","id":"split_0_root","ratio":0.5,"#,
+                r#""rect":{{"x":0,"y":0,"width":339,"height":98}}}},"#,
+                r#"{{"direction":"{direction}","id":"split_1_0","ratio":0.5,"#,
+                r#""rect":{{"x":0,"y":0,"width":170,"height":98}}}}]}}}}}}"#,
+            ),
+            p1 = p1,
+            p9 = p9,
+            direction = direction,
+        ),
+    )
+    .unwrap();
+}
+
+#[test]
+fn split_ratio_resizes_the_new_panes_own_split_never_an_outer_one() {
+    let dir = tempfile::tempdir().unwrap();
+    let (herdr, log) = fake_herdr(dir.path());
+
+    // A split's ratio is its first child's share. Shrinking the reviewr pane moves the
+    // boundary toward it, which only its sibling's trailing edge reaches: the same move on
+    // the reviewr pane would take its own trailing edge, the outer split's boundary.
+    let cases = [
+        ("right", "0.33", "pane resize --pane w1:p1 --direction right --amount 0.17"),
+        ("right", "0.7", "pane resize --pane w1:p9 --direction left --amount 0.2"),
+        ("down", "0.33", "pane resize --pane w1:p1 --direction down --amount 0.17"),
+        ("down", "0.7", "pane resize --pane w1:p9 --direction up --amount 0.2"),
+    ];
+    for (direction, ratio, resize) in cases {
+        fs::write(
+            dir.path().join("config.toml"),
+            format!("toggle_direction = \"{direction}\"\nsplit_ratio = {ratio}\n"),
+        )
+        .unwrap();
+        split_layout(dir.path(), direction);
+        let _ = fs::remove_file(&log);
+
+        let output = run_open(dir.path(), &herdr);
+
+        assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+        let calls = fs::read_to_string(&log).unwrap();
+        assert!(calls.contains("pane layout --pane w1:p9"), "{direction}/{ratio}: {calls}");
+        assert!(calls.lines().any(|line| line == resize), "{direction}/{ratio}: {calls}");
+        assert_eq!(calls.matches("pane resize").count(), 1, "{calls}");
+    }
+}
+
+#[test]
+fn the_default_split_ratio_and_non_split_placements_never_resize() {
+    let dir = tempfile::tempdir().unwrap();
+    let (herdr, log) = fake_herdr(dir.path());
+    split_layout(dir.path(), "right");
+
+    for text in
+        ["toggle_placement = \"split\"\n", "toggle_placement = \"tab\"\nsplit_ratio = 0.33\n"]
+    {
+        fs::write(dir.path().join("config.toml"), text).unwrap();
+        let _ = fs::remove_file(&log);
+
+        let output = run_open(dir.path(), &herdr);
+
+        assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+        let calls = fs::read_to_string(&log).unwrap();
+        assert!(!calls.contains("pane layout"), "{text}: {calls}");
+        assert!(!calls.contains("pane resize"), "{text}: {calls}");
+    }
+}
+
+#[test]
+fn a_failed_layout_read_or_resize_never_fails_the_open() {
+    let dir = tempfile::tempdir().unwrap();
+    let (herdr, log) = fake_herdr(dir.path());
+    fs::write(dir.path().join("config.toml"), "split_ratio = 0.33\n").unwrap();
+
+    // No layout answer: no resize is attempted, and the open still reports.
+    let output = run_open(dir.path(), &herdr);
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    assert!(String::from_utf8_lossy(&output.stdout).contains("opened w1:p9"));
+    assert!(!fs::read_to_string(&log).unwrap().contains("pane resize"));
+
+    // A refused resize is cosmetic too.
+    split_layout(dir.path(), "right");
+    fs::write(dir.path().join("resizefail"), "").unwrap();
+    let _ = fs::remove_file(&log);
+    let output = run_open(dir.path(), &herdr);
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    assert!(String::from_utf8_lossy(&output.stdout).contains("opened w1:p9"));
+    assert!(fs::read_to_string(&log).unwrap().contains("pane resize"));
+}
+
+#[test]
+fn auto_open_resizes_its_split_too() {
+    let dir = tempfile::tempdir().unwrap();
+    let (herdr, log) = fake_herdr(dir.path());
+    fs::write(dir.path().join("config.toml"), "split_ratio = 0.33\n").unwrap();
+    split_layout(dir.path(), "right");
+    let event = serde_json::json!({
+        "event": "worktree_created",
+        "data": {"workspace": {
+            "workspace_id": "workspace-born",
+            "worktree": {"checkout_path": env!("CARGO_MANIFEST_DIR")},
+        }},
+    })
+    .to_string();
+
+    let output = run_auto_open(dir.path(), &herdr, &event, None);
+
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    let calls = fs::read_to_string(&log).unwrap();
+    assert!(
+        calls
+            .lines()
+            .any(|line| line == "pane resize --pane w1:p1 --direction right --amount 0.17"),
+        "{calls}"
+    );
 }

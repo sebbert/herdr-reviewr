@@ -46,6 +46,7 @@ unreadable_config() {
 }
 placement=$(cfg_field toggle_placement) || unreadable_config
 direction=$(cfg_field toggle_direction) || unreadable_config
+split_ratio=$(cfg_field split_ratio) || unreadable_config
 auto_open=$(cfg_field auto_open) || unreadable_config
 
 # The stable launch paths track the live plugin root from here, not from the install step:
@@ -278,6 +279,42 @@ open_json=$("$H" plugin pane open --plugin "${HERDR_PLUGIN_ID:-persiyanov.review
   "$@" --cwd "$cwd" "$focus" 2>/dev/null)
 new=$(printf '%s' "$open_json" | jq -r '.result.plugin_pane.pane.pane_id // empty' 2>/dev/null)
 [ -n "$new" ] || refuse "herdr plugin pane open failed"
+
+# `plugin pane open` takes no size, so a split lands at herdr's even halves and is then
+# resized to `split_ratio`, the reviewr pane's share. At the default 0.5 nothing runs. A
+# split's `ratio` is its first child's share, and `pane resize --direction D` moves the
+# resized pane's own edge on side D (else its opposite edge) by `--amount` ratio units, at
+# the nearest ancestor split owning that edge. So the plan reads the new pane's parent split
+# (the smallest one containing it) and resizes a pane whose edge on the moving side is that
+# split's boundary — the new pane or its sibling — never an outer split. Cosmetic: a failed
+# read or resize never fails an open that already succeeded.
+if [ "$placement" = split ] && [ "$split_ratio" != 0.5 ]; then
+  resize=$("$H" pane layout --pane "$new" 2>/dev/null | jq -r --arg p "$new" --argjson r "$split_ratio" '
+    .result.layout as $l
+    | first($l.panes[] | select(.pane_id == $p) | .rect) as $n
+    | def inside($s): .x >= $s.x and .y >= $s.y
+        and .x + .width <= $s.x + $s.width and .y + .height <= $s.y + $s.height;
+      [$l.splits[] | select(. as $s | $n | inside($s.rect))]
+    | select(length > 0)
+    | min_by(.rect.width * .rect.height) as $s
+    | (if $s.direction == "right" then ["x", "width", "right", "left"]
+       else ["y", "height", "down", "up"] end) as [$pos, $len, $grow, $shrink]
+    | ($n[$pos] == $s.rect[$pos]) as $first
+    | (if $first then $n[$pos] + $n[$len] else $n[$pos] end) as $edge
+    | (if $first then $r else 1 - $r end) - $s.ratio
+    | (if . > 0 then $grow else $shrink end) as $dir
+    | (if . < 0 then -. else . end) as $amount
+    | select($amount >= 0.005)
+    | first(($l.panes[] | select(.pane_id == $p)), $l.panes[]
+        | select(.rect | inside($s.rect))
+        | select(if $dir == $grow then .rect[$pos] + .rect[$len] else .rect[$pos] end == $edge))
+    | "\(.pane_id) \($dir) \(($amount * 10000 | round) / 10000)"' 2>/dev/null)
+  read -r rz_pane rz_dir rz_amount <<EOF
+$resize
+EOF
+  [ -z "${rz_amount:-}" ] ||
+    "$H" pane resize --pane "$rz_pane" --direction "$rz_dir" --amount "$rz_amount" >/dev/null 2>&1
+fi
 
 # A tab open lands in a fresh tab that herdr labels with a bare index; name it
 # after the plugin so the tab bar reads "reviewr". Cosmetic: a

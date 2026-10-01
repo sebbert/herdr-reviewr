@@ -66,12 +66,13 @@ impl Config {
     }
 }
 
-const PLUGIN_CONFIG_KEYS: [&str; 12] = [
+const PLUGIN_CONFIG_KEYS: [&str; 13] = [
     "theme",
     "default_scope",
     "navigator_position",
     "toggle_placement",
     "toggle_direction",
+    "split_ratio",
     "auto_open",
     "github_host",
     "gitlab_host",
@@ -155,6 +156,35 @@ impl ToggleDirection {
     }
 }
 
+/// The share of a split the reviewr pane takes. herdr clamps every split's ratio to
+/// [0.1, 0.9], so the range is the one a resize can reach. Validated values are finite, so
+/// comparing bits is equality.
+#[derive(Clone, Copy, Debug)]
+pub struct SplitRatio(f64);
+
+impl SplitRatio {
+    pub const MIN: f64 = 0.1;
+    pub const MAX: f64 = 0.9;
+
+    pub fn get(self) -> f64 {
+        self.0
+    }
+}
+
+impl Default for SplitRatio {
+    fn default() -> Self {
+        Self(0.5)
+    }
+}
+
+impl PartialEq for SplitRatio {
+    fn eq(&self, other: &Self) -> bool {
+        self.0.to_bits() == other.0.to_bits()
+    }
+}
+
+impl Eq for SplitRatio {}
+
 /// One validated snapshot of `config.toml` in the resolved config directory.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PluginConfig {
@@ -163,6 +193,7 @@ pub struct PluginConfig {
     navigator_position: NavigatorPosition,
     toggle_placement: TogglePlacement,
     toggle_direction: ToggleDirection,
+    split_ratio: SplitRatio,
     auto_open: bool,
     github_host: Option<String>,
     gitlab_host: Option<String>,
@@ -180,6 +211,7 @@ impl Default for PluginConfig {
             navigator_position: NavigatorPosition::Right,
             toggle_placement: TogglePlacement::Split,
             toggle_direction: ToggleDirection::Right,
+            split_ratio: SplitRatio::default(),
             auto_open: true,
             github_host: None,
             gitlab_host: None,
@@ -212,6 +244,10 @@ impl PluginConfig {
 
     pub fn toggle_direction(&self) -> ToggleDirection {
         self.toggle_direction
+    }
+
+    pub fn split_ratio(&self) -> SplitRatio {
+        self.split_ratio
     }
 
     pub fn auto_open(&self) -> bool {
@@ -270,6 +306,7 @@ impl PluginConfig {
             "navigator_position": self.navigator_position.as_str(),
             "toggle_placement": self.toggle_placement.as_str(),
             "toggle_direction": self.toggle_direction.as_str(),
+            "split_ratio": self.split_ratio.get(),
             "auto_open": self.auto_open,
             "github_host": self.github_host,
             "gitlab_host": self.gitlab_host,
@@ -430,6 +467,14 @@ fn parse_plugin_config(path: &Path) -> Result<PluginConfig, PluginConfigError> {
                 "down" => ToggleDirection::Down,
                 _ => return Err(value_error(path, "toggle_direction", "one of right, down")),
             };
+    }
+    if let Some(value) = table.get("split_ratio") {
+        // A float only: no integer is in range, and `1` for "all of it" is a typo to surface.
+        config.split_ratio = value
+            .as_float()
+            .filter(|ratio| (SplitRatio::MIN..=SplitRatio::MAX).contains(ratio))
+            .map(SplitRatio)
+            .ok_or_else(|| value_error(path, "split_ratio", "a number from 0.1 to 0.9"))?;
     }
     if let Some(value) = table.get("auto_open") {
         config.auto_open =
@@ -754,6 +799,7 @@ mod tests {
         assert_eq!(config.navigator_position(), NavigatorPosition::Right);
         assert_eq!(config.toggle_placement(), TogglePlacement::Split);
         assert_eq!(config.toggle_direction(), ToggleDirection::Right);
+        assert_eq!(config.split_ratio(), super::SplitRatio(0.5));
         assert!(config.auto_open());
         assert_eq!(config.github_host(), None);
         assert_eq!(config.url_opener(), None);
@@ -770,6 +816,7 @@ mod tests {
                 "navigator_position = \"bottom\"\n",
                 "toggle_placement = \"overlay\"\n",
                 "toggle_direction = \"down\"\n",
+                "split_ratio = 0.33\n",
                 "auto_open = false\n",
                 "github_host = \"GitHub.Example.COM\"\n",
             ),
@@ -781,6 +828,7 @@ mod tests {
         assert_eq!(config.navigator_position(), NavigatorPosition::Bottom);
         assert_eq!(config.toggle_placement(), TogglePlacement::Overlay);
         assert_eq!(config.toggle_direction(), ToggleDirection::Down);
+        assert_eq!(config.split_ratio(), super::SplitRatio(0.33));
         assert!(!config.auto_open());
         assert_eq!(config.github_host(), Some("github.example.com"));
     }
@@ -809,6 +857,18 @@ mod tests {
         let config = super::plugin_config_in(dir.path()).unwrap();
         assert_eq!(config.editor(), None);
         assert!(config.to_json()["editor"].is_null());
+    }
+
+    #[test]
+    fn split_ratio_bounds_are_inclusive_and_reach_the_resolved_json() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        for ratio in [0.1, 0.33, 0.9] {
+            std::fs::write(&path, format!("split_ratio = {ratio}\n")).unwrap();
+            let config = super::plugin_config_in(dir.path()).expect("in range");
+            assert_eq!(config.split_ratio(), super::SplitRatio(ratio));
+            assert_eq!(config.to_json()["split_ratio"], ratio);
+        }
     }
 
     #[test]
@@ -853,6 +913,14 @@ mod tests {
             ("navigator_position = \"center\"\n", "`navigator_position`"),
             ("toggle_placement = \"left\"\n", "`toggle_placement`"),
             ("toggle_direction = \"left\"\n", "`toggle_direction`"),
+            ("split_ratio = \"0.33\"\n", "`split_ratio`"),
+            // An integer is never in range: `1` for "all of it" is a typo, not a ratio.
+            ("split_ratio = 1\n", "`split_ratio`"),
+            ("split_ratio = 0\n", "`split_ratio`"),
+            // Outside herdr's [0.1, 0.9] clamp, a resize could never reach the value.
+            ("split_ratio = 0.05\n", "`split_ratio`"),
+            ("split_ratio = 0.95\n", "`split_ratio`"),
+            ("split_ratio = nan\n", "`split_ratio`"),
             ("auto_open = \"yes\"\n", "`auto_open`"),
             ("github_host = \"https://github.example.com\"\n", "`github_host`"),
             ("editor = \"\"\n", "`editor`"),
@@ -1140,6 +1208,7 @@ mod tests {
         assert_eq!(object["navigator_position"], "right");
         assert_eq!(object["toggle_placement"], "split");
         assert_eq!(object["toggle_direction"], "right");
+        assert_eq!(object["split_ratio"], 0.5);
         assert_eq!(object["auto_open"], true);
         assert!(object["github_host"].is_null());
         let keybindings = object["keybindings"].as_object().unwrap();

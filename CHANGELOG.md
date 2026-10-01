@@ -6,6 +6,10 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+- **`split_ratio` sizes the split reviewr opens in**, e.g. `0.33` for a third. The toggle, open, and
+  auto-open all resize their fresh split to it; a failed resize never fails the open.
+
 ## [0.39.0] — 2026-09-23
 
 ### Added

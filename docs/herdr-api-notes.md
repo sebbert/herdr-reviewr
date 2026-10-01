@@ -89,6 +89,15 @@ herdr plugin pane close <pane_id>
   layout-launched pane was never registered at all. Plain `herdr pane close <pane_id>` closes any
   pane by id; `pane.sh` sweeps with it.
 - `HERDR_PLUGIN_STATE_DIR` resolves to `~/.local/state/herdr/plugins/<plugin_id>/` (observed, 0.7.1).
+- **Sizing a split (verified live, 0.9.3).** `plugin pane open` takes no size; a split opens at
+  `ratio: 0.5`. `herdr pane layout --pane <id>` → `.result.layout.{panes[] {pane_id, rect},
+  splits[] {id, direction, ratio, rect}}`, where `ratio` is the **first** child's share. `herdr
+  pane resize --pane <id> --direction D --amount F` moves that pane's own edge on side D (falling
+  back to its opposite edge when it has none) by `F` ratio units, at the **nearest ancestor split
+  owning that edge**. So a "right" on the second child of a nested split moves the *outer*
+  split. `F`'s sign is ignored, one call moves at most 0.5, and every ratio clamps to [0.1, 0.9].
+  `pane.sh` resizes whichever pane has its edge on the parent split's boundary on the side the
+  boundary moves toward.
 - **Pane command resolves against the pane's cwd (`--cwd`, the repo), not the plugin root** — a relative `./target/...` path fails, so the manifest invokes the binary by absolute path under `$HERDR_PLUGIN_ROOT`.
 
 ## Runtime env (plugin commands and panes)
