@@ -124,6 +124,72 @@ struct ArmedCross {
     path: String,
 }
 
+/// One navigator cursor stop: a read-pane item, or a stack row (top of the stack first).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PrStop {
+    Item(usize),
+    Stack(usize),
+}
+
+/// One pull request's view and place on the `PR` tab: the snapshot (or its loading or
+/// degraded state) and every reader position over it. The tab shows one at a time; while a
+/// stack PR is browsed, the checked-out PR's place waits in [`PrBrowse::home`], swapped like
+/// the file tabs' stash. Every per-PR field on `App` must be swapped in
+/// [`App::swap_pr_place`] — one left out bleeds one PR's place into the other.
+#[derive(Debug)]
+pub(crate) struct PrPlace {
+    pr: forge::PrView,
+    notice: Option<String>,
+    refreshing: bool,
+    cursor: usize,
+    stack_cursor: Option<usize>,
+    read_scroll: std::cell::Cell<usize>,
+    read_reveal: std::cell::Cell<Option<isize>>,
+    read_painted_top: std::cell::Cell<Option<(usize, usize)>>,
+    nav_scroll: std::cell::Cell<usize>,
+    reveal_nav: std::cell::Cell<bool>,
+    expanded_details: HashSet<String>,
+    card_toggles: HashMap<forge::CommentKey, bool>,
+    card_held: HashMap<forge::CommentKey, bool>,
+    painted_items: std::cell::RefCell<Vec<usize>>,
+}
+
+impl Default for PrPlace {
+    fn default() -> Self {
+        Self {
+            pr: forge::PrView::Pending,
+            notice: None,
+            refreshing: false,
+            cursor: 0,
+            stack_cursor: None,
+            read_scroll: std::cell::Cell::new(0),
+            read_reveal: std::cell::Cell::new(None),
+            read_painted_top: std::cell::Cell::new(None),
+            nav_scroll: std::cell::Cell::new(0),
+            reveal_nav: std::cell::Cell::new(true),
+            expanded_details: HashSet::new(),
+            card_toggles: HashMap::new(),
+            card_held: HashMap::new(),
+            painted_items: std::cell::RefCell::new(Vec::new()),
+        }
+    }
+}
+
+/// A stack PR the reader is looking at instead of the checked-out one. Nothing is checked
+/// out: only the `PR` tab shows it. Place state — only the reader's input starts, moves,
+/// or ends it, and it outlives the PR leaving the stack.
+#[derive(Debug)]
+pub(crate) struct PrBrowse {
+    number: u64,
+    /// Where it is read from: the repository of the PR whose stack listed it.
+    repo: crate::git::RepoTarget,
+    /// The checked-out PR's place, kept current by its own refreshes while away.
+    home: PrPlace,
+    /// The tag a by-number fetch carries; a landing paints only while it still matches.
+    generation: u64,
+    fetch_needed: bool,
+}
+
 /// The base picker's state while it is open. The rows freeze
 /// at open; the filter and highlight are the reviewer's own place state.
 #[derive(Clone, Debug)]
@@ -605,6 +671,10 @@ pub enum FooterAction {
     OpenPr,
     /// Fold or unfold the selected PR thread card; the label names what the key does next.
     ToggleThread,
+    /// `enter` on a stack row: view that PR on the `PR` tab.
+    ViewStackPr,
+    /// Back from a browsed stack PR to the checked-out branch's.
+    CheckedOutPr,
     Refresh,
     Tabs,
     Quit,
@@ -854,6 +924,16 @@ pub struct App {
     pr_nav_max_scroll: std::cell::Cell<usize>,
     /// A cursor move requests the smallest navigator scroll that reveals the selection.
     reveal_pr_nav: std::cell::Cell<bool>,
+    /// The navigator highlight on a stack row (its index, top of the stack first) instead
+    /// of on [`Self::pr_cursor`]'s item, which keeps its place in the read pane meanwhile.
+    pr_stack_cursor: Option<usize>,
+    /// The stack PR being browsed, if any ([`PrBrowse`]).
+    pr_browse: Option<PrBrowse>,
+    /// The last browse fetch tag handed out, monotonic across browse sessions.
+    pr_browse_generation: u64,
+    /// Set while the checked-out PR's update is applied to its stashed place: nothing it
+    /// does is on screen, so it must not blank the visible PR's settled highlight.
+    pr_offscreen: bool,
     /// The PR refresh awaiting dispatch, if any; the event loop services it after drawing, so
     /// a `loading` frame shows before the blocking CLI calls run.
     pub pr_pending: Option<RefreshKind>,
@@ -1047,6 +1127,10 @@ impl App {
             pr_nav_scroll: std::cell::Cell::new(0),
             pr_nav_max_scroll: std::cell::Cell::new(usize::MAX),
             reveal_pr_nav: std::cell::Cell::new(true),
+            pr_stack_cursor: None,
+            pr_browse: None,
+            pr_browse_generation: 0,
+            pr_offscreen: false,
             pr_pending: None,
             world_request: None,
             search: None,
@@ -1192,6 +1276,14 @@ impl App {
         // The recovered app refetches its PR; until that lands the base stays where the
         // painted frame put it, rather than dropping to the default for one round trip.
         self.pr_base = old.pr_base.take();
+        // A browsed stack PR is place state, so recovery keeps looking at it; both PRs
+        // refetch into fresh places, as the checked-out one always does here.
+        self.pr_browse_generation = old.pr_browse_generation;
+        self.pr_browse = old.pr_browse.take().map(|b| PrBrowse {
+            home: PrPlace::default(),
+            fetch_needed: true,
+            ..b
+        });
         // Fold toggles are keyed by comment identity, so they apply to the refetched PR.
         self.pr_card_toggles = std::mem::take(&mut old.pr_card_toggles);
         let old_mode = old.mode.clone();
@@ -2219,6 +2311,13 @@ impl App {
         self.plugin_config().is_none_or(crate::config::PluginConfig::pane_outer_borders)
     }
 
+    /// Whether the PR navigator rules its sections apart — the config's `pr_nav_separators`,
+    /// off while the config is blocked.
+    #[must_use]
+    pub fn pr_nav_separators(&self) -> bool {
+        self.plugin_config().is_some_and(crate::config::PluginConfig::pr_nav_separators)
+    }
+
     /// The avatar width in cells when avatars paint: the config opted in and the terminal
     /// answered the graphics probe. `None` paints dots.
     #[must_use]
@@ -2625,6 +2724,9 @@ impl App {
     /// Blank a settled highlight anchored to a `PR` surface: the tab's paint is being
     /// replaced or emptied, so the span's text is leaving the screen
     fn blank_pr_settled(&mut self) {
+        if self.pr_offscreen {
+            return;
+        }
         if let Some((d, _)) = &self.settled_sel {
             use crate::selection::Surface;
             let on_pr = matches!(d.surface, Surface::PrNav)
@@ -2639,6 +2741,10 @@ impl App {
     /// over the `PR` tab gates the drains this runs from, so it never fires under a live drag
     /// (`lib.rs`).
     pub fn clear_pr(&mut self) {
+        self.with_checked_out(Self::clear_pr_here);
+    }
+
+    fn clear_pr_here(&mut self) {
         self.blank_pr_settled();
         self.pr = forge::PrView::Pending;
         self.pr_notice = None;
@@ -2653,7 +2759,180 @@ impl App {
         self.pr_card_toggles.clear();
         self.pr_card_held.clear();
         self.pr_read_painted_items.borrow_mut().clear();
+        self.pr_stack_cursor = None;
         self.set_pr_base(None);
+    }
+
+    /// Exchange the shown PR's view and place with `place` — every per-PR field.
+    fn swap_pr_place(&mut self, place: &mut PrPlace) {
+        std::mem::swap(&mut self.pr, &mut place.pr);
+        std::mem::swap(&mut self.pr_notice, &mut place.notice);
+        std::mem::swap(&mut self.pr_refreshing, &mut place.refreshing);
+        std::mem::swap(&mut self.pr_cursor, &mut place.cursor);
+        std::mem::swap(&mut self.pr_stack_cursor, &mut place.stack_cursor);
+        self.pr_read_scroll.swap(&place.read_scroll);
+        self.pr_read_reveal.swap(&place.read_reveal);
+        self.pr_read_painted_top.swap(&place.read_painted_top);
+        self.pr_nav_scroll.swap(&place.nav_scroll);
+        self.reveal_pr_nav.swap(&place.reveal_nav);
+        std::mem::swap(&mut self.pr_expanded_details, &mut place.expanded_details);
+        std::mem::swap(&mut self.pr_card_toggles, &mut place.card_toggles);
+        std::mem::swap(&mut self.pr_card_held, &mut place.card_held);
+        self.pr_read_painted_items.swap(&place.painted_items);
+    }
+
+    /// Run `f` against the checked-out PR's place: the shown one, or the stashed home while
+    /// a stack PR is browsed. The checked-out PR's refreshes land through here, so a
+    /// background update never moves what the reader is looking at (Continuity).
+    fn with_checked_out<R>(&mut self, f: impl FnOnce(&mut Self) -> R) -> R {
+        let Some(mut browse) = self.pr_browse.take() else { return f(self) };
+        self.swap_pr_place(&mut browse.home);
+        self.pr_offscreen = true;
+        let out = f(self);
+        self.pr_offscreen = false;
+        self.swap_pr_place(&mut browse.home);
+        self.pr_browse = Some(browse);
+        out
+    }
+
+    /// The stack PR being browsed, `None` on the checked-out PR.
+    #[must_use]
+    pub fn pr_viewing(&self) -> Option<u64> {
+        self.pr_browse.as_ref().map(|b| b.number)
+    }
+
+    /// The checked-out branch's PR view, wherever it currently lives.
+    #[must_use]
+    pub fn pr_checked_out_view(&self) -> &forge::PrView {
+        self.pr_browse.as_ref().map_or(&self.pr, |b| &b.home.pr)
+    }
+
+    /// The checked-out branch's PR number, once resolved.
+    #[must_use]
+    pub fn pr_checked_out_number(&self) -> Option<u64> {
+        match self.pr_checked_out_view() {
+            forge::PrView::Pr(s) => Some(s.number),
+            _ => None,
+        }
+    }
+
+    /// The highlighted stack row's entry, if the highlight is on the stack.
+    #[must_use]
+    pub fn pr_stack_selected(&self) -> Option<&forge::StackEntry> {
+        let s = self.pr_snapshot()?;
+        s.stack.iter().rev().nth(self.pr_stack_cursor?)
+    }
+
+    /// The navigator's stack-row highlight, top of the stack first.
+    #[must_use]
+    pub fn pr_stack_cursor(&self) -> Option<usize> {
+        self.pr_stack_cursor
+    }
+
+    /// `Enter` on the `PR` tab: view the highlighted stack row's PR.
+    pub fn pr_activate(&mut self) {
+        if let Some(number) = self.pr_stack_selected().map(|e| e.number) {
+            self.pr_view_number(number);
+        }
+    }
+
+    /// Highlight stack row `i` and view its PR — a click on the row.
+    pub fn pr_view_stack_row(&mut self, i: usize) {
+        let Some(number) =
+            self.pr_snapshot().and_then(|s| s.stack.iter().rev().nth(i)).map(|e| e.number)
+        else {
+            return;
+        };
+        self.pr_stack_cursor = Some(i);
+        self.pr_view_number(number);
+    }
+
+    /// Show stack PR `number` on the `PR` tab without checking anything out. The checked-out
+    /// PR's own number is the way back. A browsed PR opens fresh at its top, loading until
+    /// its read lands; the checked-out PR's place is kept to return to.
+    pub fn pr_view_number(&mut self, number: u64) {
+        if self.pr_checked_out_number() == Some(number) {
+            self.pr_view_checked_out();
+            return;
+        }
+        if self.pr_viewing() == Some(number) {
+            return;
+        }
+        let repo = self
+            .pr_snapshot()
+            .and_then(|s| s.repo.clone())
+            .or_else(|| self.pr_browse.as_ref().map(|b| b.repo.clone()));
+        let Some(repo) = repo else { return };
+        self.blank_pr_settled();
+        self.pr_browse_generation = self.pr_browse_generation.wrapping_add(1);
+        let generation = self.pr_browse_generation;
+        let mut fresh = PrPlace::default();
+        self.swap_pr_place(&mut fresh);
+        match self.pr_browse.as_mut() {
+            // Already away: the previous browsed PR's place is dropped, home stays stashed.
+            Some(browse) => {
+                browse.number = number;
+                browse.repo = repo;
+                browse.generation = generation;
+                browse.fetch_needed = true;
+            }
+            None => {
+                self.pr_browse =
+                    Some(PrBrowse { number, repo, home: fresh, generation, fetch_needed: true });
+            }
+        }
+    }
+
+    /// Back to the checked-out PR, where the reader left it, with whatever its refreshes
+    /// brought in the meantime. A no-op while already there.
+    pub fn pr_view_checked_out(&mut self) {
+        let Some(mut browse) = self.pr_browse.take() else { return };
+        self.blank_pr_settled();
+        self.swap_pr_place(&mut browse.home);
+    }
+
+    /// Ask for a fresh read of the browsed PR, on the cadence the checked-out PR refreshes on.
+    pub fn request_browse_refresh(&mut self) {
+        if let Some(browse) = self.pr_browse.as_mut() {
+            browse.fetch_needed = true;
+        }
+    }
+
+    /// The browsed PR's read to dispatch, as `(tag, number, repository)`, if one is needed.
+    /// Each dispatch takes a new tag, so an older read still in flight can never paint.
+    pub fn take_browse_fetch(&mut self) -> Option<(u64, u64, crate::git::RepoTarget)> {
+        let browse = self.pr_browse.as_mut().filter(|b| b.fetch_needed)?;
+        self.pr_browse_generation = self.pr_browse_generation.wrapping_add(1);
+        browse.generation = self.pr_browse_generation;
+        browse.fetch_needed = false;
+        Some((browse.generation, browse.number, browse.repo.clone()))
+    }
+
+    /// The tag a browse read must carry to paint, while a stack PR is browsed.
+    #[must_use]
+    pub fn browse_tag(&self) -> Option<u64> {
+        self.pr_browse.as_ref().map(|b| b.generation)
+    }
+
+    /// Land a browsed PR's read: it paints only while that PR is still the one viewed under
+    /// the same tag — a read for a PR the reader left, or one a newer read superseded, is
+    /// dropped. Returns whether it painted.
+    pub fn land_browsed_pr(&mut self, generation: u64, number: u64, view: forge::PrView) -> bool {
+        let live = self
+            .pr_browse
+            .as_ref()
+            .is_some_and(|b| b.generation == generation && b.number == number);
+        if live {
+            self.apply_pr_here(view, false);
+        }
+        live
+    }
+
+    /// The browsed PR's read crossed the loading delay.
+    pub fn set_browse_refreshing(&mut self) {
+        if self.pr_browse.is_some() {
+            self.set_pr_refreshing_here(true);
+        }
     }
 
     /// The stacked-PR base the `branch` scope falls back to before the default branch.
@@ -2677,6 +2956,12 @@ impl App {
     /// blocks — `lib.rs`). A transient `Error` keeps the last good snapshot frozen with a status
     /// note, so a failed poll never blanks a populated tab; the cursor clamps to the new rows.
     pub fn apply_pr(&mut self, view: forge::PrView) {
+        self.with_checked_out(|app| app.apply_pr_here(view, true));
+    }
+
+    /// Apply `view` to the shown place. Only the checked-out PR (`checked_out`) moves the
+    /// branch scope's base: a browsed PR is only looked at.
+    fn apply_pr_here(&mut self, view: forge::PrView, checked_out: bool) {
         self.pr_refreshing = false;
         let retry = view.retry_remedy(self.keymap().hint(crate::keymap::Action::Refresh));
         let has_snapshot =
@@ -2709,9 +2994,21 @@ impl App {
         let old_cursor = self.pr_cursor;
         let old_number = self.pr_snapshot().map(|s| s.number);
         let selected = self.pr_selected_comment().map(forge::Comment::key);
+        let stack_selected = self.pr_stack_selected().map(|e| e.number);
         let painted_folds = self.painted_card_folds();
         self.pr = view;
         self.hold_painted_folds(painted_folds);
+        // The stack highlight follows its PR by number, else the nearest surviving row.
+        if self.pr_stack_cursor.is_some() {
+            let stack: Vec<u64> = self
+                .pr_snapshot()
+                .map(|s| s.stack.iter().rev().map(|e| e.number).collect())
+                .unwrap_or_default();
+            self.pr_stack_cursor = stack_selected
+                .and_then(|n| stack.iter().position(|&m| m == n))
+                .or_else(|| self.pr_stack_cursor.map(|i| i.min(stack.len().saturating_sub(1))))
+                .filter(|_| !stack.is_empty());
+        }
         // An open PR's target is the stack's parent. A fork PR's target names a branch of
         // another repository than `origin`, so it never moves the base; a finished PR's
         // target is history.
@@ -2720,7 +3017,9 @@ impl App {
             .filter(|s| s.state == forge::PrState::Open && !s.head_is_fork)
             .map(|s| s.base_ref.clone())
             .filter(|b| !b.is_empty());
-        self.set_pr_base(pr_base);
+        if checked_out {
+            self.set_pr_base(pr_base);
+        }
         let offset = self.pr_description_offset();
         let restored = if on_description {
             self.pr_has_description()
@@ -2761,7 +3060,12 @@ impl App {
         self.pr_notice.as_deref()
     }
 
+    /// The checked-out PR's refresh crossed (or left) the loading delay.
     pub fn set_pr_refreshing(&mut self, refreshing: bool) {
+        self.with_checked_out(|app| app.set_pr_refreshing_here(refreshing));
+    }
+
+    fn set_pr_refreshing_here(&mut self, refreshing: bool) {
         if refreshing && matches!(self.pr, forge::PrView::Pending) {
             self.pr = forge::PrView::Loading;
             self.pr_refreshing = false;
@@ -2824,17 +3128,40 @@ impl App {
 
     /// Move the navigator cursor by `delta`, resetting the read pane to the top.
     pub fn pr_move(&mut self, delta: isize) {
-        let n = self.pr_row_count();
-        if n == 0 {
+        let stops = self.pr_stops();
+        if stops.is_empty() {
             return;
         }
-        self.pr_select(step(self.pr_cursor, delta, n));
+        let here = match self.pr_stack_cursor {
+            Some(j) => PrStop::Stack(j),
+            None => PrStop::Item(self.pr_cursor),
+        };
+        let at = stops.iter().position(|&s| s == here).unwrap_or(0);
+        match stops[step(at, delta, stops.len())] {
+            PrStop::Item(i) => self.pr_select(i),
+            PrStop::Stack(j) => {
+                self.pr_stack_cursor = Some(j);
+                self.reveal_pr_nav.set(true);
+            }
+        }
+    }
+
+    /// The navigator's cursor stops in screen order: the description, the stack rows top
+    /// first, then the comments.
+    fn pr_stops(&self) -> Vec<PrStop> {
+        let Some(s) = self.pr_snapshot() else { return Vec::new() };
+        let offset = self.pr_description_offset();
+        let mut stops: Vec<PrStop> = (0..offset).map(PrStop::Item).collect();
+        stops.extend((0..s.stack.len()).map(PrStop::Stack));
+        stops.extend((0..s.comments.len()).map(|i| PrStop::Item(i + offset)));
+        stops
     }
 
     /// Select navigator row `i`, scrolling the read pane to that item's top — the one place
     /// the cursor-move and the read-pane jump stay paired (a click and `j`/`k` share it).
     pub(crate) fn pr_select(&mut self, i: usize) {
         self.pr_cursor = i;
+        self.pr_stack_cursor = None;
         self.pr_read_reveal.set(Some(0));
         self.reveal_pr_nav.set(true);
         self.pr_expanded_details.clear();
@@ -4642,8 +4969,15 @@ impl App {
             if self.pr_snapshot().is_some() {
                 out.push((A::OpenPr, Primary));
             }
-            if self.pr_selected_comment().is_some_and(forge::Comment::is_collapsible) {
+            // On a stack row the highlight's own act leads: view the PR it names.
+            let shown = self.pr_snapshot().map(|s| s.number);
+            if self.pr_stack_selected().is_some_and(|e| Some(e.number) != shown) {
+                out.push((A::ViewStackPr, Do));
+            } else if self.pr_selected_comment().is_some_and(forge::Comment::is_collapsible) {
                 out.push((A::ToggleThread, Do));
+            }
+            if self.pr_viewing().is_some() {
+                out.push((A::CheckedOutPr, Do));
             }
             out.push((A::Search, Go));
             out.push((A::TogglePane, Go));
@@ -4934,10 +5268,11 @@ impl App {
                 return;
             }
         };
-        let target = self
-            .pr_snapshot()
-            .filter(|s| s.state == forge::PrState::Open)
-            .map(|s| s.base_ref.clone());
+        // The checked-out branch's PR, never a browsed stack PR.
+        let target = match self.pr_checked_out_view() {
+            forge::PrView::Pr(s) if s.state == forge::PrState::Open => Some(s.base_ref.clone()),
+            _ => None,
+        };
         let mut rows: Vec<BaseChoice> = branches
             .into_iter()
             .map(|b| BaseChoice::Branch {

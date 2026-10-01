@@ -8147,3 +8147,211 @@ fn folding_a_thread_the_reader_scrolled_into_brings_its_header_to_the_top() {
     assert!(folded_at.1 <= top, "the header comes back into view at the top");
     assert!(painted_cell(&app, "@bob").is_some(), "with what follows it below");
 }
+
+/// A three-PR stack around checked-out #11: #10 below it, #12 above it, read from one repo.
+fn stack_snapshot(number: u64, base: &str, title: &str) -> herdr_reviewr::forge::PrSnapshot {
+    use herdr_reviewr::forge::{PrState, StackEntry};
+    let entry = |number, base: &str, level| StackEntry {
+        number,
+        title: format!("pr {number}"),
+        state: PrState::Open,
+        is_draft: false,
+        head_ref: format!("head-{number}"),
+        base_ref: base.to_string(),
+        level,
+    };
+    let at = i32::try_from(number).unwrap() - 11;
+    herdr_reviewr::forge::PrSnapshot {
+        number,
+        title: title.to_string(),
+        base_ref: base.to_string(),
+        body: format!("body of {number}"),
+        stack: vec![
+            entry(10, "main", -1 - at),
+            entry(11, "head-10", -at),
+            entry(12, "head-11", 1 - at),
+        ],
+        repo: herdr_reviewr::git::RepoTarget::new("github.com", "o", "r"),
+        ..common::pr_snapshot()
+    }
+}
+
+fn browsing_app(r: &Repo) -> App {
+    use herdr_reviewr::forge::PrView;
+    let mut app = app_on(r);
+    app.set_tab(herdr_reviewr::app::Tab::Pr).unwrap();
+    app.apply_pr(PrView::Pr(Box::new(stack_snapshot(11, "feature", "checked out work"))));
+    app
+}
+
+fn offers(app: &App, action: FooterAction) -> bool {
+    app.footer_bands().iter().any(|&(a, _)| a == action)
+}
+
+fn shown_number(app: &App) -> Option<u64> {
+    app.pr_snapshot().map(|s| s.number)
+}
+
+#[test]
+fn stack_rows_are_cursor_stops_and_enter_views_one_without_checking_it_out() {
+    use herdr_reviewr::forge::PrView;
+    let r = stacked_repo();
+    let mut app = browsing_app(&r);
+    let keymap = Keymap::default();
+    let world = app.world_input();
+    let base = app.pr_base().map(str::to_string);
+
+    // The description, then the stack top first: `j` from the description lands on #12.
+    assert!(app.pr_on_description());
+    press(&mut app, &keymap, KeyCode::Char('j'));
+    assert_eq!(app.pr_stack_selected().map(|e| e.number), Some(12));
+    assert!(offers(&app, FooterAction::ViewStackPr));
+    press(&mut app, &keymap, KeyCode::Enter);
+    assert_eq!(app.pr_viewing(), Some(12));
+    assert!(app.pr_snapshot().is_none(), "the browsed PR loads; nothing else paints meanwhile");
+    assert_eq!(app.pr_checked_out_number(), Some(11));
+
+    // Its read is by number, from the repository the stack was read from.
+    let (tag, number, target) = app.take_browse_fetch().expect("a read is dispatched");
+    assert_eq!((number, target.owner(), target.name()), (12, "o", "r"));
+    assert!(app.take_browse_fetch().is_none(), "one read per request");
+    assert!(app.land_browsed_pr(
+        tag,
+        12,
+        PrView::Pr(Box::new(stack_snapshot(12, "head-11", "child")))
+    ));
+    assert_eq!(shown_number(&app), Some(12));
+    assert!(offers(&app, FooterAction::CheckedOutPr));
+
+    // Nothing outside the `PR` tab moved: the base still follows the checked-out PR.
+    assert_eq!(app.pr_base().map(str::to_string), base);
+    assert_eq!(app.world_input(), world);
+    assert_eq!(app.scope, Scope::Uncommitted);
+}
+
+#[test]
+fn the_checked_out_pr_key_and_its_own_row_go_back_to_where_the_reader_was() {
+    use herdr_reviewr::forge::PrView;
+    let r = stacked_repo();
+    let mut app = browsing_app(&r);
+    let keymap = Keymap::default();
+    app.pr_move(4); // somewhere on the stack: #10, the bottom row
+    assert_eq!(app.pr_stack_selected().map(|e| e.number), Some(10));
+    app.pr_activate();
+    assert_eq!(app.pr_viewing(), Some(10));
+
+    press(&mut app, &keymap, KeyCode::Char('0'));
+    assert_eq!(app.pr_viewing(), None);
+    assert_eq!(shown_number(&app), Some(11));
+    assert_eq!(app.pr_stack_selected().map(|e| e.number), Some(10), "the reader's place");
+
+    // From a browsed PR, activating the checked-out PR's own row is the way back too.
+    app.pr_view_number(12);
+    let (tag, ..) = app.take_browse_fetch().unwrap();
+    app.land_browsed_pr(tag, 12, PrView::Pr(Box::new(stack_snapshot(12, "head-11", "child"))));
+    let row = (0..3)
+        .find(|&i| app.pr_snapshot().unwrap().stack.iter().rev().nth(i).unwrap().number == 11);
+    app.pr_view_stack_row(row.unwrap());
+    assert_eq!(app.pr_viewing(), None);
+    assert_eq!(shown_number(&app), Some(11));
+
+    // The key is rebindable, and inert off the `PR` tab.
+    let rebound = Keymap::resolve(&[(Action::CheckedOutPr, vec![Key::plain('H')])]).unwrap();
+    app.pr_view_number(12);
+    press(&mut app, &rebound, KeyCode::Char('0'));
+    assert_eq!(app.pr_viewing(), Some(12), "the old key is free");
+    press(&mut app, &rebound, KeyCode::Char('H'));
+    assert_eq!(app.pr_viewing(), None);
+}
+
+#[test]
+fn the_checked_out_prs_refresh_lands_behind_a_browsed_pr_without_moving_the_view() {
+    use herdr_reviewr::forge::PrView;
+    let r = stacked_repo();
+    let mut app = browsing_app(&r);
+    app.pr_view_number(12);
+    let (tag, ..) = app.take_browse_fetch().unwrap();
+    app.land_browsed_pr(tag, 12, PrView::Pr(Box::new(stack_snapshot(12, "head-11", "child"))));
+    app.pr_move(1);
+
+    // The background refresh of #11 retitles it and retargets it.
+    app.apply_pr(PrView::Pr(Box::new(stack_snapshot(11, "dev", "retitled"))));
+    assert_eq!(app.pr_viewing(), Some(12), "the reader stays where they are");
+    assert_eq!(app.pr_snapshot().unwrap().title, "child");
+    assert_eq!(app.pr_base(), Some("dev"), "the checked-out PR still owns the base");
+    // A checked-out refresh failing or clearing never touches the browsed view either.
+    app.clear_pr();
+    assert_eq!(app.pr_snapshot().unwrap().title, "child");
+    app.apply_pr(PrView::Pr(Box::new(stack_snapshot(11, "dev", "retitled"))));
+
+    app.pr_view_checked_out();
+    assert_eq!(app.pr_snapshot().unwrap().title, "retitled", "home brought its refresh");
+}
+
+#[test]
+fn a_browsed_read_paints_only_while_its_pr_is_still_viewed_under_its_tag() {
+    use herdr_reviewr::forge::PrView;
+    let r = stacked_repo();
+    let mut app = browsing_app(&r);
+    let child = || PrView::Pr(Box::new(stack_snapshot(12, "head-11", "child")));
+
+    app.pr_view_number(12);
+    let (stale, ..) = app.take_browse_fetch().unwrap();
+    app.request_browse_refresh();
+    let (live, ..) = app.take_browse_fetch().unwrap();
+    assert!(!app.land_browsed_pr(stale, 12, child()), "a superseded read is dropped");
+    assert!(app.pr_snapshot().is_none());
+    assert!(app.land_browsed_pr(live, 12, child()));
+
+    // A read for a PR the reader left never paints over another PR.
+    app.request_browse_refresh();
+    let (left, ..) = app.take_browse_fetch().unwrap();
+    app.pr_view_number(10);
+    assert!(!app.land_browsed_pr(left, 12, child()));
+    assert!(app.pr_snapshot().is_none(), "#10 is still loading, not showing #12");
+    app.pr_view_checked_out();
+    assert!(!app.land_browsed_pr(left, 12, child()));
+    assert_eq!(shown_number(&app), Some(11));
+    assert!(app.take_browse_fetch().is_none(), "nothing is browsed: nothing to read");
+}
+
+#[test]
+fn a_failed_browsed_read_shows_its_own_degraded_state_and_keeps_a_good_one() {
+    use herdr_reviewr::forge::PrView;
+    use herdr_reviewr::git::Forge;
+    let r = stacked_repo();
+    let mut app = browsing_app(&r);
+    app.pr_view_number(12);
+    let (tag, ..) = app.take_browse_fetch().unwrap();
+    let failed = || PrView::Error(Forge::GitHub, "#12 not found".into());
+    assert!(app.land_browsed_pr(tag, 12, failed()));
+    assert_eq!(app.pr, failed(), "its own failure, never the checked-out PR's data");
+    assert_eq!(app.pr_checked_out_number(), Some(11));
+
+    // Once it painted, a failed refresh keeps it with a notice, like the checked-out PR.
+    app.request_browse_refresh();
+    let (tag, ..) = app.take_browse_fetch().unwrap();
+    app.land_browsed_pr(tag, 12, PrView::Pr(Box::new(stack_snapshot(12, "head-11", "child"))));
+    app.request_browse_refresh();
+    let (tag, ..) = app.take_browse_fetch().unwrap();
+    app.land_browsed_pr(tag, 12, PrView::Error(Forge::GitHub, "rate limited".into()));
+    assert_eq!(shown_number(&app), Some(12));
+    assert!(app.pr_notice().is_some_and(|n| n.contains("rate limited")));
+}
+
+#[test]
+fn a_browsed_pr_outlives_leaving_the_stack_and_survives_the_file_tabs() {
+    use herdr_reviewr::forge::{PrSnapshot, PrView};
+    let r = stacked_repo();
+    let mut app = browsing_app(&r);
+    app.pr_view_number(12);
+    let (tag, ..) = app.take_browse_fetch().unwrap();
+    app.land_browsed_pr(tag, 12, PrView::Pr(Box::new(stack_snapshot(12, "head-11", "child"))));
+    // #11's next read lists no stack at all: #12 left it.
+    app.apply_pr(PrView::Pr(Box::new(PrSnapshot { number: 11, ..common::pr_snapshot() })));
+    assert_eq!(app.pr_viewing(), Some(12));
+    app.set_tab(herdr_reviewr::app::Tab::Changes).unwrap();
+    app.set_tab(herdr_reviewr::app::Tab::Pr).unwrap();
+    assert_eq!(app.pr_viewing(), Some(12), "a tab round trip is no way back");
+    assert_eq!(shown_number(&app), Some(12));
+}

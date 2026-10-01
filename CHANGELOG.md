@@ -7,6 +7,17 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ## [Unreleased]
 
 ### Added
+- **Browse a PR stack without checking anything out.** Stack rows on the PR tab are cursor
+  stops. `Enter` or a click views that PR's state, checks, description, and conversation, read
+  from GitHub by number. The header reads `viewing #12 · not checked out`, the stack marks it
+  `◆ viewing`, and `o` opens it. `0` (`checked-out-pr`, rebindable), or the checked-out PR's
+  own row, goes back to where you were on it. The file tabs, the branch base, and your comments
+  stay with the checked-out branch. The viewed PR refreshes on the PR tab's cadence. The
+  checked-out PR's refreshes land behind it and never take you back, and a failed read shows its
+  own error.
+- **`pr_nav_separators = true` rules the PR navigator's sections apart** (off by default): a
+  horizontal line between the stack, checks, and comments sections in place of the blank row.
+  Off, the navigator looks as before.
 - **Opt-in author avatars on the PR tab.** With `avatars = true` (off by default), each comment
   author's avatar replaces the `●` on the thread timeline, as a round picture through the
   Kitty graphics protocol's Unicode placeholders, so herdr and Ghostty can show it.
@@ -53,6 +64,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   the selected thread from inside it brings its header back to the top of the pane.
 
 ### Changed
+- **The checked-out PR's stack row wears a filled `●` and a `checked out` tag**, in place of the
+  small `▸`. The tag gives way in a narrow pane; the mark stays.
 - **A split gives reviewr 40% by default**, not herdr's even halves: `split_ratio` defaults to
   `0.4` when the key is omitted. Set `split_ratio = 0.5` for the old even split.
 - **The PR tab reads as one conversation.** The read pane shows the description, then every

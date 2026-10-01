@@ -157,15 +157,18 @@ jumps, and `Ctrl+W` / `Ctrl+U` / `Ctrl+K` deletes.
 
 | Key | Action |
 | --- | --- |
-| `j` `k` | Jump to the description or a comment |
+| `j` `k` | Jump to the description, a stack PR, or a comment |
+| `Enter` | View the selected stack PR ([Stacked PRs](#stacked-prs)) |
+| `0` | Back to the checked-out branch's PR |
 | `PageUp` `PageDown` | Scroll focused pane |
 | `a` | Fold or unfold the selected thread |
-| `o` | Open PR in browser |
+| `o` | Open the PR you are viewing in the browser |
 | `r` | Refresh |
 
 The mouse works too. Drag over any text to select and copy it, double-click a word,
 triple-click a line. Click or drag the line-number gutter to comment. Click files, tabs, and
-links, and scroll with the wheel. On the PR tab, click a thread's header to fold or unfold it.
+links, and scroll with the wheel. On the PR tab, click a thread's header to fold or unfold it,
+and click a stack row to view that PR.
 
 ## The three tabs
 
@@ -234,6 +237,7 @@ toggle_direction = "down"
 split_ratio = 0.33
 auto_open = false
 pane_outer_borders = false
+pr_nav_separators = true
 avatars = true
 github_host = "github.example.com"
 editor = "code -g {file}:{line}"
@@ -346,20 +350,42 @@ disables the picker.
 On GitHub, the PR tab's navigator lists the stack a PR sits in: the PRs below it, down to the
 one that targets the default branch, and the open PRs stacked on top of it — the chains
 `gh stack` builds, or any PR whose base is another PR's
-branch. Each row shows the number, state, and title, top of the stack first, with this PR
-marked `▸` and the trunk last:
+branch. Each row shows the number, state, and title, top of the stack first, with the trunk
+last. The checked-out branch's PR wears a filled `●` and a `checked out` tag:
 
 ```text
 stack · 3
    #12 open   Add the settings page
- ▸ #11 open   Add the settings API
+ ● #11 open   Add the settings API    checked out
    #10 merged Add the settings table
    └ main
 ```
 
+Move onto a stack row with `j`/`k` and press `Enter` (or click it) to view that PR: its state,
+checks, description, and conversation, read from GitHub by number. Nothing is checked out,
+and nothing outside the PR tab changes. The file tabs, the branch scope's base, and your
+comments stay with the checked-out branch. The header says `viewing #12 · not checked out`
+while you look, and the stack marks the viewed PR `◆ … viewing` beside the checked-out `●`.
+`o` opens the PR you are viewing. `0` (`checked-out-pr`), or the checked-out PR's own row,
+takes you back to where you were on it.
+
+The viewed PR refreshes on its own, on the PR tab's cadence. The checked-out PR keeps
+refreshing behind it, but that never takes you back. A viewed PR stays on screen until you
+leave it, even if it drops out of the stack. Each PR you open from the stack starts at its
+top. A failed read shows its own error, never the checked-out PR's data.
+
 A PR that stacks on nothing shows no stack section. Reading the stack costs one extra GitHub
 query per refresh, plus one per further level. GitLab and Azure DevOps show no stack, but their
 MR or PR target still sets the [base](#base-branch).
+
+### Navigator separators
+
+The PR tab's navigator parts its stack, checks, and comments sections with blank rows. To rule
+them apart with a horizontal line instead:
+
+```toml
+pr_nav_separators = true   # default: false
+```
 
 ### Editor
 
@@ -435,6 +461,7 @@ The action names and their defaults:
 | `copy` | `y`, `Y` |
 | `open-pr` | `o` |
 | `toggle-thread` | `a` |
+| `checked-out-pr` | `0` |
 | `refresh` | `r` |
 | `quit` | `q` |
 

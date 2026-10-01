@@ -66,7 +66,7 @@ impl Config {
     }
 }
 
-const PLUGIN_CONFIG_KEYS: [&str; 17] = [
+const PLUGIN_CONFIG_KEYS: [&str; 18] = [
     "theme",
     "default_scope",
     "navigator_position",
@@ -75,6 +75,7 @@ const PLUGIN_CONFIG_KEYS: [&str; 17] = [
     "split_ratio",
     "auto_open",
     "pane_outer_borders",
+    "pr_nav_separators",
     "avatars",
     "avatar_width",
     "avatar_fit",
@@ -189,8 +190,10 @@ impl PartialEq for SplitRatio {
 
 impl Eq for SplitRatio {}
 
-/// One validated snapshot of `config.toml` in the resolved config directory.
+/// One validated snapshot of `config.toml` in the resolved config directory. Each on/off
+/// key is its own boolean, as the file spells it.
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[allow(clippy::struct_excessive_bools)]
 pub struct PluginConfig {
     theme: String,
     default_scope: crate::model::Scope,
@@ -202,6 +205,9 @@ pub struct PluginConfig {
     /// herdr's `[ui] pane_outer_borders` for reviewr's own panes: `false` drops every border
     /// on the reviewr pane's outer edge, keeping one divider between the tiled panes.
     pane_outer_borders: bool,
+    /// Opt-in: rule lines between the PR navigator's stack, checks, and comments sections
+    /// in place of the blank rows that part them.
+    pr_nav_separators: bool,
     /// Opt-in: paint each PR conversation turn's dot as the author's avatar where the
     /// terminal speaks the Kitty graphics protocol.
     avatars: bool,
@@ -228,6 +234,7 @@ impl Default for PluginConfig {
             split_ratio: SplitRatio::default(),
             auto_open: true,
             pane_outer_borders: true,
+            pr_nav_separators: false,
             avatars: false,
             avatar_width: 1,
             avatar_fit: crate::avatar::Fit::Height,
@@ -274,6 +281,10 @@ impl PluginConfig {
 
     pub fn pane_outer_borders(&self) -> bool {
         self.pane_outer_borders
+    }
+
+    pub fn pr_nav_separators(&self) -> bool {
+        self.pr_nav_separators
     }
 
     pub fn avatars(&self) -> bool {
@@ -343,6 +354,7 @@ impl PluginConfig {
             "split_ratio": self.split_ratio.get(),
             "auto_open": self.auto_open,
             "pane_outer_borders": self.pane_outer_borders,
+            "pr_nav_separators": self.pr_nav_separators,
             "avatars": self.avatars,
             "avatar_width": self.avatar_width,
             "avatar_fit": self.avatar_fit.as_str(),
@@ -517,6 +529,10 @@ fn parse_plugin_config(path: &Path) -> Result<PluginConfig, PluginConfigError> {
     if let Some(value) = table.get("auto_open") {
         config.auto_open =
             value.as_bool().ok_or_else(|| value_error(path, "auto_open", "a boolean"))?;
+    }
+    if let Some(value) = table.get("pr_nav_separators") {
+        config.pr_nav_separators =
+            value.as_bool().ok_or_else(|| value_error(path, "pr_nav_separators", "a boolean"))?;
     }
     if let Some(value) = table.get("pane_outer_borders") {
         config.pane_outer_borders =
@@ -863,6 +879,7 @@ mod tests {
         assert_eq!(config.split_ratio(), super::SplitRatio(0.4));
         assert!(config.auto_open());
         assert!(config.pane_outer_borders(), "today's framed look by default");
+        assert!(!config.pr_nav_separators(), "separators are opt-in");
         assert!(!config.avatars(), "avatars are opt-in");
         assert_eq!(config.avatar_width(), 1);
         assert_eq!(config.avatar_fit(), crate::avatar::Fit::Height);
@@ -884,6 +901,7 @@ mod tests {
                 "split_ratio = 0.33\n",
                 "auto_open = false\n",
                 "pane_outer_borders = false\n",
+                "pr_nav_separators = true\n",
                 "avatars = true\n",
                 "avatar_width = 2\n",
                 "avatar_fit = \"width\"\n",
@@ -901,6 +919,8 @@ mod tests {
         assert!(!config.auto_open());
         assert!(!config.pane_outer_borders());
         assert_eq!(config.to_json()["pane_outer_borders"], false);
+        assert!(config.pr_nav_separators());
+        assert_eq!(config.to_json()["pr_nav_separators"], true);
         assert!(config.avatars());
         assert_eq!(config.avatar_width(), 2);
         assert_eq!(config.to_json()["avatars"], true);
@@ -1001,6 +1021,7 @@ mod tests {
             ("auto_open = \"yes\"\n", "`auto_open`"),
             ("pane_outer_borders = \"false\"\n", "`pane_outer_borders`"),
             ("pane_outer_borders = 0\n", "`pane_outer_borders`"),
+            ("pr_nav_separators = \"yes\"\n", "`pr_nav_separators`"),
             ("avatars = \"yes\"\n", "`avatars`"),
             ("avatar_width = 0\n", "`avatar_width`"),
             ("avatar_width = 3\n", "`avatar_width`"),
@@ -1297,6 +1318,7 @@ mod tests {
         assert_eq!(object["toggle_direction"], "right");
         assert_eq!(object["split_ratio"], 0.4);
         assert_eq!(object["auto_open"], true);
+        assert_eq!(object["pr_nav_separators"], false);
         assert!(object["github_host"].is_null());
         let keybindings = object["keybindings"].as_object().unwrap();
         assert_eq!(

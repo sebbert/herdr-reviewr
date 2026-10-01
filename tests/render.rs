@@ -4719,7 +4719,8 @@ fn the_pr_navigator_lists_the_stack_top_first_with_this_pr_marked() {
     assert!(text.contains("stack · 3"), "{text}");
     let row = |needle: &str| text.lines().position(|l| l.contains(needle)).unwrap();
     assert!(row("#12 open") < row("#11 open") && row("#11 open") < row("#10 merged"), "{text}");
-    assert!(text.lines().nth(row("#11 open")).unwrap().contains("▸ #11"), "{text}");
+    let checked_out = text.lines().nth(row("#11 open")).unwrap();
+    assert!(checked_out.contains("● #11") && checked_out.contains("checked out"), "{text}");
     assert!(row("└ main") == row("#10 merged") + 1, "the trunk closes the stack: {text}");
 
     // A PR alone lists no stack section.
@@ -5167,4 +5168,120 @@ fn a_thread_resolved_above_the_reader_folds_without_moving_their_view() {
     let moved = read(&app);
     assert!(app.pr_card_collapsed(app.pr_selected_comment().unwrap()), "cat folds");
     assert!(!moved.iter().any(|l| l.contains("cat-line-01")), "{moved:#?}");
+}
+
+/// Checked-out #11 in a three-PR stack (#10 below, #12 above), on the `PR` tab.
+fn stack_app(config: &str) -> (Repo, App) {
+    use herdr_reviewr::app::Tab;
+    use herdr_reviewr::forge::PrView;
+    let r = Repo::init();
+    r.write("x.rs", "y\n");
+    r.commit_all("init");
+    let mut app = app_on(&r);
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("config.toml"), config).unwrap();
+    app.set_plugin_config(herdr_reviewr::config::plugin_config_in(dir.path()).unwrap());
+    app.set_tab(Tab::Pr).unwrap();
+    app.apply_pr(PrView::Pr(Box::new(stack_pr(11))));
+    (r, app)
+}
+
+fn stack_pr(number: u64) -> herdr_reviewr::forge::PrSnapshot {
+    use herdr_reviewr::forge::{Check, CheckStatus, PrState, StackEntry};
+    let entry = |n: u64, base: &str| StackEntry {
+        number: n,
+        title: format!("Work {n}"),
+        state: PrState::Open,
+        is_draft: false,
+        head_ref: format!("head-{n}"),
+        base_ref: base.to_string(),
+        level: i32::try_from(n).unwrap() - i32::try_from(number).unwrap(),
+    };
+    herdr_reviewr::forge::PrSnapshot {
+        number,
+        title: format!("Work {number}"),
+        stack: vec![entry(10, "main"), entry(11, "head-10"), entry(12, "head-11")],
+        checks: vec![Check { name: "ci".into(), status: CheckStatus::Success }],
+        comments: vec![common::comment()],
+        repo: herdr_reviewr::git::RepoTarget::new("github.com", "o", "r"),
+        ..common::pr_snapshot()
+    }
+}
+
+fn line_with<'a>(text: &'a str, needle: &str) -> &'a str {
+    text.lines().find(|l| l.contains(needle)).unwrap_or_else(|| panic!("no {needle}:\n{text}"))
+}
+
+#[test]
+fn a_browsed_stack_pr_is_marked_apart_from_the_checked_out_one_and_the_header_says_so() {
+    use herdr_reviewr::forge::PrView;
+    let (_r, mut app) = stack_app("");
+    let text = dump(&render_size(&app, 140, 30));
+    assert!(!text.contains("viewing"), "on the checked-out PR nothing says viewing: {text}");
+    assert!(line_with(&text, "#11 open").contains("● #11"));
+
+    app.pr_view_number(12);
+    // Still loading: the header already names the PR, never the checked-out one's chip.
+    let text = dump(&render_size(&app, 140, 30));
+    let header = text.lines().next().unwrap();
+    assert!(header.contains("viewing #12 · not checked out"), "{header}");
+    assert!(!header.contains("#11"), "{header}");
+
+    let (tag, ..) = app.take_browse_fetch().unwrap();
+    app.land_browsed_pr(tag, 12, PrView::Pr(Box::new(stack_pr(12))));
+    let text = dump(&render_size(&app, 140, 30));
+    assert!(text.lines().next().unwrap().contains("viewing #12 · not checked out"));
+    let viewed = line_with(&text, "#12 open");
+    assert!(viewed.contains("◆ #12") && viewed.contains("viewing"), "{text}");
+    let home = line_with(&text, "#11 open");
+    assert!(home.contains("● #11") && home.contains("checked out"), "{text}");
+    let bottom = line_with(&text, "#10 open");
+    let lead: String = bottom[..bottom.find("#10").unwrap()].chars().rev().take(3).collect();
+    assert!(!lead.contains('●') && !lead.contains('◆'), "an unmarked row: {bottom}");
+    assert!(!text.contains("sync unknown"), "a browsed PR has no local sync: {text}");
+
+    // Narrow, the tags give way and the marks stay.
+    let text = dump(&render_size(&app, 70, 30));
+    assert!(line_with(&text, "#12 open").contains("◆ #12"), "{text}");
+    assert!(line_with(&text, "#11 open").contains("● #11"), "{text}");
+    assert!(text.lines().next().unwrap().contains("viewing #12"), "{text}");
+}
+
+/// The navigator rows above and below the `checks` header, from its own column.
+fn around_checks(buf: &Buffer) -> (String, String) {
+    let text = dump(buf);
+    let y = text.lines().position(|l| l.contains("checks  ✓")).expect("checks header");
+    let line = text.lines().nth(y).unwrap();
+    let x = line[..line.find("checks  ✓").unwrap()].chars().count();
+    let x = u16::try_from(x).unwrap();
+    let y = u16::try_from(y).unwrap();
+    // Above: the stack's parting row. Below the one check: the comments' parting row.
+    (cells(buf, x, y - 1, 6), cells(buf, x, y + 2, 6))
+}
+
+#[test]
+fn navigator_separators_rule_the_sections_apart_only_when_configured() {
+    use herdr_reviewr::forge::{PrSnapshot, PrView};
+    for borders in ["", "pane_outer_borders = false\n"] {
+        // Off (the default): the sections part with blank rows, as ever.
+        let (_r, app) = stack_app(borders);
+        let (above, below) = around_checks(&render_size(&app, 140, 30));
+        assert_eq!((above.trim(), below.trim()), ("", ""), "no rule by default ({borders:?})");
+
+        // On: a rule between stack and checks, and between checks and comments.
+        let (_r, app) = stack_app(&format!("{borders}pr_nav_separators = true\n"));
+        let (above, below) = around_checks(&render_size(&app, 140, 30));
+        assert_eq!(above, "──────", "stack | checks ({borders:?})");
+        assert_eq!(below, "──────", "checks | comments ({borders:?})");
+        // A rule is no cursor stop and copies as nothing.
+        let text = dump(&render_size(&app, 50, 30));
+        assert!(text.contains("──"), "a narrow pane still rules: {text}");
+    }
+
+    // With no stack, only checks | comments is ruled.
+    let (_r, mut app) = stack_app("pr_nav_separators = true\n");
+    app.apply_pr(PrView::Pr(Box::new(PrSnapshot { stack: Vec::new(), ..stack_pr(11) })));
+    let (above, below) = around_checks(&render_size(&app, 140, 30));
+    assert!(!above.contains('─'), "nothing above checks to part from: {above:?}");
+    assert_eq!(below, "──────");
 }

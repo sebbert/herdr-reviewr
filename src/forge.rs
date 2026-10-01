@@ -148,6 +148,9 @@ pub struct PrSnapshot {
     /// empty when it stacks on nothing and nothing stacks on it. GitHub only: the other
     /// providers leave it empty.
     pub stack: Vec<StackEntry>,
+    /// The repository the PR was read from, so a stack PR can be read by number from the
+    /// same place. `None` from the providers without stacks.
+    pub repo: Option<crate::git::RepoTarget>,
 }
 
 /// One pull request of a stack: the chain whose bases are each other's heads, as
@@ -722,14 +725,47 @@ fn fetch_inner(
     // `gh pr checkout` recorded the pull request itself: exact, so it outranks the lookup.
     // A pin the forge no longer knows (a stale record) falls back to the lookup.
     if let Some(pin) = input.local.pin_on(crate::git::Forge::GitHub)
-        && let Some(view) = pin_outcome(read_pr(repo, input, &pin.repo, pin.number, cancelled))?
+        && let Some(view) = pin_outcome(read_pr(
+            repo,
+            input.local.head_oid.as_deref(),
+            &pin.repo,
+            pin.number,
+            cancelled,
+        ))?
     {
         return Ok(view);
     }
     let Some((number, detail_repo)) = lookup_pick(repo, input, repository, cancelled)? else {
         return Ok(PrView::NoPr);
     };
-    Ok(read_pr(repo, input, detail_repo, number, cancelled)?.unwrap_or(PrView::NoPr))
+    Ok(read_pr(repo, input.local.head_oid.as_deref(), detail_repo, number, cancelled)?
+        .unwrap_or(PrView::NoPr))
+}
+
+/// Read one pull request by number, for browsing a stack: the PR the checked-out branch
+/// resolved stays the tab's own, and this one is only looked at. Nothing local pins it,
+/// so its sync is unknown. A number the forge no longer resolves is an error naming it,
+/// never `NoPr` — the tab must not read as the branch having no PR.
+#[must_use]
+pub(crate) fn fetch_number(
+    repo: &Path,
+    target: &crate::git::RepoTarget,
+    number: u64,
+    cancelled: &AtomicBool,
+) -> PrView {
+    number_outcome(read_pr(repo, None, target, number, cancelled), number)
+}
+
+/// The view a by-number read lands as ([`fetch_number`]).
+fn number_outcome(read: Result<Option<PrView>, GhError>, number: u64) -> PrView {
+    match read {
+        Ok(Some(view)) => view,
+        Ok(None) | Err(GhError::NotFound(_)) => PrView::Error(
+            crate::git::Forge::GitHub,
+            format!("{}{number} not found", crate::git::Forge::GitHub.sigil()),
+        ),
+        Err(error) => error.into(),
+    }
 }
 
 /// What a pinned pull request's read decides: its view, or `None` to fall back to the head
@@ -745,7 +781,7 @@ fn pin_outcome(read: Result<Option<PrView>, GhError>) -> Result<Option<PrView>, 
 /// Read one pull request's full snapshot. `None` when the forge reports no such PR.
 fn read_pr(
     repo: &Path,
-    input: &PrFetchInput,
+    pin: Option<&str>,
     detail_repo: &crate::git::RepoTarget,
     number: u64,
     cancelled: &AtomicBool,
@@ -766,9 +802,9 @@ fn read_pr(
     // Sync compares the fetch's pinned HEAD to the PR head, so a checkout or commit landing
     // mid-fetch never pairs one branch's PR with another branch's count.
     let pr_head = node["headRefOid"].as_str().unwrap_or_default();
-    let sync = local_sync(repo, input.local.head_oid.as_deref(), pr_head)
-        .map_err(|error| GhError::LocalGit(error.0))?;
+    let sync = local_sync(repo, pin, pr_head).map_err(|error| GhError::LocalGit(error.0))?;
     let mut snapshot = build_snapshot(node, sync);
+    snapshot.repo = Some(detail_repo.clone());
     let cancelled = || target.cancelled.load(Ordering::Acquire);
     snapshot.stack = stack_outcome(read_stack(&target, node), cancelled)?;
     Ok(Some(PrView::Pr(Box::new(snapshot))))
@@ -1428,6 +1464,7 @@ fn build_snapshot(node: &Value, sync: Sync) -> PrSnapshot {
         comments_truncated,
         checks_truncated,
         stack: Vec::new(),
+        repo: None,
     }
 }
 
@@ -1897,6 +1934,7 @@ mod tests {
             comments_truncated: false,
             checks_truncated: false,
             stack: Vec::new(),
+            repo: None,
         };
         assert_eq!(snap(&[]).checks_rollup(), None);
         assert_eq!(
@@ -1919,6 +1957,27 @@ mod tests {
             "isDraft": false, "headRefName": head, "baseRefName": base,
             "isCrossRepository": false,
         })
+    }
+
+    #[test]
+    fn a_stack_pr_read_by_number_lands_as_itself_or_a_named_error_never_no_pr() {
+        let snapshot = PrView::Pr(Box::new(PrSnapshot {
+            stack: vec![stack_entry(&stack_node(12, "c", "b", "OPEN"), 0).unwrap()],
+            ..build_snapshot(&stack_node(12, "c", "b", "OPEN"), Sync::Unknown)
+        }));
+        assert_eq!(number_outcome(Ok(Some(snapshot.clone())), 12), snapshot);
+        let gone = PrView::Error(crate::git::Forge::GitHub, "#12 not found".into());
+        assert_eq!(number_outcome(Ok(None), 12), gone, "a vanished PR is no `NoPr`");
+        assert_eq!(number_outcome(Err(GhError::NotFound("gone".into())), 12), gone);
+        assert_eq!(
+            number_outcome(Err(GhError::NoGh), 12),
+            PrView::NoCli(crate::git::Forge::GitHub),
+            "the same remedies as the checked-out PR's read"
+        );
+        // An unpinned read has no local side to compare: sync stays unknown, and the
+        // snapshot names the PR it was asked for.
+        let read = build_snapshot(&stack_node(12, "c", "b", "OPEN"), Sync::Unknown);
+        assert_eq!((read.number, read.sync), (12, Sync::Unknown));
     }
 
     #[test]

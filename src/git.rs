@@ -176,8 +176,8 @@ pub struct RepoTarget {
 
 impl RepoTarget {
     /// Build one canonical GitHub repository target from a hostname and owner/name pair.
-    #[cfg(test)]
-    pub(crate) fn new(host: &str, owner: &str, name: &str) -> Option<Self> {
+    #[must_use]
+    pub fn new(host: &str, owner: &str, name: &str) -> Option<Self> {
         Self::with_path(Forge::GitHub, host, &[owner, name])
     }
 

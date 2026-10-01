@@ -2784,6 +2784,8 @@ fn action_key_label(app: &App, action: FooterAction) -> (String, String) {
         // `enter` opens the highlight in every list: a search result, a base, a commit run.
         A::OpenResult | A::PickBaseRow => ("enter".into(), "open"),
         A::OpenPr => (hint(K::OpenPr), "open ↗"),
+        A::ViewStackPr => ("enter".into(), "view"),
+        A::CheckedOutPr => (hint(K::CheckedOutPr), "checked out"),
         A::ToggleThread => {
             let folded = app.pr_selected_comment().is_some_and(|cm| app.pr_card_collapsed(cm));
             (hint(K::ToggleThread), if folded { "expand" } else { "collapse" })
@@ -4270,8 +4272,21 @@ fn render_pr_header(frame: &mut Frame, app: &App, area: Rect) {
     let p = app.palette();
     let bar = Style::default().bg(p.surface0);
     let mut spans = tab_bar_spans(app);
-    let lead_tabs: usize = spans.iter().map(Span::width).sum();
+    let mut lead_tabs: usize = spans.iter().map(Span::width).sum();
     let w = area.width as usize;
+
+    // A browsed stack PR says so before anything else, in every state — loading, failed, or
+    // resolved — so another PR's story can never read as the checked-out branch's. It
+    // shortens before it would crowd out the chip, and never drops below its number.
+    if let Some(number) = app.pr_viewing() {
+        let sigil = app.pr_forge.sigil();
+        let full = format!("  viewing {sigil}{number} · not checked out");
+        let short = format!("  viewing {sigil}{number}");
+        let chip = app.pr_snapshot().map_or(0, |s| pr_chip_width(app, s) + 2);
+        let banner = if lead_tabs + full.width() + chip + 8 <= w { full } else { short };
+        lead_tabs += banner.width();
+        spans.push(Span::styled(banner, bar.fg(p.orange).add_modifier(Modifier::BOLD)));
+    }
 
     // A resolved PR shows its identity chip; with no PR the header carries nothing — the read
     // pane is the single home for the empty/degraded message, not repeated across all regions.
@@ -4349,7 +4364,7 @@ fn pr_chip_width(app: &App, s: &forge::PrSnapshot) -> usize {
 
 /// The PR's merge, sync, and checks status for the footer, joined by `·`. Merge and sync show
 /// only for an open PR — they are meaningless once it is merged or closed.
-fn pr_state_line(_app: &App, s: &forge::PrSnapshot) -> String {
+fn pr_state_line(app: &App, s: &forge::PrSnapshot) -> String {
     let mut parts: Vec<String> = Vec::new();
     if s.state == forge::PrState::Open {
         match s.merge {
@@ -4357,7 +4372,9 @@ fn pr_state_line(_app: &App, s: &forge::PrSnapshot) -> String {
             forge::Merge::Blocked => parts.push("blocked".into()),
             forge::Merge::Clean => {}
         }
-        match s.sync {
+        // A browsed stack PR is not checked out: there is no local branch to be in sync with.
+        let sync = if app.pr_viewing().is_some() { forge::Sync::InSync } else { s.sync };
+        match sync {
             forge::Sync::Unpushed(n) => parts.push(format!("⇡ {n} unpushed")),
             forge::Sync::Behind(n) => parts.push(format!("⇣ {n} behind")),
             forge::Sync::Unknown => parts.push("? sync unknown".to_string()),
@@ -4396,10 +4413,10 @@ fn render_pr_nav(frame: &mut Frame, app: &App, pane: Pane) {
     let rows = pr_nav_rows(app, width, std::time::SystemTime::now());
     let viewport = inner.height as usize;
     // Transitional frames retain the request until both a viewport and its selected row exist.
-    let can_reveal = viewport > 0 && rows.iter().any(|row| row.cursor == Some(app.pr_cursor));
-    let reveal = can_reveal && app.take_pr_nav_reveal();
+    let target = rows.iter().position(|row| row.selected(app));
+    let reveal = viewport > 0 && target.is_some() && app.take_pr_nav_reveal();
     let (scroll, max_scroll) =
-        settle_pr_nav_scroll(&rows, app.pr_cursor, viewport, app.pr_nav_scroll(), reveal);
+        settle_pr_nav_scroll(rows.len(), target, viewport, app.pr_nav_scroll(), reveal);
     app.note_pr_nav_max_scroll(max_scroll);
     app.set_pr_nav_scroll(scroll);
     let items: Vec<ListItem> = rows
@@ -4407,17 +4424,44 @@ fn render_pr_nav(frame: &mut Frame, app: &App, pane: Pane) {
         .skip(scroll)
         .take(viewport)
         .map(|row| {
-            let selected = row.cursor == Some(app.pr_cursor);
+            if row.rule {
+                return ListItem::new(Line::from(Span::styled(
+                    "─".repeat(width),
+                    Style::default().fg(p.surface2),
+                )));
+            }
+            let selected = row.selected(app);
             selectable_row(p, row.spans, width, selected.then(|| p.cursor_bg(true)))
         })
         .collect();
     frame.render_widget(List::new(items), inner);
 }
 
-/// One painted PR navigator row and the cursor index it selects, when interactive.
+/// One painted PR navigator row: the read-pane item it selects, the stack row it is, or
+/// neither — a header, a check, a gap.
+#[derive(Default)]
 struct PrNavRow {
     spans: Vec<Span<'static>>,
     cursor: Option<usize>,
+    /// The stack row this is, top of the stack first — a cursor stop of its own.
+    stack: Option<usize>,
+    /// A section rule, painted across the pane; its copied text is empty.
+    rule: bool,
+}
+
+impl PrNavRow {
+    fn text(spans: Vec<Span<'static>>) -> Self {
+        Self { spans, ..Self::default() }
+    }
+
+    /// The highlight is on this row: a stack row while the highlight is on the stack,
+    /// else the selected item's row.
+    fn selected(&self, app: &App) -> bool {
+        match app.pr_stack_cursor() {
+            Some(j) => self.stack == Some(j),
+            None => self.cursor == Some(app.pr_cursor),
+        }
+    }
 }
 
 /// The complete PR navigator layout, shared by painting and click hit-testing.
@@ -4425,80 +4469,92 @@ fn pr_nav_rows(app: &App, width: usize, now: std::time::SystemTime) -> Vec<PrNav
     let Some(s) = app.pr_snapshot() else { return Vec::new() };
     let p = app.palette();
     let dim = Style::default().fg(p.dim2);
+    // Between the stack, checks, and comments sections: a gap, or a rule when configured.
+    let parting = || {
+        if app.pr_nav_separators() {
+            PrNavRow { rule: true, ..PrNavRow::default() }
+        } else {
+            PrNavRow::default()
+        }
+    };
     let mut rows = Vec::new();
     if app.pr_has_description() {
         rows.push(PrNavRow {
             spans: vec![Span::styled("description", text_style(p))],
             cursor: Some(0),
+            ..PrNavRow::default()
         });
-        rows.push(PrNavRow { spans: Vec::new(), cursor: None });
+        rows.push(PrNavRow::default());
     }
     if !s.stack.is_empty() {
         push_stack_rows(&mut rows, app, s, width);
-        rows.push(PrNavRow { spans: Vec::new(), cursor: None });
+        rows.push(parting());
     }
-    rows.push(PrNavRow { spans: vec![Span::styled(pr_checks_header(s), dim)], cursor: None });
+    rows.push(PrNavRow::text(vec![Span::styled(pr_checks_header(s), dim)]));
     for check in &s.checks {
         let (glyph, color) = check_glyph(p, check.status);
-        rows.push(PrNavRow {
-            spans: vec![
-                Span::styled(format!(" {glyph} "), Style::default().fg(color)),
-                Span::styled(check.name.clone(), text_style(p)),
-            ],
-            cursor: None,
-        });
+        rows.push(PrNavRow::text(vec![
+            Span::styled(format!(" {glyph} "), Style::default().fg(color)),
+            Span::styled(check.name.clone(), text_style(p)),
+        ]));
     }
-    rows.push(PrNavRow { spans: Vec::new(), cursor: None });
-    rows.push(PrNavRow {
-        spans: vec![Span::styled(format!("comments · {}", s.comments.len()), dim)],
-        cursor: None,
-    });
+    rows.push(parting());
+    rows.push(PrNavRow::text(vec![Span::styled(format!("comments · {}", s.comments.len()), dim)]));
     let offset = app.pr_description_offset();
     rows.extend(s.comments.iter().enumerate().map(|(index, comment)| PrNavRow {
         spans: pr_comment_row(comment, width, now, p),
         cursor: Some(index + offset),
+        ..PrNavRow::default()
     }));
     rows
 }
 
 /// The stack section: its header, then one row per PR top of the stack first — the way
-/// `gh stack` and a branch graph read — with this PR marked, and the trunk the bottom PR
-/// targets as the last row. Read-only, so no row is a cursor stop.
+/// `gh stack` and a branch graph read — and the trunk the bottom PR targets as the last
+/// row. The checked-out PR wears a filled `●` and a `checked out` tag; a browsed one, when
+/// it is another, a `◆` and `viewing`. The tag drops first in a narrow pane, the marks
+/// never. Each PR row is a cursor stop, and `Enter` or a click views it.
 fn push_stack_rows(rows: &mut Vec<PrNavRow>, app: &App, s: &forge::PrSnapshot, width: usize) {
     let p = app.palette();
     let dim = Style::default().fg(p.dim2);
-    rows.push(PrNavRow {
-        spans: vec![Span::styled(format!("stack · {}", s.stack.len()), dim)],
-        cursor: None,
-    });
-    for entry in s.stack.iter().rev() {
-        let current = entry.level == 0;
+    rows.push(PrNavRow::text(vec![Span::styled(format!("stack · {}", s.stack.len()), dim)]));
+    let checked_out = app.pr_checked_out_number();
+    let viewing = app.pr_viewing();
+    for (i, entry) in s.stack.iter().rev().enumerate() {
         let (word, color) = stack_state(p, entry);
-        let lead = if current { " ▸ " } else { "   " };
+        let (mark, mark_color, tag) = if checked_out == Some(entry.number) {
+            ("●", p.green, "checked out")
+        } else if viewing == Some(entry.number) {
+            ("◆", p.blue, "viewing")
+        } else {
+            (" ", p.dim2, "")
+        };
+        let marked = !tag.is_empty();
+        let lead = format!(" {mark} ");
         let number = format!("{}{} ", app.pr_forge.sigil(), entry.number);
         let state = format!("{word:<6} ");
         let used = lead.width() + number.width() + state.width();
-        let title = truncate_width(&entry.title, width.saturating_sub(used));
-        let title_style = if current {
+        // The tag keeps its room only while the title still gets a readable minimum.
+        let tag_w = if marked && width >= used + 2 + tag.width() + 8 { 2 + tag.width() } else { 0 };
+        let title = truncate_width(&entry.title, width.saturating_sub(used + tag_w));
+        let title_style = if marked {
             text_style(p).add_modifier(Modifier::BOLD)
         } else {
             Style::default().fg(p.dim0)
         };
-        rows.push(PrNavRow {
-            spans: vec![
-                Span::styled(lead, Style::default().fg(p.blue)),
-                Span::styled(number, Style::default().fg(p.yellow)),
-                Span::styled(state, Style::default().fg(color)),
-                Span::styled(title, title_style),
-            ],
-            cursor: None,
-        });
+        let mut spans = vec![
+            Span::styled(lead, Style::default().fg(mark_color).add_modifier(Modifier::BOLD)),
+            Span::styled(number, Style::default().fg(p.yellow)),
+            Span::styled(state, Style::default().fg(color)),
+            Span::styled(title, title_style),
+        ];
+        if tag_w > 0 {
+            spans.push(Span::styled(format!("  {tag}"), Style::default().fg(mark_color)));
+        }
+        rows.push(PrNavRow { spans, stack: Some(i), ..PrNavRow::default() });
     }
     if let Some(bottom) = s.stack.first().filter(|e| !e.base_ref.is_empty()) {
-        rows.push(PrNavRow {
-            spans: vec![Span::styled(format!("   └ {}", bottom.base_ref), dim)],
-            cursor: None,
-        });
+        rows.push(PrNavRow::text(vec![Span::styled(format!("   └ {}", bottom.base_ref), dim)]));
     }
 }
 
@@ -4513,15 +4569,15 @@ fn stack_state(p: &Palette, e: &forge::StackEntry) -> (&'static str, Color) {
 }
 
 fn settle_pr_nav_scroll(
-    rows: &[PrNavRow],
-    cursor: usize,
+    rows: usize,
+    target: Option<usize>,
     viewport: usize,
     current: usize,
     reveal: bool,
 ) -> (usize, usize) {
-    let max = rows.len().saturating_sub(viewport);
+    let max = rows.saturating_sub(viewport);
     let mut scroll = current.min(max);
-    if reveal && let Some(target) = rows.iter().position(|row| row.cursor == Some(cursor)) {
+    if reveal && let Some(target) = target {
         if target < scroll {
             scroll = target;
         } else if target >= scroll.saturating_add(viewport) {
@@ -5310,6 +5366,13 @@ pub fn hit_pr_open(area: Rect, app: &App, col: u16, row: u16) -> bool {
 #[must_use]
 pub fn pr_nav_cursor_at(app: &App, row: usize) -> Option<usize> {
     pr_nav_rows(app, usize::MAX, std::time::SystemTime::now()).get(row)?.cursor
+}
+
+/// The stack row the PR navigator's display row `row` is, `None` off the stack — a click
+/// there views that PR.
+#[must_use]
+pub fn pr_nav_stack_at(app: &App, row: usize) -> Option<usize> {
+    pr_nav_rows(app, usize::MAX, std::time::SystemTime::now()).get(row)?.stack
 }
 
 /// The status glyph and Catppuccin accent for a check.

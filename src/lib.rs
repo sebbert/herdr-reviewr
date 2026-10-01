@@ -618,6 +618,26 @@ fn drain_pr_shutdown(
     }
 }
 
+/// The browsed stack PR's one read in flight: its tag, cancel flag, and start, and whether
+/// its loading indicator already lit.
+#[derive(Default)]
+struct BrowseFetch {
+    active: Option<(u64, Arc<AtomicBool>, Instant)>,
+    indicated: bool,
+}
+
+impl BrowseFetch {
+    fn active_tag(&self) -> Option<u64> {
+        self.active.as_ref().map(|(tag, ..)| *tag)
+    }
+
+    fn cancel(&mut self) {
+        if let Some((_, cancelled, _)) = self.active.take() {
+            cancelled.store(true, Ordering::Release);
+        }
+    }
+}
+
 fn schedule_poll_probe(pr: &mut PrCoordinator, tab: crate::app::Tab) {
     if tab == crate::app::Tab::Pr {
         pr.probe_pending = true;
@@ -992,6 +1012,9 @@ fn event_loop(
     let (recovery_tx, recovery_rx) = mpsc::channel::<(u64, PluginConfig, App)>();
     let mut recovery_inflight = false;
     let (pr_tx, pr_rx) = mpsc::channel::<TaggedPr>();
+    // A browsed stack PR's reads: `(tag, number, view)`, one in flight, latest-wins by tag.
+    let (browse_tx, browse_rx) = mpsc::channel::<(u64, u64, crate::forge::PrView)>();
+    let mut browse = BrowseFetch::default();
     let mut pr = PrCoordinator::new(app.plugin_config().is_some());
     // The world worker owns every refresh build and the turn tracker; the loop sends
     // input-tagged jobs and reconciles the completions.
@@ -1249,6 +1272,43 @@ fn event_loop(
             if let Some(kind) = refresh {
                 last_pr_poll = Instant::now();
                 pr.request_refresh(kind);
+                // A browsed stack PR refreshes on the checked-out PR's cadence, on its own read.
+                app.request_browse_refresh();
+            }
+
+            // A browsed PR's read paints only while its tag is still the live one: the reader
+            // may have moved on to another PR, or back, while it was in flight.
+            if !app.gates_pr_drain()
+                && let Ok((tag, number, view)) = browse_rx.try_recv()
+            {
+                if browse.active_tag() == Some(tag) {
+                    browse.active = None;
+                }
+                if app.land_browsed_pr(tag, number, view) {
+                    continue;
+                }
+            }
+            if app.plugin_config().is_some()
+                && let Some((tag, number, target)) = app.take_browse_fetch()
+            {
+                // A newer read supersedes the one in flight.
+                browse.cancel();
+                let (tx, repo) = (browse_tx.clone(), app.repo.clone());
+                let cancelled = Arc::new(AtomicBool::new(false));
+                browse.active = Some((tag, cancelled.clone(), Instant::now()));
+                browse.indicated = false;
+                thread::spawn(move || {
+                    let view = crate::forge::fetch_number(&repo, &target, number, &cancelled);
+                    let _ = tx.send((tag, number, view));
+                });
+            }
+            if let Some((tag, _, started)) = &browse.active
+                && !browse.indicated
+                && started.elapsed() >= INDICATOR_DELAY
+                && app.browse_tag() == Some(*tag)
+            {
+                app.set_browse_refreshing();
+                browse.indicated = true;
             }
 
             // A fetch completion waits for a fresh local-input probe before it may paint.
@@ -1344,7 +1404,7 @@ fn event_loop(
                     cancelled: cancelled.clone(),
                     started: Instant::now(),
                 });
-                let held = match &app.pr {
+                let held = match app.pr_checked_out_view() {
                     crate::forge::PrView::Pr(snapshot) => Some(snapshot.head_oid.clone()),
                     _ => None,
                 };
@@ -1372,7 +1432,10 @@ fn event_loop(
             // While a fetch is in flight, wake often so its result paints promptly when it
             // lands. A world refresh usually lands within tens of milliseconds, so its wake
             // is tighter — the landing paints near the build's own speed.
-            if pr.active_fetch.is_some() || pr.active_probe_epoch.is_some() {
+            if pr.active_fetch.is_some()
+                || pr.active_probe_epoch.is_some()
+                || browse.active.is_some()
+            {
                 timeout = timeout.min(Duration::from_millis(100));
             }
             if let Some((_, builds)) = world_inflight {
@@ -1518,6 +1581,7 @@ fn event_loop(
     // Nothing reviewr transmitted outlives it in the herdr pane.
     write_terminal(&app.avatars.deletions());
     restore_terminal(kbd);
+    browse.cancel();
     drain_pr_shutdown(&mut pr, &probe_rx, &pr_rx);
     result
 }
@@ -1937,6 +2001,8 @@ pub fn handle_key(app: &mut App, key: KeyEvent, area: Rect, keymap: &Keymap) -> 
             (Some(K::TabAllFiles), _) => app.set_tab(crate::app::Tab::AllFiles)?,
             (Some(K::OpenPr), _) => app.pr_open(),
             (Some(K::ToggleThread), _) => app.toggle_selected_pr_card(),
+            (Some(K::CheckedOutPr), _) => app.pr_view_checked_out(),
+            (_, Enter) => app.pr_activate(),
             (Some(K::Search), _) => app.open_search(),
             (Some(K::NavigatorPosition), _) => app.cycle_navigator_position(),
             (Some(K::NavigatorGrow), _) => app.resize_navigator(4),
@@ -2038,9 +2104,9 @@ pub fn handle_key(app: &mut App, key: KeyEvent, area: Rect, keymap: &Keymap) -> 
             K::Search => app.open_search(),
             K::Find => app.open_find(),
             K::Keys => app.toggle_keys(),
-            // `delete` off the diff, and `open-pr` and `toggle-thread` off the `PR` tab, are
-            // inert. `edit` is not: it reaches the navigator's file rows too.
-            K::Delete | K::OpenPr | K::ToggleThread => {}
+            // `delete` off the diff, and `open-pr`, `toggle-thread`, and `checked-out-pr` off
+            // the `PR` tab, are inert. `edit` is not: it reaches the navigator's file rows too.
+            K::Delete | K::OpenPr | K::ToggleThread | K::CheckedOutPr => {}
         }
         return Ok(());
     }
@@ -2445,6 +2511,8 @@ fn perform_click(
             app.focus = Focus::Files;
             if let Some(i) = ui::pr_nav_cursor_at(app, drag.extent.row) {
                 app.pr_select(i);
+            } else if let Some(i) = ui::pr_nav_stack_at(app, drag.extent.row) {
+                app.pr_view_stack_row(i);
             }
         }
         Surface::Read | Surface::Painted | Surface::Card { .. } => {

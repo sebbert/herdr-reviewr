@@ -486,6 +486,7 @@ fn build_snapshot(
         comments_truncated,
         checks_truncated,
         stack: Vec::new(),
+        repo: None,
     }
 }
 
