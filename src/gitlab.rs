@@ -303,7 +303,7 @@ fn assemble_discussions(page1: Vec<Value>, total: u64, later: Vec<Value>) -> (Ve
     // Oldest-first throughout: page 1 leads the fetched run, the tail pages follow. Page 1 is
     // already in hand, and a page of system events can filter down to nothing, so keeping it
     // spends the surface's slots on real comments instead of leaving them empty. Rows carry
-    // their own timestamps and render newest-first, so an unread middle shows as a gap, never
+    // their own timestamps and render oldest-first, so an unread middle shows as a gap, never
     // as the wrong order.
     let mut pool = page1;
     pool.extend(later);
@@ -720,7 +720,7 @@ fn replies_from_discussion(discussion: &Value) -> Vec<Reply> {
         .collect()
 }
 
-/// Merge the discussion threads and approvals into one newest-first comment list:
+/// Merge the discussion threads and approvals into one oldest-first comment list:
 /// MR-level notes are `comment` rows, diff-position discussions are `finding` rows, and an
 /// approval is a `review` row.
 fn merge_comments(discussions: &[Value], approvals: &Value) -> Vec<Comment> {
@@ -755,6 +755,7 @@ fn merge_comments(discussions: &[Value], approvals: &Value) -> Vec<Comment> {
             body: root["body"].as_str().unwrap_or("").trim().to_string(),
             snippet: None,
             created_at: root["created_at"].as_str().unwrap_or("").to_string(),
+            review_state: None,
             is_resolved,
             is_outdated: false,
             replies: replies_from_discussion(discussion),
@@ -767,14 +768,16 @@ fn merge_comments(discussions: &[Value], approvals: &Value) -> Vec<Comment> {
         }
         let bot = is_gitlab_bot(&author);
         // The approvals surface carries no timestamp, so approvals sort after the
-        // dated rows in the newest-first list.
-        out.push(prose_row(
+        // dated rows as the merge request's standing verdict.
+        let mut row = prose_row(
             CommentKind::Review,
             author,
             bot,
             "Approved this merge request.".to_string(),
             String::new(),
-        ));
+        );
+        row.review_state = Some(crate::forge::ReviewState::Approved);
+        out.push(row);
     }
     finish_comments(&mut out);
     out
@@ -1201,10 +1204,12 @@ mod tests {
         assert_eq!(old.anchor, "src/a.rs:8-9");
         assert_eq!(old.place.as_ref().unwrap().side, Some(crate::model::Side::Old));
         assert!(comments.iter().any(|c| c.kind == CommentKind::Comment));
-        assert_eq!(
-            comments.iter().find(|c| c.kind == CommentKind::Review).unwrap().author,
-            "reviewer"
-        );
+        let approval = comments.last().unwrap();
+        assert_eq!(approval.kind, CommentKind::Review, "the undated approval sorts last");
+        assert_eq!(approval.author, "reviewer");
+        assert_eq!(approval.review_state, Some(crate::forge::ReviewState::Approved));
+        let dated: Vec<_> = comments[..3].iter().map(|c| c.created_at.as_str()).collect();
+        assert!(dated.windows(2).all(|w| w[0] <= w[1]), "dated rows run oldest first: {dated:?}");
     }
 
     #[test]

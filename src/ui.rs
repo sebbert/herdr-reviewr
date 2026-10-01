@@ -900,12 +900,9 @@ pub(crate) fn painted_sel(app: &App, area: Rect) -> Option<PaintedSel> {
             inner.height.saturating_sub(notice_h),
         );
         let max = content.lines.len().saturating_sub(rect.height as usize);
-        let scroll = app.pr_read_scroll.min(max);
+        let scroll = app.pr_read_scroll().min(max);
         let offsets: Vec<usize> = (0..content.lines.len())
-            .map(|i| match &content.snippet {
-                Some((r, w)) if r.contains(&i) => *w,
-                _ => 0,
-            })
+            .map(|i| content.snippets.iter().find(|(r, _)| r.contains(&i)).map_or(0, |(_, w)| *w))
             .collect();
         let texts = content
             .lines
@@ -4246,7 +4243,7 @@ fn checks_summary(s: &forge::PrSnapshot) -> String {
     }
 }
 
-/// The PR navigator: the checks list above the newest-first comments list, with the cursor
+/// The PR navigator: the checks list above the oldest-first comments list, with the cursor
 /// row filled and the view windowed to keep it on screen.
 fn render_pr_nav(frame: &mut Frame, app: &App, area: Rect) {
     // Identity lives in the header; the read pane shows the selected comment, so the navigator
@@ -4349,7 +4346,8 @@ fn pr_checks_header(s: &forge::PrSnapshot) -> String {
     }
 }
 
-/// One comment row: `@author anchor`, then a trailing `resolved`/`outdated` marker or the age.
+/// One comment row: `@author anchor` (a review's verdict in place of the bare `review`
+/// word), then a trailing reply count and `resolved`/`outdated` marker or the age.
 fn pr_comment_row(
     cm: &forge::Comment,
     width: usize,
@@ -4357,21 +4355,43 @@ fn pr_comment_row(
     p: &Palette,
 ) -> Vec<Span<'static>> {
     let author_color = if cm.author_is_bot { p.dim1 } else { p.orange };
-    let trailing = if cm.is_resolved {
+    let status = if cm.is_resolved {
         "resolved".to_string()
     } else if cm.is_outdated {
         "outdated".to_string()
     } else {
         relative_age(&cm.created_at, now)
     };
+    let trailing = match (cm.replies.len(), status.is_empty()) {
+        (0, _) => status,
+        (n, true) => format!("↳{n}"),
+        (n, false) => format!("↳{n} {status}"),
+    };
     let author = format!("@{} ", cm.author);
     let budget = width.saturating_sub(author.width() + trailing.width() + 3).max(1);
-    let anchor = elide_head(&cm.anchor, budget);
+    let (anchor, anchor_style) = match cm.review_state {
+        Some(state) => {
+            let (glyph, color) = review_glyph(p, state);
+            (format!("{glyph} {}", state.label()), Style::default().fg(color))
+        }
+        None => (cm.anchor.clone(), text_style(p)),
+    };
+    let anchor = elide_head(&anchor, budget);
     vec![
         Span::styled(author, Style::default().fg(author_color)),
-        Span::styled(anchor, text_style(p)),
+        Span::styled(anchor, anchor_style),
         Span::styled(format!("  {trailing}"), Style::default().fg(p.dim2)),
     ]
+}
+
+/// A review verdict's glyph and accent, matching the checks' success/failure colours.
+fn review_glyph(p: &Palette, state: forge::ReviewState) -> (&'static str, Color) {
+    match state {
+        forge::ReviewState::Approved => ("✓", p.green),
+        forge::ReviewState::ChangesRequested | forge::ReviewState::Rejected => ("✗", p.red),
+        forge::ReviewState::Commented => ("●", p.text),
+        forge::ReviewState::Dismissed => ("–", p.dim1),
+    }
 }
 
 /// Note the painted link regions and heading anchors for a markdown render drawn
@@ -4533,14 +4553,82 @@ struct PrReadContent {
     lines: Vec<Line<'static>>,
     /// Each markdown body's render metadata and its first display row, for hit-testing.
     body_meta: Vec<(usize, crate::markdown::Rendered)>,
-    /// The snippet quote's line range and its gutter prefix width, whose cells a selection
+    /// Each snippet quote's line range and its gutter prefix width, whose cells a selection
     /// never copies.
-    snippet: Option<(std::ops::Range<usize>, usize)>,
+    snippets: Vec<(std::ops::Range<usize>, usize)>,
+    /// Each cursor item's first display line (`tops[cursor]`), where a selection scrolls to.
+    tops: Vec<usize>,
+}
+
+/// A full-width heavy rule, optionally opening with a `label` — the separator between
+/// conversation items, distinct from the light rule between a thread's replies.
+fn push_heavy_rule(lines: &mut Vec<Line<'static>>, label: Option<&str>, width: usize, p: &Palette) {
+    let width = width.max(1);
+    let style = Style::default().fg(p.dim1);
+    let line = match label {
+        Some(label) => {
+            let head = format!("━━ {label} ");
+            let fill = width.saturating_sub(head.width());
+            Line::from(vec![
+                Span::styled("━━ ", style),
+                Span::styled(format!("{label} "), style.add_modifier(Modifier::BOLD)),
+                Span::styled("━".repeat(fill), style),
+            ])
+        }
+        None => Line::from(Span::styled("━".repeat(width), style)),
+    };
+    lines.push(line);
+}
+
+/// One comment card's header: what it is anchored to (a finding's `path:line` with its
+/// thread state, a review's verdict, or `comment`). The selected card's header carries the
+/// accent, so the reader can see which card the navigator points at.
+fn push_card_header(
+    lines: &mut Vec<Line<'static>>,
+    cm: &forge::Comment,
+    selected: bool,
+    p: &Palette,
+) {
+    let base = if selected {
+        Style::default().fg(p.blue).add_modifier(Modifier::BOLD)
+    } else {
+        text_style(p).add_modifier(Modifier::BOLD)
+    };
+    let dim = Style::default().fg(p.dim2);
+    let mut spans =
+        vec![Span::styled(if selected { "▌ " } else { "  " }, Style::default().fg(p.blue))];
+    match (cm.kind, cm.review_state) {
+        (_, Some(state)) => {
+            let (glyph, color) = review_glyph(p, state);
+            spans.push(Span::styled("review", base));
+            spans.push(Span::styled(SEP, dim));
+            spans.push(Span::styled(
+                format!("{glyph} {}", state.label()),
+                Style::default().fg(color),
+            ));
+        }
+        (forge::CommentKind::Finding, None) => {
+            spans.push(Span::styled(cm.anchor.clone(), base));
+            for (flag, word) in [(cm.is_resolved, "resolved"), (cm.is_outdated, "outdated")] {
+                if flag {
+                    spans.push(Span::styled(SEP, dim));
+                    spans.push(Span::styled(word, dim));
+                }
+            }
+        }
+        (_, None) => spans.push(Span::styled(cm.anchor.clone(), base)),
+    }
+    let replies = cm.replies.len();
+    if replies > 0 {
+        let noun = if replies == 1 { "reply" } else { "replies" };
+        spans.push(Span::styled(SEP, dim));
+        spans.push(Span::styled(format!("{replies} {noun}"), dim));
+    }
+    lines.push(Line::from(spans));
 }
 
 fn pr_read_content(app: &App, inner: Rect) -> PrReadContent {
     let p = app.palette();
-    let selected = app.pr_selected_comment();
     let width = inner.width as usize;
     let notice_lines =
         app.pr_notice().map(|notice| wrap_text(notice, width.max(1))).unwrap_or_default();
@@ -4565,19 +4653,53 @@ fn pr_read_content(app: &App, inner: Rect) -> PrReadContent {
     };
     let mut lines: Vec<Line<'static>> = Vec::new();
     let mut body_meta: Vec<(usize, crate::markdown::Rendered)> = Vec::new();
-    let mut snippet = None;
-    if let Some(cm) = selected {
-        // The finding's range paints as Diff-view rows; only the prose body is markdown
-        snippet = push_finding_quote(&mut lines, app, cm, width, p);
-        let now = std::time::SystemTime::now();
-        // Every turn is byline then body. The pane title names the thread; the byline
-        // names who spoke and when, including the root, so a reply cannot look like
-        // the next paragraph of the same comment.
-        push_comment_byline(&mut lines, &cm.author, cm.author_is_bot, &cm.created_at, now, p);
-        let mut rendered = app.markdown_render(&cm.body, width.max(1));
+    let mut snippets = Vec::new();
+    let mut tops = Vec::new();
+    let Some(s) = app.pr_snapshot().filter(|s| app.pr_has_description() || !s.comments.is_empty())
+    else {
+        // The empty-state remedy can outgrow a narrow pane; wrap it rather than clip it.
+        let refresh = app.keymap().hint(crate::keymap::Action::Refresh);
+        for piece in wrap_text(&pr_empty_msg(&app.pr, app.pr_forge, refresh), width.max(1)) {
+            lines.push(Line::from(Span::styled(piece, Style::default().fg(p.dim2))));
+        }
+        return PrReadContent { notice, lines, body_meta, snippets, tops };
+    };
+    let mut push_body = |lines: &mut Vec<Line<'static>>, text: &str| {
+        let mut rendered = app.markdown_render(text, width.max(1));
         let offset = lines.len();
         lines.append(&mut rendered.lines);
         body_meta.push((offset, rendered));
+    };
+    // One conversation: the description, then every comment oldest first. A labelled heavy
+    // rule opens the comments and a plain one parts each card; a thread's replies stay in
+    // their root's card behind the light rule.
+    if app.pr_has_description() {
+        tops.push(0);
+        push_body(&mut lines, &s.body);
+    }
+    let now = std::time::SystemTime::now();
+    let offset = app.pr_description_offset();
+    for (i, cm) in s.comments.iter().enumerate() {
+        if !lines.is_empty() {
+            lines.push(Line::raw(""));
+        }
+        tops.push(lines.len());
+        if i == 0 {
+            let noun = if s.comments.len() == 1 { "comment" } else { "comments" };
+            push_heavy_rule(&mut lines, Some(&format!("{} {noun}", s.comments.len())), width, p);
+        } else {
+            push_heavy_rule(&mut lines, None, width, p);
+        }
+        push_card_header(&mut lines, cm, app.pr_cursor == i + offset, p);
+        lines.push(Line::raw(""));
+        // The finding's range paints as Diff-view rows; only the prose body is markdown
+        snippets.extend(push_finding_quote(&mut lines, app, cm, width, p));
+        // Every turn is byline then body. The byline names who spoke and when, including
+        // the root, so a reply cannot look like the next paragraph of the same comment.
+        push_comment_byline(&mut lines, &cm.author, cm.author_is_bot, &cm.created_at, now, p);
+        if !cm.body.is_empty() {
+            push_body(&mut lines, &cm.body);
+        }
         for reply in &cm.replies {
             push_comment_rule(&mut lines, width, p);
             push_comment_byline(
@@ -4588,29 +4710,14 @@ fn pr_read_content(app: &App, inner: Rect) -> PrReadContent {
                 now,
                 p,
             );
-            let mut rendered = app.markdown_render(&reply.body, width.max(1));
-            let offset = lines.len();
-            lines.append(&mut rendered.lines);
-            body_meta.push((offset, rendered));
-        }
-    } else if app.pr_on_description() {
-        if let Some(s) = app.pr_snapshot() {
-            let mut rendered = app.markdown_render(&s.body, width.max(1));
-            let offset = lines.len();
-            lines.append(&mut rendered.lines);
-            body_meta.push((offset, rendered));
-        }
-    } else {
-        // The empty-state remedy can outgrow a narrow pane; wrap it rather than clip it.
-        let refresh = app.keymap().hint(crate::keymap::Action::Refresh);
-        for piece in wrap_text(&pr_empty_msg(&app.pr, app.pr_forge, refresh), width.max(1)) {
-            lines.push(Line::from(Span::styled(piece, Style::default().fg(p.dim2))));
+            push_body(&mut lines, &reply.body);
         }
     }
-    PrReadContent { notice, lines, body_meta, snippet }
+    PrReadContent { notice, lines, body_meta, snippets, tops }
 }
 
-/// The PR read pane: the selected description or comment, or the loading/degraded message.
+/// The PR read pane: the whole conversation — description, then every comment oldest
+/// first — scrolled to the selected item, or the loading/degraded message.
 fn render_pr_read(frame: &mut Frame, app: &App, area: Rect) {
     let p = app.palette();
     let title = match app.pr_selected_comment() {
@@ -4649,7 +4756,7 @@ fn render_pr_read(frame: &mut Frame, app: &App, area: Rect) {
     // wrap below the clamp. Scrolling stops with the last line at the pane's bottom edge.
     let max = content.lines.len().saturating_sub(body.height as usize);
     app.note_pr_read_max_scroll(max);
-    let scroll = app.pr_read_scroll.min(max);
+    let scroll = app.settle_pr_read_scroll(&content.tops, max);
     for (offset, rendered) in &content.body_meta {
         note_markdown_regions(app, rendered, body, scroll, *offset);
     }

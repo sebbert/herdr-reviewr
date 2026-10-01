@@ -157,7 +157,7 @@ jumps, and `Ctrl+W` / `Ctrl+U` / `Ctrl+K` deletes.
 
 | Key | Action |
 | --- | --- |
-| `j` `k` | Move through description and comments |
+| `j` `k` | Jump to the description or a comment |
 | `PageUp` `PageDown` | Scroll focused pane |
 | `o` | Open PR in browser |
 | `r` | Refresh |
@@ -172,7 +172,10 @@ links, and scroll with the wheel.
 - **All files** — any file's current content from the whole worktree, comments too. A collapsed
   folder with a changed file under it shows a dot. Ignored paths show dimmed.
 - **PR** — a read-only mirror of the branch's pull request (GitHub, Azure DevOps) or merge
-  request (GitLab): state, checks, description, and comments, rendered as markdown. reviewr
+  request (GitLab): state, checks, description, and comments, rendered as markdown. The read
+  pane is one conversation: the description, then every comment oldest first, with a rule
+  between each. Conversation comments, review verdicts (`✓ approved`, `✗ changes requested`),
+  and inline threads (`path:line`, replies grouped under the root) share the one list. reviewr
   never writes to the forge.
 
 ## Diff scopes

@@ -200,6 +200,7 @@ pub fn comment() -> herdr_reviewr::forge::Comment {
         body: "b".into(),
         snippet: None,
         created_at: "2026-06-27T10:00:00Z".into(),
+        review_state: None,
         is_resolved: false,
         is_outdated: false,
         replies: Vec::new(),

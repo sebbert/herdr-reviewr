@@ -206,8 +206,11 @@ pub struct Comment {
     pub body: String,
     /// The finding's diff hunk as GitHub returns it; `None` for a review or comment.
     pub snippet: Option<String>,
-    /// The post time as GitHub's ISO-8601 string (`…Z`), the newest-first sort key.
+    /// The post time as an ISO-8601 string (`…Z`), the oldest-first sort key. Empty for an
+    /// undated standing verdict (a GitLab approval, an Azure DevOps vote).
     pub created_at: String,
+    /// The verdict a `review` row carries; `None` for a comment or finding.
+    pub review_state: Option<ReviewState>,
     pub is_resolved: bool,
     pub is_outdated: bool,
     /// Replies after the root, oldest first. Empty for a single card.
@@ -229,6 +232,49 @@ pub enum CommentKind {
     Review,
     Comment,
     Finding,
+}
+
+/// A review's verdict, normalised across GitHub review states, GitLab approvals, and Azure
+/// DevOps votes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReviewState {
+    Approved,
+    ChangesRequested,
+    /// Azure DevOps' `-10` vote — stronger than a change request.
+    Rejected,
+    Commented,
+    Dismissed,
+}
+
+impl ReviewState {
+    /// GitHub's `PullRequestReviewState`; `PENDING` (an unsubmitted draft) maps to nothing.
+    pub(crate) fn from_github(state: &str) -> Option<Self> {
+        match state {
+            "APPROVED" => Some(Self::Approved),
+            "CHANGES_REQUESTED" => Some(Self::ChangesRequested),
+            "COMMENTED" => Some(Self::Commented),
+            "DISMISSED" => Some(Self::Dismissed),
+            _ => None,
+        }
+    }
+
+    /// The verdict's word, as the navigator row and the conversation card print it.
+    #[must_use]
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Approved => "approved",
+            Self::ChangesRequested => "changes requested",
+            Self::Rejected => "rejected",
+            Self::Commented => "commented",
+            Self::Dismissed => "dismissed",
+        }
+    }
+
+    /// A body-less review is still a conversation event when it carries a verdict. A bare
+    /// `commented` is the shell GitHub creates around inline-only threads, already shown.
+    fn is_verdict(self) -> bool {
+        !matches!(self, Self::Commented)
+    }
 }
 
 /// Where a finding sits: path, inclusive line range, and which file side.
@@ -988,7 +1034,7 @@ fn build_detail_query(number: u64) -> String {
          headRefOid isCrossRepository \
          commits(last:1){{nodes{{commit{{statusCheckRollup{{contexts(first:100){{pageInfo{{hasNextPage}} nodes{{__typename \
          ... on CheckRun{{name status conclusion}} ... on StatusContext{{context state}}}}}}}}}}}}}} \
-         reviews(last:100){{pageInfo{{hasPreviousPage}} nodes{{author{{login}} body submittedAt}}}} \
+         reviews(last:100){{pageInfo{{hasPreviousPage}} nodes{{author{{login}} body state submittedAt}}}} \
          comments(last:100){{pageInfo{{hasPreviousPage}} nodes{{author{{login}} body createdAt}}}} \
          reviewThreads(last:100){{pageInfo{{hasPreviousPage}} nodes{{id isResolved isOutdated path \
          startLine line originalStartLine originalLine diffSide \
@@ -1163,10 +1209,15 @@ pub(crate) fn upsert_latest(checks: &mut Vec<Check>, check: Check) {
 }
 
 /// The shared comment finish: collapse each bot's PR-level posts to its latest, then order
-/// newest first — ISO-8601 `…Z` strings sort lexically in chronological order
+/// oldest first — ISO-8601 `…Z` strings sort lexically in chronological order. An undated
+/// standing verdict (a GitLab approval, an Azure DevOps vote) is the PR's current state, so
+/// it sorts after every dated row. The sort is stable, so same-instant rows keep their
+/// provider order.
 pub(crate) fn finish_comments(out: &mut Vec<Comment>) {
     dedup_bot_prose(out);
-    out.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+    out.sort_by(|a, b| {
+        (a.created_at.is_empty(), &a.created_at).cmp(&(b.created_at.is_empty(), &b.created_at))
+    });
 }
 
 /// The latest run per check name, normalised from check runs and commit statuses.
@@ -1209,17 +1260,21 @@ fn check_status(node: &Value) -> CheckStatus {
 }
 
 /// Merge the three comment surfaces (GraphQL `reviews`, `comments`, and `reviewThreads` node
-/// arrays) into one newest-first list, keeping only a bot's latest PR-level post and each human's.
+/// arrays) into one oldest-first list, keeping only a bot's latest PR-level post and each human's.
 fn merge_comments(reviews: &Value, issues: &Value, threads: &Value) -> Vec<Comment> {
     let mut out: Vec<Comment> = Vec::new();
 
-    // Submitted reviews with a non-empty body (the PR-level `review` cards).
+    // Submitted reviews with a body or a verdict (the PR-level `review` cards).
     for r in reviews.as_array().into_iter().flatten() {
         let body = r["body"].as_str().unwrap_or("").trim().to_string();
-        if body.is_empty() {
+        let state = r["state"].as_str().and_then(ReviewState::from_github);
+        if body.is_empty() && !state.is_some_and(ReviewState::is_verdict) {
             continue;
         }
-        out.push(prose_comment(CommentKind::Review, &r["author"], body, r["submittedAt"].as_str()));
+        let mut row =
+            prose_comment(CommentKind::Review, &r["author"], body, r["submittedAt"].as_str());
+        row.review_state = state;
+        out.push(row);
     }
 
     // Plain conversation comments (the `comment` cards).
@@ -1265,6 +1320,7 @@ fn merge_comments(reviews: &Value, issues: &Value, threads: &Value) -> Vec<Comme
             body: root["body"].as_str().unwrap_or("").trim().to_string(),
             snippet: root["diffHunk"].as_str().filter(|h| !h.is_empty()).map(str::to_string),
             created_at: root["createdAt"].as_str().unwrap_or("").to_string(),
+            review_state: None,
             is_resolved: t["isResolved"].as_bool().unwrap_or(false),
             is_outdated: t["isOutdated"].as_bool().unwrap_or(false),
             replies: replies_from_nodes(&nodes[root_i..]),
@@ -1351,6 +1407,7 @@ pub(crate) fn prose_row(
         body,
         snippet: None,
         created_at,
+        review_state: None,
         is_resolved: false,
         is_outdated: false,
         replies: Vec::new(),
@@ -1887,7 +1944,7 @@ mod tests {
     }
 
     #[test]
-    fn comments_merge_three_surfaces_newest_first() {
+    fn comments_merge_three_surfaces_oldest_first() {
         let reviews = serde_json::json!([
             {"author": {"login": "codex[bot]"}, "state": "COMMENTED", "body": "Codex review.", "submittedAt": "2026-06-27T10:00:00Z"}
         ]);
@@ -1903,17 +1960,19 @@ mod tests {
         ]);
         let cs = merge_comments(&reviews, &issues, &threads);
         assert_eq!(cs.len(), 3);
-        // Newest first across all three surfaces — pin the full order so a reversed or
+        // Oldest first across all three surfaces — pin the full order so a reversed or
         // unstable comparator fails rather than passing on the endpoints alone.
         assert_eq!(
             cs.iter().map(|c| c.created_at.as_str()).collect::<Vec<_>>(),
-            ["2026-06-27T12:00:00Z", "2026-06-27T11:00:00Z", "2026-06-27T10:00:00Z"]
+            ["2026-06-27T10:00:00Z", "2026-06-27T11:00:00Z", "2026-06-27T12:00:00Z"]
         );
-        assert_eq!(cs[0].author, "persijano");
-        assert_eq!(cs[0].kind, CommentKind::Comment);
-        assert!(!cs[0].author_is_bot);
+        assert_eq!(cs[0].kind, CommentKind::Review);
+        assert_eq!(cs[0].review_state, Some(ReviewState::Commented));
         assert_eq!(cs[1].kind, CommentKind::Finding);
-        assert_eq!(cs[2].kind, CommentKind::Review);
+        assert_eq!(cs[1].review_state, None);
+        assert_eq!(cs[2].author, "persijano");
+        assert_eq!(cs[2].kind, CommentKind::Comment);
+        assert!(!cs[2].author_is_bot);
         // The finding carries its thread state, an unanchored line, and one reply.
         let f = cs.iter().find(|c| c.kind == CommentKind::Finding).unwrap();
         assert_eq!(f.anchor, "a.py");
@@ -1921,6 +1980,40 @@ mod tests {
         assert_eq!(f.replies.len(), 1);
         assert_eq!(f.replies[0].author, "persijano");
         assert_eq!(f.replies[0].body, "Addressed in abc");
+    }
+
+    #[test]
+    fn a_bodyless_review_lands_only_when_it_carries_a_verdict() {
+        let reviews = serde_json::json!([
+            {"author": {"login": "ann"}, "state": "APPROVED", "body": "", "submittedAt": "2026-06-27T10:00:00Z"},
+            {"author": {"login": "bob"}, "state": "CHANGES_REQUESTED", "body": "fix it", "submittedAt": "2026-06-27T09:00:00Z"},
+            // The empty shell GitHub wraps around an inline-only review: its threads already show.
+            {"author": {"login": "cat"}, "state": "COMMENTED", "body": "", "submittedAt": "2026-06-27T11:00:00Z"},
+            // An unsubmitted draft carries no verdict and no body.
+            {"author": {"login": "dan"}, "state": "PENDING", "body": "", "submittedAt": null}
+        ]);
+        let cs = merge_comments(&reviews, &serde_json::json!([]), &serde_json::json!([]));
+        let rows: Vec<_> = cs.iter().map(|c| (c.author.as_str(), c.review_state)).collect();
+        assert_eq!(
+            rows,
+            [("bob", Some(ReviewState::ChangesRequested)), ("ann", Some(ReviewState::Approved))]
+        );
+    }
+
+    #[test]
+    fn undated_verdicts_sort_after_every_dated_row() {
+        let row = |author: &str, created: &str| Comment {
+            author: author.to_string(),
+            ..prose_row(CommentKind::Comment, String::new(), false, "b".into(), created.into())
+        };
+        let mut out = vec![
+            row("vote", ""),
+            row("late", "2026-06-27T12:00:00Z"),
+            row("early", "2026-06-27T09:00:00Z"),
+        ];
+        finish_comments(&mut out);
+        let authors: Vec<_> = out.iter().map(|c| c.author.as_str()).collect();
+        assert_eq!(authors, ["early", "late", "vote"]);
     }
 
     #[test]
@@ -2054,6 +2147,7 @@ mod tests {
             body: body.to_string(),
             snippet: None,
             created_at: created_at.to_string(),
+            review_state: None,
             is_resolved: false,
             is_outdated: false,
             replies: Vec::new(),

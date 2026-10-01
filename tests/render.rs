@@ -1646,6 +1646,155 @@ fn pr_bodies_render_as_markdown_and_the_description_row_pins_first() {
 }
 
 #[test]
+fn the_read_pane_shows_the_description_then_every_comment_oldest_first() {
+    use herdr_reviewr::forge::{Comment, CommentKind, PrSnapshot, PrView, Reply, ReviewState};
+    let r = Repo::init();
+    r.write("x.rs", "y\n");
+    r.commit_all("init");
+    let mut app = app_on(&r);
+    app.set_tab(Tab::Pr).unwrap();
+    let place = herdr_reviewr::forge::FindingPlace::from_anchor(
+        "x.rs:1",
+        Some(herdr_reviewr::model::Side::New),
+    );
+    let comments = vec![
+        Comment {
+            author: "ann".into(),
+            body: "FIRST_COMMENT".into(),
+            created_at: "2026-06-27T09:00:00Z".into(),
+            ..common::comment()
+        },
+        Comment {
+            kind: CommentKind::Finding,
+            author: "bob".into(),
+            anchor: place.anchor(),
+            place: Some(place),
+            body: "THREAD_ROOT".into(),
+            created_at: "2026-06-27T10:00:00Z".into(),
+            is_resolved: true,
+            replies: vec![Reply {
+                author: "ann".into(),
+                author_is_bot: false,
+                body: "THREAD_REPLY".into(),
+                created_at: "2026-06-27T10:30:00Z".into(),
+            }],
+            ..common::comment()
+        },
+        Comment {
+            kind: CommentKind::Review,
+            author: "cat".into(),
+            anchor: "review".into(),
+            body: String::new(),
+            created_at: "2026-06-27T11:00:00Z".into(),
+            review_state: Some(ReviewState::Approved),
+            ..common::comment()
+        },
+    ];
+    app.pr = PrView::Pr(Box::new(PrSnapshot {
+        body: "DESCRIPTION_BODY".into(),
+        comments,
+        ..common::pr_snapshot()
+    }));
+
+    let out = render(&app);
+    let at = |needle: &str| out.find(needle).unwrap_or_else(|| panic!("{needle} missing:\n{out}"));
+    // One conversation: the description, a labelled separator, then each card oldest first,
+    // with the thread's reply grouped under its root.
+    let order = [
+        at("DESCRIPTION_BODY"),
+        at("━━ 3 comments"),
+        at("FIRST_COMMENT"),
+        at("x.rs:1 · resolved · 1 reply"),
+        at("THREAD_ROOT"),
+        at("THREAD_REPLY"),
+        at("review · ✓ approved"),
+    ];
+    assert!(order.windows(2).all(|w| w[0] < w[1]), "conversation order:\n{out}");
+    // A plain heavy rule parts the cards after the labelled one opens the list.
+    let read: Vec<&str> = out.lines().map(|l| l.split('│').nth(1).unwrap_or("")).collect();
+    let plain_rules = read.iter().filter(|l| l.trim_start().starts_with("━━━━")).count();
+    assert_eq!(plain_rules, 2, "a separator between each pair of cards:\n{out}");
+
+    // The navigator names the review by its verdict, and counts a thread's replies.
+    let nav = right_column(&out, 68);
+    assert!(nav.contains("@cat ✓ approved"), "the verdict replaces the bare word:\n{nav}");
+    assert!(nav.contains("↳1 resolved"), "the thread's reply count:\n{nav}");
+    let (ann, cat) = (nav.find("@ann").unwrap(), nav.find("@cat").unwrap());
+    assert!(ann < cat, "the navigator lists oldest first:\n{nav}");
+}
+
+#[test]
+fn selecting_a_comment_scrolls_the_conversation_to_it_and_a_refresh_keeps_it_anchored() {
+    use herdr_reviewr::forge::{Comment, PrSnapshot, PrView};
+    let r = Repo::init();
+    r.write("x.rs", "y\n");
+    r.commit_all("init");
+    let mut app = app_on(&r);
+    app.set_tab(Tab::Pr).unwrap();
+    let body =
+        |tag: &str| (0..12).map(|n| format!("{tag}-line-{n:02}")).collect::<Vec<_>>().join("\n\n");
+    let snapshot = |description: &str| PrSnapshot {
+        body: description.into(),
+        comments: (0..4)
+            .map(|i| Comment {
+                author: format!("author-{i}"),
+                body: body(&format!("c{i}")),
+                created_at: format!("2026-06-27T1{i}:00:00Z"),
+                ..common::comment()
+            })
+            .collect(),
+        ..common::pr_snapshot()
+    };
+    app.apply_pr(PrView::Pr(Box::new(snapshot("short description"))));
+    let read = |app: &App| -> Vec<String> {
+        // The read pane's text, without the scrollbar thumb painted on its right border.
+        render(app)
+            .lines()
+            .map(|l| {
+                let read = l.split('│').nth(1).unwrap_or("");
+                read.split('┃').next().unwrap_or("").trim_end().to_string()
+            })
+            .collect()
+    };
+
+    // Selecting the third comment brings its card to the top of the read pane.
+    app.pr_move(3);
+    assert_eq!(app.pr_selected_comment().map(|c| c.author.as_str()), Some("author-2"));
+    let jumped = read(&app);
+    let first = jumped.iter().find(|l| !l.trim().is_empty()).unwrap();
+    assert!(first.starts_with("━━━"), "the card's separator opens the pane: {jumped:#?}");
+    assert!(jumped.iter().any(|l| l.contains("c2-line-00")), "{jumped:#?}");
+    assert!(!jumped.iter().any(|l| l.contains("c1-line-11")), "earlier cards scroll away");
+
+    // The reader scrolls into the card; a refresh that grows the description above it
+    // leaves exactly the same lines on screen (Continuity: anchored by identity).
+    let area = Rect::new(0, 0, 140, 40);
+    handle_mouse(
+        &mut app,
+        MouseEvent {
+            kind: MouseEventKind::ScrollDown,
+            column: 5,
+            row: 10,
+            modifiers: KeyModifiers::NONE,
+        },
+        area,
+        &[],
+        &Keymap::default(),
+        &herdr_reviewr::export::Clipboard,
+    )
+    .unwrap();
+    let before = read(&app);
+    assert_ne!(before, jumped, "the wheel scrolled the read pane");
+    let before_scroll = app.pr_read_scroll();
+    let longer = (0..10).map(|n| format!("para {n}")).collect::<Vec<_>>().join("\n\n");
+    app.apply_pr(PrView::Pr(Box::new(snapshot(&longer))));
+    let after = read(&app);
+    assert_eq!(app.pr_selected_comment().map(|c| c.author.as_str()), Some("author-2"));
+    assert!(app.pr_read_scroll() > before_scroll, "the absolute scroll absorbs the growth");
+    assert_eq!(before, after, "the reader's view does not move");
+}
+
+#[test]
 fn a_finding_range_paints_as_diff_rows() {
     use herdr_reviewr::forge::{Comment, CommentKind, PrSnapshot, PrView};
     let r = Repo::init();
@@ -1706,8 +1855,13 @@ fn a_finding_range_paints_as_diff_rows() {
     assert!(out.contains("bar"), "the insertion in range paints:\n{out}");
     assert!(out.contains("SNIP_TAIL"), "the snippet wraps even when wrap is off:\n{out}");
     assert!(out.contains("ctx") && out.contains("tail"), "the three-line margin paints:\n{out}");
-    assert!(!out.contains("OUT_ABOVE"), "context beyond the margin is omitted:\n{out}");
-    assert!(!out.contains("OUT_BELOW"), "following context beyond the margin is omitted:\n{out}");
+    // Both findings paint in the one conversation; the margin claims are about the first card.
+    let first_card = &read[..read.find("Comment on line 16").expect("the second card paints")];
+    assert!(!first_card.contains("OUT_ABOVE"), "context beyond the margin is omitted:\n{read}");
+    assert!(
+        !first_card.contains("OUT_BELOW"),
+        "following context beyond the margin is omitted:\n{read}"
+    );
     assert!(!out.contains("@@"), "the hunk header does not paint:\n{out}");
     assert!(
         out.contains("Comment on line +21"),
@@ -1719,8 +1873,9 @@ fn a_finding_range_paints_as_diff_rows() {
     let out = render(&app);
     assert!(out.contains("Comment on line 16"), "a context range has no sign:\n{out}");
     assert!(out.contains("OUT_ABOVE"), "the other finding's range paints:\n{out}");
-    assert!(!out.contains("foo"), "the first finding's deletion does not linger:\n{out}");
-    assert!(!out.contains("bar"), "the first finding's insertion does not linger:\n{out}");
+    // The conversation keeps both cards; the selection marker moves to the second one.
+    assert!(out.contains("▌ x.rs:16"), "the selected card's header is marked:\n{out}");
+    assert!(!out.contains("▌ x.rs:21"), "the first card's header loses the marker:\n{out}");
     assert!(out.contains("second finding"), "the selected body follows its range:\n{out}");
 }
 
@@ -2299,7 +2454,14 @@ fn a_finding_paints_its_replies_in_the_read_pane() {
     assert!(out.contains("Addressed in abc"), "{out}");
     assert!(out.contains('─'), "a rule separates turns:\n{out}");
     assert!(!out.contains("open on"), "{out}");
-    assert!(!out.contains("↳"), "{out}");
+    // The old `↳ N replies` pointer line is gone from the read pane; the navigator's `↳1`
+    // reply count is the only one.
+    let read = out
+        .lines()
+        .map(|l| l.chars().take(l.chars().count() * 68 / 100).collect::<String>())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(!read.contains("↳"), "{read}");
 }
 
 #[test]

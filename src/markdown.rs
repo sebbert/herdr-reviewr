@@ -120,22 +120,25 @@ pub fn render_expanded<S: std::hash::BuildHasher>(
     r.out
 }
 
-/// A render memo keyed by `(text, width, expanded summaries)`. Several bodies can sit
-/// on one PR thread, so it keeps the last few. Cleared on a theme switch.
+/// A render memo keyed by `(text, width, expanded summaries)`. The PR read pane paints the
+/// whole conversation — description, every comment, every reply — each frame, so it holds
+/// a full 100-row fetch's bodies with room to spare, evicting the least recently used.
+/// Cleared on a theme switch.
 #[derive(Debug, Default)]
 pub struct RenderCache {
-    slots: Vec<CacheSlot>,
+    slots: std::collections::HashMap<CacheKey, CacheSlot>,
+    clock: u64,
 }
+
+type CacheKey = (String, usize, Vec<String>);
 
 #[derive(Debug)]
 struct CacheSlot {
-    text: String,
-    width: usize,
-    expanded: Vec<String>,
+    used: u64,
     rendered: Rendered,
 }
 
-const CACHE_SLOTS: usize = 16;
+const CACHE_SLOTS: usize = 512;
 
 impl RenderCache {
     pub fn get(&mut self, text: &str, width: usize, hl: &Highlighter, p: &Palette) -> Rendered {
@@ -152,26 +155,20 @@ impl RenderCache {
     ) -> Rendered {
         let mut expanded_key: Vec<String> = expanded.iter().cloned().collect();
         expanded_key.sort();
-        if let Some(i) = self
-            .slots
-            .iter()
-            .position(|s| s.text == text && s.width == width && s.expanded == expanded_key)
-        {
-            let slot = self.slots.remove(i);
-            let rendered = slot.rendered.clone();
-            self.slots.push(slot);
-            return rendered;
+        self.clock += 1;
+        let key = (text.to_string(), width, expanded_key);
+        if let Some(slot) = self.slots.get_mut(&key) {
+            slot.used = self.clock;
+            return slot.rendered.clone();
         }
         let rendered = render_expanded(text, width, hl, p, expanded);
-        self.slots.push(CacheSlot {
-            text: text.to_string(),
-            width,
-            expanded: expanded_key,
-            rendered: rendered.clone(),
-        });
-        if self.slots.len() > CACHE_SLOTS {
-            self.slots.remove(0);
+        if self.slots.len() >= CACHE_SLOTS
+            && let Some(oldest) =
+                self.slots.iter().min_by_key(|(_, slot)| slot.used).map(|(k, _)| k.clone())
+        {
+            self.slots.remove(&oldest);
         }
+        self.slots.insert(key, CacheSlot { used: self.clock, rendered: rendered.clone() });
         rendered
     }
 

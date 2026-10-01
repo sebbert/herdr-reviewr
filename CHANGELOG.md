@@ -10,6 +10,20 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - **`split_ratio` sizes the split reviewr opens in**, e.g. `0.33` for a third. The toggle, open, and
   auto-open all resize their fresh split to it; a failed resize never fails the open.
 
+### Changed
+- **The PR tab reads as one conversation.** The read pane shows the description, then every
+  comment, review, and inline thread oldest first. A labelled rule opens the comments and a
+  rule parts each card. Each card's header names its anchor: `path:line` with resolved/outdated
+  for a thread, the verdict for a review. Replies stay grouped under their root. `j`/`k` (or a
+  click) jumps the pane to that card, and a refresh keeps the card you are reading in place.
+  `→`/`←` expand/collapse every `<details>` in the conversation.
+- **Reviews show their verdict.** `✓ approved`, `✗ changes requested`, `✗ rejected`, or
+  `– dismissed` stands in for the bare `review` word in the navigator. A GitHub approval or
+  change request with no body now shows too. GitLab approvals and Azure DevOps votes map onto
+  the same verdicts and close the list as the standing state.
+- **The navigator lists comments oldest first**, matching the conversation, with a `↳N`
+  reply count on threads.
+
 ## [0.39.0] — 2026-09-23
 
 ### Added

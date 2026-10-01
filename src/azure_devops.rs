@@ -13,7 +13,7 @@ use serde_json::Value;
 
 use crate::forge::{
     AssocPr, Association, Check, CheckStatus, Comment, CommentKind, Merge, PrFetchInput,
-    PrSnapshot, PrState, PrView, Reply, Sync, finish_comments, prose_row, push_unique,
+    PrSnapshot, PrState, PrView, Reply, ReviewState, Sync, finish_comments, prose_row, push_unique,
     upsert_latest,
 };
 
@@ -645,7 +645,7 @@ fn thread_line_range(context: &Value) -> (Option<u64>, Option<u64>) {
     (left_s.or(left_e), left_e.or(left_s))
 }
 
-/// Merge the threads and reviewer votes into one newest-first comment list: PR-level threads
+/// Merge the threads and reviewer votes into one oldest-first comment list: PR-level threads
 /// are `comment` rows, file-position threads are `finding` rows with the thread's resolved
 /// status, and a reviewer vote is a `review` row. A thread
 /// carries no code context, so a finding has no snippet.
@@ -687,6 +687,7 @@ fn merge_comments(threads: &[&Value], pr: &Value) -> Vec<Comment> {
             body: root["content"].as_str().unwrap_or("").trim().to_string(),
             snippet: None,
             created_at: root["publishedDate"].as_str().unwrap_or("").to_string(),
+            review_state: None,
             is_resolved,
             is_outdated: false,
             replies: replies_from_thread(thread),
@@ -698,26 +699,31 @@ fn merge_comments(threads: &[&Value], pr: &Value) -> Vec<Comment> {
             continue;
         }
         let author = reviewer["displayName"].as_str().unwrap_or("").to_string();
-        let Some(body) = vote_body(reviewer["vote"].as_i64().unwrap_or(0)) else { continue };
+        let Some((body, state)) = vote_body(reviewer["vote"].as_i64().unwrap_or(0)) else {
+            continue;
+        };
         if author.is_empty() {
             continue;
         }
         let bot = is_azure_bot(reviewer);
-        // The vote carries no timestamp, so votes sort after the dated rows in the
-        // newest-first list.
-        out.push(prose_row(CommentKind::Review, author, bot, body.to_string(), String::new()));
+        // The vote carries no timestamp, so votes sort after the dated rows as the pull
+        // request's standing verdict.
+        let mut row = prose_row(CommentKind::Review, author, bot, body.to_string(), String::new());
+        row.review_state = Some(state);
+        out.push(row);
     }
     finish_comments(&mut out);
     out
 }
 
-/// The prose one reviewer vote renders as; a zero vote renders nothing.
-fn vote_body(vote: i64) -> Option<&'static str> {
+/// The prose and verdict one reviewer vote renders as; a zero vote renders nothing.
+/// "Waiting for the author" asks for changes; "approved with suggestions" still approves.
+fn vote_body(vote: i64) -> Option<(&'static str, ReviewState)> {
     match vote {
-        10 => Some("Approved this pull request."),
-        5 => Some("Approved this pull request with suggestions."),
-        -5 => Some("Is waiting for the author."),
-        -10 => Some("Rejected this pull request."),
+        10 => Some(("Approved this pull request.", ReviewState::Approved)),
+        5 => Some(("Approved this pull request with suggestions.", ReviewState::Approved)),
+        -5 => Some(("Is waiting for the author.", ReviewState::ChangesRequested)),
+        -10 => Some(("Rejected this pull request.", ReviewState::Rejected)),
         _ => None,
     }
 }
@@ -888,6 +894,10 @@ mod tests {
         assert_eq!(votes.len(), 2, "a zero vote and a container render nothing");
         assert_eq!(votes[0].body, "Approved this pull request.");
         assert_eq!(votes[1].body, "Is waiting for the author.");
+        assert_eq!(votes[0].review_state, Some(ReviewState::Approved));
+        assert_eq!(votes[1].review_state, Some(ReviewState::ChangesRequested));
+        // Undated votes are the standing verdict, so they close the oldest-first list.
+        assert!(comments.iter().rev().take(2).all(|c| c.kind == CommentKind::Review));
     }
 
     #[test]

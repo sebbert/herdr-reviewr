@@ -810,8 +810,17 @@ pub struct App {
     pr_refreshing: bool,
     /// The PR navigator's cursor over its rows (checks then comments).
     pub(crate) pr_cursor: usize,
-    /// Top visible line of the PR read pane, reset when the selected comment changes.
-    pub(crate) pr_read_scroll: usize,
+    /// Top visible line of the PR read pane's conversation (description, then every
+    /// comment). The renderer writes it when it resolves [`Self::pr_read_reveal`].
+    pr_read_scroll: std::cell::Cell<usize>,
+    /// A pending read-pane placement, resolved at paint: put the selected item's top this
+    /// many lines above the pane's top edge. A selection sets `Some(0)`; a world refresh
+    /// that keeps the selection carries the reader's offset into the selected item, so text
+    /// above it that grew or shrank never moves what the reader is looking at.
+    pr_read_reveal: std::cell::Cell<Option<isize>>,
+    /// The cursor item and its top line as last painted, the base a refresh's offset is
+    /// measured from.
+    pr_read_painted_top: std::cell::Cell<Option<(usize, usize)>>,
     /// Top visible row of the PR navigator, independent of its selection.
     pr_nav_scroll: std::cell::Cell<usize>,
     /// The PR navigator's maximum useful scroll, noted by the renderer each frame.
@@ -987,7 +996,9 @@ impl App {
             pr_notice: None,
             pr_refreshing: false,
             pr_cursor: 0,
-            pr_read_scroll: 0,
+            pr_read_scroll: std::cell::Cell::new(0),
+            pr_read_reveal: std::cell::Cell::new(None),
+            pr_read_painted_top: std::cell::Cell::new(None),
             pr_nav_scroll: std::cell::Cell::new(0),
             pr_nav_max_scroll: std::cell::Cell::new(usize::MAX),
             reveal_pr_nav: std::cell::Cell::new(true),
@@ -1912,6 +1923,28 @@ impl App {
         self.pr_read_max_scroll.set(max);
     }
 
+    /// The PR read pane's top visible line.
+    #[must_use]
+    pub fn pr_read_scroll(&self) -> usize {
+        self.pr_read_scroll.get()
+    }
+
+    /// Settle the read pane's scroll for this frame: resolve a pending reveal against the
+    /// painted item tops (`tops[i]` is cursor item `i`'s first line), clamp to `max`, and note
+    /// the cursor item's top for the next refresh's offset.
+    pub(crate) fn settle_pr_read_scroll(&self, tops: &[usize], max: usize) -> usize {
+        let top = tops.get(self.pr_cursor).copied();
+        if let Some(top) = top
+            && let Some(offset) = self.pr_read_reveal.take()
+        {
+            self.pr_read_scroll.set(top.saturating_add_signed(offset));
+        }
+        self.pr_read_painted_top.set(top.map(|t| (self.pr_cursor, t)));
+        let scroll = self.pr_read_scroll.get().min(max);
+        self.pr_read_scroll.set(scroll);
+        scroll
+    }
+
     /// Record the navigator's painted scroll bound for wheel and page input.
     pub(crate) fn note_pr_nav_max_scroll(&self, max: usize) {
         self.pr_nav_max_scroll.set(max);
@@ -2014,7 +2047,8 @@ impl App {
             return;
         };
         if self.tab == Tab::Pr {
-            self.pr_read_scroll = idx.min(self.pr_read_max_scroll.get());
+            self.pr_read_reveal.set(None);
+            self.pr_read_scroll.set(idx.min(self.pr_read_max_scroll.get()));
         } else if self.preview_active() {
             self.preview_scrolled = true;
             self.preview_scroll = idx.min(self.preview_max_scroll.get());
@@ -2091,15 +2125,20 @@ impl App {
         self.pr_expanded_details.clear();
     }
 
+    /// Every markdown body the read pane's conversation paints: the description, then each
+    /// comment and its replies.
     fn pr_markdown_bodies(&self) -> Vec<String> {
-        if self.pr_on_description() {
-            return self.pr_snapshot().map(|s| vec![s.body.clone()]).unwrap_or_default();
-        }
-        let Some(cm) = self.pr_selected_comment() else {
+        let Some(s) = self.pr_snapshot() else {
             return Vec::new();
         };
-        let mut bodies = vec![cm.body.clone()];
-        bodies.extend(cm.replies.iter().map(|r| r.body.clone()));
+        let mut bodies = Vec::new();
+        if self.pr_has_description() {
+            bodies.push(s.body.clone());
+        }
+        for cm in &s.comments {
+            bodies.push(cm.body.clone());
+            bodies.extend(cm.replies.iter().map(|r| r.body.clone()));
+        }
         bodies
     }
 
@@ -2476,7 +2515,9 @@ impl App {
         self.pr_notice = None;
         self.pr_refreshing = false;
         self.pr_cursor = 0;
-        self.pr_read_scroll = 0;
+        self.pr_read_scroll.set(0);
+        self.pr_read_reveal.set(None);
+        self.pr_read_painted_top.set(None);
         self.pr_nav_scroll.set(0);
         self.reveal_pr_nav.set(true);
         self.pr_expanded_details.clear();
@@ -2507,13 +2548,15 @@ impl App {
         // would point at replaced text — blank it. The early returns above keep the old
         // paint, and keep the highlight with it.
         self.blank_pr_settled();
-        // Follow the selected row by identity, not index, so a refresh that inserts a newer
-        // comment (the list is newest-first) keeps the cursor on the same one and leaves the read
-        // scroll intact — only a vanished or absent selection resets it (mirrors the file tabs'
-        // poll-preservation). The pinned description row's identity is itself:
+        // Follow the selected row by identity, not index, so a refresh that inserts a comment
+        // anywhere in the oldest-first list keeps the cursor on the same one, and the read
+        // pane stays anchored to it at the same offset — only a vanished or absent selection
+        // resets it (mirrors the file tabs' poll-preservation). The pinned description row's
+        // identity is itself:
         // it survives while the new snapshot still has a description, and an emptied one
         // vanishes like a deleted comment.
         let on_description = self.pr_on_description();
+        let old_cursor = self.pr_cursor;
         let old_number = self.pr_snapshot().map(|s| s.number);
         let selected = self
             .pr_selected_comment()
@@ -2534,13 +2577,22 @@ impl App {
         };
         if let Some(i) = restored {
             self.pr_cursor = i;
+            // A reveal still pending (a selection not yet painted) wins; otherwise carry the
+            // reader's offset from the selected item's painted top.
+            if self.pr_read_reveal.get().is_none()
+                && let Some((cursor, top)) = self.pr_read_painted_top.get()
+                && cursor == old_cursor
+            {
+                let scroll = self.pr_read_scroll.get();
+                self.pr_read_reveal.set(Some(scroll as isize - top as isize));
+            }
         } else {
             // The selection vanished (or there was none): clamp the cursor into range,
             // and reset the read pane whenever a selected row disappeared — the pane now
             // shows a different row.
             let clamped = self.pr_row_count().saturating_sub(1);
             if self.pr_cursor > clamped || on_description || selected.is_some() {
-                self.pr_read_scroll = 0;
+                self.pr_read_reveal.set(Some(0));
             }
             self.pr_cursor = self.pr_cursor.min(clamped);
             self.pr_expanded_details.clear();
@@ -2622,11 +2674,11 @@ impl App {
         self.pr_select(step(self.pr_cursor, delta, n));
     }
 
-    /// Select navigator row `i`, resetting the read pane to the top — the one place the
-    /// cursor-move and the read-scroll reset stay paired (a click and `j`/`k` share it).
+    /// Select navigator row `i`, scrolling the read pane to that item's top — the one place
+    /// the cursor-move and the read-pane jump stay paired (a click and `j`/`k` share it).
     pub(crate) fn pr_select(&mut self, i: usize) {
         self.pr_cursor = i;
-        self.pr_read_scroll = 0;
+        self.pr_read_reveal.set(Some(0));
         self.reveal_pr_nav.set(true);
         self.pr_expanded_details.clear();
     }
@@ -2644,8 +2696,11 @@ impl App {
     /// with the last line at the pane's bottom edge. The base clamps first, so a stale
     /// scroll (the pane grew, or the body shrank) never swallows the first upward input.
     pub(crate) fn pr_scroll_read(&mut self, delta: isize) {
-        self.pr_read_scroll =
-            clamp_scroll(self.pr_read_scroll, delta, self.pr_read_max_scroll.get());
+        self.pr_read_scroll.set(clamp_scroll(
+            self.pr_read_scroll.get(),
+            delta,
+            self.pr_read_max_scroll.get(),
+        ));
     }
 
     /// Open the pull request in the browser. A resolved PR always carries a
@@ -5143,12 +5198,12 @@ mod tests {
         let mut app = App::blocked(PathBuf::from("."), Scope::Uncommitted, None);
         app.note_pr_read_max_scroll(4);
         app.pr_scroll_read(100);
-        assert_eq!(app.pr_read_scroll, 4, "scroll stops with the last line at the pane edge");
+        assert_eq!(app.pr_read_scroll(), 4, "scroll stops with the last line at the pane edge");
         app.pr_scroll_read(-1);
-        assert_eq!(app.pr_read_scroll, 3, "no dead zone above the clamp");
+        assert_eq!(app.pr_read_scroll(), 3, "no dead zone above the clamp");
         app.note_pr_read_max_scroll(0);
         app.pr_scroll_read(5);
-        assert_eq!(app.pr_read_scroll, 0, "content that fits the pane does not scroll");
+        assert_eq!(app.pr_read_scroll(), 0, "content that fits the pane does not scroll");
     }
 
     #[test]

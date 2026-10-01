@@ -69,14 +69,19 @@ pub fn rows_from_snippet(
     rows
 }
 
-/// One-slot memo for [`rows_from_snippet`]. The PR pane shows one finding at a time,
-/// so one key absorbs the per-frame highlight (`policies/ux-responsiveness.md`).
+/// Memo for [`rows_from_snippet`]. The PR read pane paints every finding's quote each
+/// frame, so it keeps one entry per finding the conversation shows
+/// (`policies/ux-responsiveness.md`); a snapshot that drops findings lets the oldest go.
 /// Cleared on a theme switch — the key does not include the highlighter.
 #[derive(Debug, Default)]
 pub struct SnippetRowCache {
-    key: Option<(String, String, u32, u32, Side)>,
-    rows: Vec<Row>,
+    slots: Vec<(SnippetKey, Vec<Row>)>,
 }
+
+type SnippetKey = (String, String, u32, u32, Side);
+
+/// Above a full 100-thread fetch, so one conversation never thrashes it.
+const SNIPPET_SLOTS: usize = 128;
 
 impl SnippetRowCache {
     pub fn get(
@@ -88,19 +93,21 @@ impl SnippetRowCache {
         side: Side,
         hl: &Highlighter,
     ) -> Vec<Row> {
-        if self.key.as_ref().is_some_and(|(h, p, s, e, sd)| {
+        if let Some((_, rows)) = self.slots.iter().find(|((h, p, s, e, sd), _)| {
             h == hunk && p == path && *s == start && *e == end && *sd == side
         }) {
-            return self.rows.clone();
+            return rows.clone();
         }
-        self.rows = rows_from_snippet(hunk, path, start, end, side, hl);
-        self.key = Some((hunk.to_string(), path.to_string(), start, end, side));
-        self.rows.clone()
+        let rows = rows_from_snippet(hunk, path, start, end, side, hl);
+        if self.slots.len() >= SNIPPET_SLOTS {
+            self.slots.remove(0);
+        }
+        self.slots.push(((hunk.to_string(), path.to_string(), start, end, side), rows.clone()));
+        rows
     }
 
     pub fn clear(&mut self) {
-        self.key = None;
-        self.rows.clear();
+        self.slots.clear();
     }
 }
 

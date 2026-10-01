@@ -3518,35 +3518,37 @@ fn apply_pr_follows_the_selected_comment_across_a_refresh() {
     let mut app = app_on(&r);
     app.set_tab(Tab::Pr).unwrap();
 
-    // Newest-first [ann@10:00, bob@09:00]; the cursor lands on the newest, then move to bob.
+    // Oldest-first [bob@09:00, ann@10:00]; the cursor lands on the oldest, then move to ann.
     app.apply_pr(snap(vec![
-        comment("ann", "2026-06-27T10:00:00Z"),
         comment("bob", "2026-06-27T09:00:00Z"),
-    ]));
-    assert_eq!(app.pr_selected_comment().map(|c| c.author.as_str()), Some("ann"));
-    app.pr_move(1);
-    assert_eq!(app.pr_selected_comment().map(|c| c.author.as_str()), Some("bob"));
-
-    // A refresh prepends a newer comment: the cursor follows bob to its new index, not index 1.
-    app.apply_pr(snap(vec![
-        comment("cara", "2026-06-27T11:00:00Z"),
         comment("ann", "2026-06-27T10:00:00Z"),
+    ]));
+    assert_eq!(app.pr_selected_comment().map(|c| c.author.as_str()), Some("bob"));
+    app.pr_move(1);
+    assert_eq!(app.pr_selected_comment().map(|c| c.author.as_str()), Some("ann"));
+
+    // A refresh surfaces an older row (a thread whose root predates both) ahead of the
+    // selection, and appends a newer one: the cursor follows ann by identity, not index 1.
+    app.apply_pr(snap(vec![
+        comment("dan", "2026-06-27T08:00:00Z"),
+        comment("bob", "2026-06-27T09:00:00Z"),
+        comment("ann", "2026-06-27T10:00:00Z"),
+        comment("cara", "2026-06-27T11:00:00Z"),
+    ]));
+    assert_eq!(
+        app.pr_selected_comment().map(|c| c.author.as_str()),
+        Some("ann"),
+        "the cursor follows the same comment by identity, not its old index"
+    );
+
+    // A refresh where ann and cara are gone clamps the now-dangling cursor back into range.
+    app.apply_pr(snap(vec![
+        comment("dan", "2026-06-27T08:00:00Z"),
         comment("bob", "2026-06-27T09:00:00Z"),
     ]));
     assert_eq!(
         app.pr_selected_comment().map(|c| c.author.as_str()),
         Some("bob"),
-        "the cursor follows the same comment by identity, not its old index"
-    );
-
-    // A refresh where bob is gone clamps the now-dangling cursor back into range.
-    app.apply_pr(snap(vec![
-        comment("cara", "2026-06-27T11:00:00Z"),
-        comment("ann", "2026-06-27T10:00:00Z"),
-    ]));
-    assert_eq!(
-        app.pr_selected_comment().map(|c| c.author.as_str()),
-        Some("ann"),
         "a vanished selection clamps to the last row"
     );
 }
