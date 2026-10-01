@@ -173,7 +173,7 @@ impl SplitRatio {
 
 impl Default for SplitRatio {
     fn default() -> Self {
-        Self(0.5)
+        Self(0.4)
     }
 }
 
@@ -799,7 +799,7 @@ mod tests {
         assert_eq!(config.navigator_position(), NavigatorPosition::Right);
         assert_eq!(config.toggle_placement(), TogglePlacement::Split);
         assert_eq!(config.toggle_direction(), ToggleDirection::Right);
-        assert_eq!(config.split_ratio(), super::SplitRatio(0.5));
+        assert_eq!(config.split_ratio(), super::SplitRatio(0.4));
         assert!(config.auto_open());
         assert_eq!(config.github_host(), None);
         assert_eq!(config.url_opener(), None);
@@ -1208,7 +1208,7 @@ mod tests {
         assert_eq!(object["navigator_position"], "right");
         assert_eq!(object["toggle_placement"], "split");
         assert_eq!(object["toggle_direction"], "right");
-        assert_eq!(object["split_ratio"], 0.5);
+        assert_eq!(object["split_ratio"], 0.4);
         assert_eq!(object["auto_open"], true);
         assert!(object["github_host"].is_null());
         let keybindings = object["keybindings"].as_object().unwrap();

@@ -973,24 +973,48 @@ fn split_ratio_resizes_the_new_panes_own_split_never_an_outer_one() {
 }
 
 #[test]
-fn the_default_split_ratio_and_non_split_placements_never_resize() {
+fn the_default_split_ratio_resizes_to_two_fifths() {
+    // With the key omitted the share is 0.4, so a fresh even split shrinks the reviewr
+    // pane: the boundary moves toward it, through the sibling's trailing edge.
+    let dir = tempfile::tempdir().unwrap();
+    let (herdr, log) = fake_herdr(dir.path());
+    fs::write(dir.path().join("config.toml"), "toggle_placement = \"split\"\n").unwrap();
+    split_layout(dir.path(), "right");
+
+    let output = run_open(dir.path(), &herdr);
+
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    let calls = fs::read_to_string(&log).unwrap();
+    assert!(
+        calls.lines().any(|line| line == "pane resize --pane w1:p1 --direction right --amount 0.1"),
+        "{calls}"
+    );
+    assert_eq!(calls.matches("pane resize").count(), 1, "{calls}");
+}
+
+#[test]
+fn a_split_already_at_its_ratio_and_non_split_placements_never_resize() {
     let dir = tempfile::tempdir().unwrap();
     let (herdr, log) = fake_herdr(dir.path());
     split_layout(dir.path(), "right");
 
-    for text in
-        ["toggle_placement = \"split\"\n", "toggle_placement = \"tab\"\nsplit_ratio = 0.33\n"]
-    {
-        fs::write(dir.path().join("config.toml"), text).unwrap();
-        let _ = fs::remove_file(&log);
+    // An explicit 0.5 matches herdr's even halves: the layout is read, nothing moves.
+    fs::write(dir.path().join("config.toml"), "split_ratio = 0.5\n").unwrap();
+    let output = run_open(dir.path(), &herdr);
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    let calls = fs::read_to_string(&log).unwrap();
+    assert!(calls.contains("pane layout --pane w1:p9"), "{calls}");
+    assert!(!calls.contains("pane resize"), "{calls}");
 
-        let output = run_open(dir.path(), &herdr);
-
-        assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
-        let calls = fs::read_to_string(&log).unwrap();
-        assert!(!calls.contains("pane layout"), "{text}: {calls}");
-        assert!(!calls.contains("pane resize"), "{text}: {calls}");
-    }
+    // A non-split placement never reads the layout.
+    fs::write(dir.path().join("config.toml"), "toggle_placement = \"tab\"\nsplit_ratio = 0.33\n")
+        .unwrap();
+    let _ = fs::remove_file(&log);
+    let output = run_open(dir.path(), &herdr);
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    let calls = fs::read_to_string(&log).unwrap();
+    assert!(!calls.contains("pane layout"), "{calls}");
+    assert!(!calls.contains("pane resize"), "{calls}");
 }
 
 #[test]

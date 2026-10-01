@@ -281,14 +281,15 @@ new=$(printf '%s' "$open_json" | jq -r '.result.plugin_pane.pane.pane_id // empt
 [ -n "$new" ] || refuse "herdr plugin pane open failed"
 
 # `plugin pane open` takes no size, so a split lands at herdr's even halves and is then
-# resized to `split_ratio`, the reviewr pane's share. At the default 0.5 nothing runs. A
+# resized to `split_ratio`, the reviewr pane's share (default 0.4). A split already at that
+# share (an explicit 0.5) reads the layout and resizes nothing. A
 # split's `ratio` is its first child's share, and `pane resize --direction D` moves the
 # resized pane's own edge on side D (else its opposite edge) by `--amount` ratio units, at
 # the nearest ancestor split owning that edge. So the plan reads the new pane's parent split
 # (the smallest one containing it) and resizes a pane whose edge on the moving side is that
 # split's boundary — the new pane or its sibling — never an outer split. Cosmetic: a failed
 # read or resize never fails an open that already succeeded.
-if [ "$placement" = split ] && [ "$split_ratio" != 0.5 ]; then
+if [ "$placement" = split ]; then
   resize=$("$H" pane layout --pane "$new" 2>/dev/null | jq -r --arg p "$new" --argjson r "$split_ratio" '
     .result.layout as $l
     | first($l.panes[] | select(.pane_id == $p) | .rect) as $n

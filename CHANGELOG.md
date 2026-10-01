@@ -20,6 +20,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   query per stack level, so a PR that stacks on nothing costs one extra query per refresh.
 
 ### Changed
+- **A split gives reviewr 40% by default**, not herdr's even halves: `split_ratio` defaults to
+  `0.4` when the key is omitted. Set `split_ratio = 0.5` for the old even split.
 - **The PR tab reads as one conversation.** The read pane shows the description, then every
   comment, review, and inline thread oldest first. A labelled rule opens the comments, and each
   one sits in its own rounded box. The box's top border names its anchor: `path:line` with
