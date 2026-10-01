@@ -66,7 +66,7 @@ impl Config {
     }
 }
 
-const PLUGIN_CONFIG_KEYS: [&str; 13] = [
+const PLUGIN_CONFIG_KEYS: [&str; 14] = [
     "theme",
     "default_scope",
     "navigator_position",
@@ -74,6 +74,7 @@ const PLUGIN_CONFIG_KEYS: [&str; 13] = [
     "toggle_direction",
     "split_ratio",
     "auto_open",
+    "pane_outer_borders",
     "github_host",
     "gitlab_host",
     "azure_devops_host",
@@ -195,6 +196,9 @@ pub struct PluginConfig {
     toggle_direction: ToggleDirection,
     split_ratio: SplitRatio,
     auto_open: bool,
+    /// herdr's `[ui] pane_outer_borders` for reviewr's own panes: `false` drops every border
+    /// on the reviewr pane's outer edge, keeping one divider between the tiled panes.
+    pane_outer_borders: bool,
     github_host: Option<String>,
     gitlab_host: Option<String>,
     azure_devops_host: Option<String>,
@@ -213,6 +217,7 @@ impl Default for PluginConfig {
             toggle_direction: ToggleDirection::Right,
             split_ratio: SplitRatio::default(),
             auto_open: true,
+            pane_outer_borders: true,
             github_host: None,
             gitlab_host: None,
             azure_devops_host: None,
@@ -252,6 +257,10 @@ impl PluginConfig {
 
     pub fn auto_open(&self) -> bool {
         self.auto_open
+    }
+
+    pub fn pane_outer_borders(&self) -> bool {
+        self.pane_outer_borders
     }
 
     pub fn github_host(&self) -> Option<&str> {
@@ -308,6 +317,7 @@ impl PluginConfig {
             "toggle_direction": self.toggle_direction.as_str(),
             "split_ratio": self.split_ratio.get(),
             "auto_open": self.auto_open,
+            "pane_outer_borders": self.pane_outer_borders,
             "github_host": self.github_host,
             "gitlab_host": self.gitlab_host,
             "azure_devops_host": self.azure_devops_host,
@@ -479,6 +489,10 @@ fn parse_plugin_config(path: &Path) -> Result<PluginConfig, PluginConfigError> {
     if let Some(value) = table.get("auto_open") {
         config.auto_open =
             value.as_bool().ok_or_else(|| value_error(path, "auto_open", "a boolean"))?;
+    }
+    if let Some(value) = table.get("pane_outer_borders") {
+        config.pane_outer_borders =
+            value.as_bool().ok_or_else(|| value_error(path, "pane_outer_borders", "a boolean"))?;
     }
     if let Some(value) = table.get("github_host") {
         config.github_host = Some(parse_forge_host(path, "github_host", value)?);
@@ -801,6 +815,7 @@ mod tests {
         assert_eq!(config.toggle_direction(), ToggleDirection::Right);
         assert_eq!(config.split_ratio(), super::SplitRatio(0.4));
         assert!(config.auto_open());
+        assert!(config.pane_outer_borders(), "today's framed look by default");
         assert_eq!(config.github_host(), None);
         assert_eq!(config.url_opener(), None);
     }
@@ -818,6 +833,7 @@ mod tests {
                 "toggle_direction = \"down\"\n",
                 "split_ratio = 0.33\n",
                 "auto_open = false\n",
+                "pane_outer_borders = false\n",
                 "github_host = \"GitHub.Example.COM\"\n",
             ),
         )
@@ -830,6 +846,8 @@ mod tests {
         assert_eq!(config.toggle_direction(), ToggleDirection::Down);
         assert_eq!(config.split_ratio(), super::SplitRatio(0.33));
         assert!(!config.auto_open());
+        assert!(!config.pane_outer_borders());
+        assert_eq!(config.to_json()["pane_outer_borders"], false);
         assert_eq!(config.github_host(), Some("github.example.com"));
     }
 
@@ -922,6 +940,8 @@ mod tests {
             ("split_ratio = 0.95\n", "`split_ratio`"),
             ("split_ratio = nan\n", "`split_ratio`"),
             ("auto_open = \"yes\"\n", "`auto_open`"),
+            ("pane_outer_borders = \"false\"\n", "`pane_outer_borders`"),
+            ("pane_outer_borders = 0\n", "`pane_outer_borders`"),
             ("github_host = \"https://github.example.com\"\n", "`github_host`"),
             ("editor = \"\"\n", "`editor`"),
             ("editor = \"   \"\n", "`editor`"),

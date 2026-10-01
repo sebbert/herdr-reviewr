@@ -7110,6 +7110,32 @@ fn a_drag_across_a_comment_box_copies_its_text_without_the_border() {
 }
 
 #[test]
+fn a_borderless_read_pane_drag_copies_from_its_first_painted_cell() {
+    use herdr_reviewr::app::Tab;
+    use herdr_reviewr::forge::{PrSnapshot, PrView};
+    let r = Repo::init();
+    r.write("x.rs", "y\n");
+    r.commit_all("init");
+    let mut app = app_on(&r);
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("config.toml"), "pane_outer_borders = false\n").unwrap();
+    app.set_plugin_config(herdr_reviewr::config::plugin_config_in(dir.path()).unwrap());
+    app.set_tab(Tab::Pr).unwrap();
+    app.apply_pr(PrView::Pr(Box::new(PrSnapshot {
+        body: "alpha beta".into(),
+        ..common::pr_snapshot()
+    })));
+    // No border column precedes the text: the inner rect starts on the pane's own edge, and
+    // a drag from that first cell copies the line whole.
+    let inner = herdr_reviewr::ui::read_inner_rect(SEL_AREA, &app);
+    assert_eq!(inner.x, SEL_AREA.x, "the read pane's text starts at the outer edge");
+    sel_mouse(&mut app, MouseEventKind::Down(MouseButton::Left), inner.x, inner.y);
+    sel_mouse(&mut app, MouseEventKind::Drag(MouseButton::Left), inner.x + 40, inner.y);
+    sel_mouse(&mut app, MouseEventKind::Up(MouseButton::Left), inner.x + 40, inner.y);
+    assert_eq!(last_copy().as_deref(), Some("alpha beta"));
+}
+
+#[test]
 fn a_pr_navigator_drag_gates_the_pr_drains() {
     use herdr_reviewr::app::Tab;
     use herdr_reviewr::forge::{Comment, PrSnapshot, PrView};

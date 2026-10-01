@@ -7,6 +7,12 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ## [Unreleased]
 
 ### Added
+- **`pane_outer_borders = false` drops reviewr's pane frames**, matching herdr's `[ui]` key of
+  the same name. One divider line stays between the two panes and follows every navigator
+  position. Each pane keeps its title on a top row of its own, and the focused pane's title
+  takes the accent instead of its border. The read pane's scrollbar rides the divider when
+  the navigator sits to its right, and otherwise takes a column of its own. Popups, the
+  comment box, and the keys help keep their frames.
 - **`split_ratio` sizes the split reviewr opens in**, e.g. `0.33` for a third. The toggle, open, and
   auto-open all resize their fresh split to it; a failed resize never fails the open.
 - **A stacked PR diffs against its parent branch.** When the branch's open PR targets another

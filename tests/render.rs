@@ -4709,3 +4709,163 @@ fn the_pr_navigator_lists_the_stack_top_first_with_this_pr_marked() {
     app.apply_pr(PrView::Pr(Box::new(PrSnapshot { number: 11, ..common::pr_snapshot() })));
     assert!(!dump(&render_size(&app, 120, 30)).contains("stack ·"));
 }
+
+/// Load a config whose `pane_outer_borders` is off, the way the event loop applies a reread.
+fn borderless(app: &mut App) {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("config.toml"), "pane_outer_borders = false\n").unwrap();
+    app.set_plugin_config(herdr_reviewr::config::plugin_config_in(dir.path()).unwrap());
+}
+
+/// The painted text on frame row `y` from column `x`, `len` cells long.
+fn cells(buf: &Buffer, x: u16, y: u16, len: u16) -> String {
+    (x..(x + len).min(buf.area.width)).map(|cx| buf[(cx, y)].symbol().to_string()).collect()
+}
+
+const POSITIONS: [NavigatorPosition; 4] = [
+    NavigatorPosition::Right,
+    NavigatorPosition::Bottom,
+    NavigatorPosition::Left,
+    NavigatorPosition::Top,
+];
+
+#[test]
+fn pane_outer_borders_off_drops_the_frames_and_keeps_one_divider_in_every_position() {
+    let mut framed = edited_app();
+    let mut app = edited_app();
+    borderless(&mut app);
+    let area = Rect::new(0, 0, 80, 24);
+    for position in POSITIONS {
+        framed.navigator_position = position;
+        app.navigator_position = position;
+        let boxed = dump(&render_size(&framed, 80, 24));
+        assert!(boxed.contains('┌') && boxed.contains('┘'), "on: today's frames ({position:?})");
+
+        let buf = render_size(&app, 80, 24);
+        let out = dump(&buf);
+        for corner in ['┌', '┐', '└', '┘'] {
+            assert!(!out.contains(corner), "off: no frame corner {corner} ({position:?}):\n{out}");
+        }
+        // One divider line between the panes, not the two meeting borders.
+        let body = ui::body_rect(area, &app);
+        let hits: Vec<(u16, u16)> = (body.y..body.y + body.height)
+            .flat_map(|y| (body.x..body.x + body.width).map(move |x| (x, y)))
+            .filter(|&(x, y)| ui::hit_divider(area, &app, x, y))
+            .collect();
+        let (line, glyph) = if position.stacked() {
+            (hits.iter().map(|h| h.1).collect::<std::collections::BTreeSet<_>>(), "─")
+        } else {
+            (hits.iter().map(|h| h.0).collect::<std::collections::BTreeSet<_>>(), "│")
+        };
+        assert_eq!(line.len(), 1, "a one-cell divider ({position:?}):\n{out}");
+        assert!(hits.iter().all(|&(x, y)| buf[(x, y)].symbol() == glyph), "{position:?}:\n{out}");
+
+        // Painted and hit-tested geometry agree: each content rect's first cell is the pane's
+        // first content, and the title sits on the row above it.
+        let files = ui::files_inner_rect(area, &app);
+        assert_eq!(cells(&buf, files.x, files.y, 10), "M hello.rs", "{position:?}:\n{out}");
+        assert!(cells(&buf, files.x, files.y - 1, 7).contains("Files"), "{position:?}:\n{out}");
+        let read = ui::read_inner_rect(area, &app);
+        let first = cells(&buf, read.x, read.y, 12);
+        assert!(first.trim_start().starts_with("1 alpha"), "{position:?}: {first:?}\n{out}");
+        assert!(first.starts_with(' '), "the gutter opens the row, no border before it");
+        assert!(cells(&buf, read.x, read.y - 1, 10).contains("hello.rs"), "{position:?}");
+        assert!(!ui::hit_divider(area, &app, files.x, files.y), "content is not divider");
+        let row = ui::hit_file(area, &app, files.x, files.y, 1, 0);
+        assert_eq!(row, Some(0), "a click on the first painted file row hits it ({position:?})");
+    }
+
+    // A hidden navigator leaves the read pane alone: no divider, no frame.
+    app.navigator_hidden = true;
+    let out = dump(&render_size(&app, 80, 24));
+    assert!(!out.contains('┌') && !out.contains('│'), "{out}");
+}
+
+#[test]
+fn borderless_focus_shows_in_the_title_and_overlays_keep_their_frames() {
+    let mut app = edited_app();
+    borderless(&mut app);
+    let area = Rect::new(0, 0, 80, 24);
+    let title_fg = |app: &App, inner: Rect| {
+        let buf = render_size(app, 80, 24);
+        // The title text starts one cell in, after its breathing space.
+        buf[(inner.x + 1, inner.y - 1)].fg
+    };
+    app.focus = Focus::Diff;
+    let (read, files) = (ui::read_inner_rect(area, &app), ui::files_inner_rect(area, &app));
+    let (lit, dim) = (title_fg(&app, read), title_fg(&app, files));
+    assert_ne!(lit, dim, "the focused pane's title stands out");
+    app.focus = Focus::Files;
+    assert_eq!(title_fg(&app, files), lit, "focus moves the accent to the navigator title");
+    assert_eq!(title_fg(&app, read), dim);
+
+    // Floating overlays keep full borders: they float over content, not against the edge.
+    app.mode = Mode::List;
+    let out = dump(&render_size(&app, 80, 24));
+    assert!(out.contains('┌') && out.contains('┘'), "the comments list keeps its frame:\n{out}");
+}
+
+#[test]
+fn a_borderless_divider_drags_to_the_mouse_and_the_read_thumb_never_covers_text() {
+    use herdr_reviewr::forge::{PrSnapshot, PrView};
+    let mut app = edited_app();
+    borderless(&mut app);
+    // A 100-cell split axis either way, so the drag's whole-percent share is exact.
+    let area = Rect::new(0, 0, 100, 102);
+    let body = ui::body_rect(area, &app);
+    let event = |kind, column, row| MouseEvent { kind, column, row, modifiers: KeyModifiers::NONE };
+    for (position, target) in [
+        (NavigatorPosition::Right, (body.x + 60, body.y + 5)),
+        (NavigatorPosition::Left, (body.x + 40, body.y + 5)),
+        (NavigatorPosition::Bottom, (body.x + 5, body.y + 60)),
+        (NavigatorPosition::Top, (body.x + 5, body.y + 40)),
+    ] {
+        app.navigator_position = position;
+        let start = (body.y..body.y + body.height)
+            .flat_map(|y| (body.x..body.x + body.width).map(move |x| (x, y)))
+            .find(|&(x, y)| ui::hit_divider(area, &app, x, y))
+            .unwrap();
+        for (kind, (x, y)) in [
+            (MouseEventKind::Down(ratatui::crossterm::event::MouseButton::Left), start),
+            (MouseEventKind::Drag(ratatui::crossterm::event::MouseButton::Left), target),
+            (MouseEventKind::Up(ratatui::crossterm::event::MouseButton::Left), target),
+        ] {
+            handle_mouse(
+                &mut app,
+                event(kind, x, y),
+                area,
+                &[],
+                &Keymap::default(),
+                &herdr_reviewr::export::Clipboard,
+            )
+            .unwrap();
+        }
+        assert!(
+            ui::hit_divider(area, &app, target.0, target.1),
+            "the divider lands under the mouse ({position:?})"
+        );
+    }
+
+    // The PR read pane's scrollbar: on the divider when the navigator is right of it, else
+    // in a column of its own that the content never reaches.
+    app.set_tab(Tab::Pr).unwrap();
+    let long = (0..80).map(|n| format!("line {n}")).collect::<Vec<_>>().join("\n\n");
+    app.pr = PrView::Pr(Box::new(PrSnapshot { body: long, ..common::pr_snapshot() }));
+    for position in POSITIONS {
+        app.navigator_position = position;
+        let buf = render_size(&app, 100, 102);
+        let read = ui::read_inner_rect(area, &app);
+        let thumb: Vec<u16> = (read.y..read.y + read.height)
+            .flat_map(|y| (0..100u16).map(move |x| (x, y)))
+            .filter(|&(x, y)| buf[(x, y)].symbol() == "┃")
+            .map(|(x, _)| x)
+            .collect();
+        assert!(!thumb.is_empty(), "the overflow paints a thumb ({position:?})");
+        let col = thumb[0];
+        assert!(thumb.iter().all(|&x| x == col), "one track column ({position:?})");
+        assert!(col >= read.x + read.width, "the thumb sits outside the text ({position:?})");
+        if position == NavigatorPosition::Right {
+            assert!(ui::hit_divider(area, &app, col, read.y), "on the divider");
+        }
+    }
+}

@@ -228,6 +228,7 @@ toggle_placement = "overlay"
 toggle_direction = "down"
 split_ratio = 0.33
 auto_open = false
+pane_outer_borders = false
 github_host = "github.example.com"
 editor = "code -g {file}:{line}"
 
@@ -267,6 +268,20 @@ navigator_position = "bottom"
 
 `<` grows, `>` shrinks, or drag the divider. `z` hides the navigator altogether and brings it
 back.
+
+### Outer borders
+
+reviewr frames each pane by default. If herdr runs with `[ui] pane_outer_borders = false`,
+set the same key in reviewr's file so its panes match:
+
+```toml
+pane_outer_borders = false   # default: true
+```
+
+The frames go. One divider line stays between the file list and the diff. Each pane keeps
+its title on a top row of its own, and the focused pane's title is lit instead of its
+border. Popups, the comment box, and the keys help keep their frames: they float over the
+panes rather than sitting against the edge.
 
 ### Base branch
 

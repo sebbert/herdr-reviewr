@@ -2166,6 +2166,13 @@ impl App {
         self.snippet_cache.borrow_mut().get(hunk, path, start, end, side, &self.highlighter)
     }
 
+    /// Whether reviewr's tiled panes draw the borders on its own outer edge — the config's
+    /// `pane_outer_borders`, framed while the config is blocked.
+    #[must_use]
+    pub fn pane_outer_borders(&self) -> bool {
+        self.plugin_config().is_none_or(crate::config::PluginConfig::pane_outer_borders)
+    }
+
     /// The navigator share remembered for the active side or stacked axis.
     #[must_use]
     pub fn navigator_share(&self) -> u16 {

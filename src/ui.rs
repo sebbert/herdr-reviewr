@@ -58,6 +58,10 @@ pub fn render(frame: &mut Frame, app: &App) {
         return;
     }
 
+    // The divider paints first: the read pane's scrollbar thumb rides on it.
+    if let Some(divider) = p.divider {
+        render_divider(frame, app, divider);
+    }
     if app.tab == Tab::Pr {
         render_pr_header(frame, app, p.tab);
         render_pr_read(frame, app, p.diff);
@@ -126,23 +130,136 @@ fn vrows(area: Rect, app: &App) -> Rc<[Rect]> {
 /// the renderer agree by construction (a layout change can't desync hit-testing from paint).
 struct Panes {
     tab: Rect,
-    diff: Rect,
-    files: Rect,
+    diff: Pane,
+    files: Pane,
+    /// The one-cell line between the two tiled panes when `pane_outer_borders` is off; with
+    /// it on, each pane's own border meets the other's and there is no separate divider.
+    divider: Option<Rect>,
     body: Rect,
     status: Rect,
+}
+
+/// One tiled pane: the rect it owns, its content rect inside the chrome (a full border, or
+/// with `pane_outer_borders` off a title-only top row), and the column its overflow
+/// scrollbar thumb paints in.
+#[derive(Clone, Copy, Debug)]
+struct Pane {
+    outer: Rect,
+    inner: Rect,
+    track_x: u16,
+}
+
+/// Where a borderless pane's scrollbar thumb paints.
+#[derive(Clone, Copy)]
+enum Track {
+    /// The pane never scrolls behind a thumb (the navigators).
+    None,
+    /// On the divider just right of the pane, the way a framed pane paints on its border.
+    Beside(u16),
+    /// In the pane's own last column, kept clear of content.
+    Own,
+}
+
+impl Pane {
+    fn framed(outer: Rect) -> Self {
+        let track_x = (outer.x + outer.width).saturating_sub(1);
+        Self { outer, inner: inner_rect(outer), track_x }
+    }
+
+    fn borderless(outer: Rect, track: Track) -> Self {
+        let mut inner = Rect {
+            x: outer.x,
+            y: outer.y.saturating_add(1).min(outer.y + outer.height),
+            width: outer.width,
+            height: outer.height.saturating_sub(1),
+        };
+        let track_x = match track {
+            Track::Beside(x) => x,
+            Track::None | Track::Own => (outer.x + outer.width).saturating_sub(1),
+        };
+        if matches!(track, Track::Own) {
+            inner.width = inner.width.saturating_sub(1);
+        }
+        Self { outer, inner, track_x }
+    }
 }
 
 fn panes(area: Rect, app: &App) -> Panes {
     let rows = vrows(area, app);
     let body = rows[1];
+    let framed = app.pane_outer_borders();
     // A hidden navigator gives the read pane the whole body. The zero-sized files rect keeps
     // every hit-test missing it by construction.
-    let (diff, files) = if app.navigator_hidden_here() {
-        (body, Rect::new(body.x, body.y, 0, 0))
+    let (diff, files, divider) = if app.navigator_hidden_here() {
+        (body, Rect::new(body.x, body.y, 0, 0), None)
     } else {
-        split_body(body, app.navigator_position, app.navigator_share())
+        let (diff, files) = split_body(body, app.navigator_position, app.navigator_share());
+        if framed {
+            (diff, files, None)
+        } else {
+            let (diff, files, divider) = carve_divider(diff, files, app.navigator_position);
+            (diff, files, Some(divider))
+        }
     };
-    Panes { tab: rows[0], diff, files, body, status: rows[2] }
+    let (diff, files) = if framed {
+        (Pane::framed(diff), Pane::framed(files))
+    } else {
+        // The read pane's thumb rides the divider when it sits on the pane's right; against
+        // the outer edge it takes the pane's last column instead.
+        let track = match divider {
+            Some(d) if d.height > 1 && d.x == diff.x + diff.width => Track::Beside(d.x),
+            _ => Track::Own,
+        };
+        (Pane::borderless(diff, track), Pane::borderless(files, Track::None))
+    };
+    Panes { tab: rows[0], diff, files, divider, body, status: rows[2] }
+}
+
+/// Take the one-cell divider out of the split, on the split boundary itself — the cell a
+/// divider drag puts under the mouse in every position.
+fn carve_divider(diff: Rect, files: Rect, position: NavigatorPosition) -> (Rect, Rect, Rect) {
+    let (mut diff, mut files) = (diff, files);
+    let divider = match position {
+        NavigatorPosition::Right => {
+            let d = Rect::new(files.x, files.y, files.width.min(1), files.height);
+            files.x += d.width;
+            files.width -= d.width;
+            d
+        }
+        NavigatorPosition::Left => {
+            let d = Rect::new(diff.x, diff.y, diff.width.min(1), diff.height);
+            diff.x += d.width;
+            diff.width -= d.width;
+            d
+        }
+        NavigatorPosition::Bottom => {
+            let d = Rect::new(files.x, files.y, files.width, files.height.min(1));
+            files.y += d.height;
+            files.height -= d.height;
+            d
+        }
+        NavigatorPosition::Top => {
+            let d = Rect::new(diff.x, diff.y, diff.width, diff.height.min(1));
+            diff.y += d.height;
+            diff.height -= d.height;
+            d
+        }
+    };
+    (diff, files, divider)
+}
+
+/// Paint the borderless layout's divider: one line in the unfocused border tone.
+fn render_divider(frame: &mut Frame, app: &App, divider: Rect) {
+    let glyph = if divider.width == 1 && divider.height > 1 { "│" } else { "─" };
+    let style = Style::default().fg(app.palette().surface2);
+    let buf = frame.buffer_mut();
+    for y in divider.y..divider.y + divider.height {
+        for x in divider.x..divider.x + divider.width {
+            if let Some(cell) = buf.cell_mut((x, y)) {
+                cell.set_symbol(glyph).set_style(style);
+            }
+        }
+    }
 }
 
 /// Split `axis_len` cells by `pct`, honoring the shared minimum-pane rule: a three-cell
@@ -197,15 +314,15 @@ pub fn hit_divider(area: Rect, app: &App, col: u16, row: u16) -> bool {
         return false;
     }
     let p = panes(area, app);
+    if let Some(divider) = p.divider {
+        return contains(divider, col, row);
+    }
+    let (body, files) = (p.body, p.files.outer);
     match app.navigator_position {
-        NavigatorPosition::Left => {
-            contains(p.body, col, row) && at_seam(col, p.files.x + p.files.width)
-        }
-        NavigatorPosition::Right => contains(p.body, col, row) && at_seam(col, p.files.x),
-        NavigatorPosition::Top => {
-            contains(p.body, col, row) && at_seam(row, p.files.y + p.files.height)
-        }
-        NavigatorPosition::Bottom => contains(p.body, col, row) && at_seam(row, p.files.y),
+        NavigatorPosition::Left => contains(body, col, row) && at_seam(col, files.x + files.width),
+        NavigatorPosition::Right => contains(body, col, row) && at_seam(col, files.x),
+        NavigatorPosition::Top => contains(body, col, row) && at_seam(row, files.y + files.height),
+        NavigatorPosition::Bottom => contains(body, col, row) && at_seam(row, files.y),
     }
 }
 
@@ -225,7 +342,7 @@ pub fn hit_file(
     n_files: usize,
     file_scroll: usize,
 ) -> Option<usize> {
-    let inner = inner_rect(panes(area, app).files);
+    let inner = panes(area, app).files.inner;
     if !contains(inner, col, row) {
         return None;
     }
@@ -236,32 +353,32 @@ pub fn hit_file(
 /// The number of file rows visible in the file pane, used to clamp the file-list scroll.
 #[must_use]
 pub fn file_viewport_height(area: Rect, app: &App) -> usize {
-    inner_rect(panes(area, app).files).height as usize
+    panes(area, app).files.inner.height as usize
 }
 
 /// Whether `(col, row)` falls in the file pane, so the wheel scrolls the list it is over.
 #[must_use]
 pub fn in_files_pane(area: Rect, app: &App, col: u16, row: u16) -> bool {
-    contains(panes(area, app).files, col, row)
+    contains(panes(area, app).files.outer, col, row)
 }
 
 /// Whether `(col, row)` falls in the diff pane — the markdown preview's click target,
 /// whose rendered geometry the source-row hit test cannot describe.
 #[must_use]
 pub fn in_diff_pane(area: Rect, app: &App, col: u16, row: u16) -> bool {
-    contains(panes(area, app).diff, col, row)
+    contains(panes(area, app).diff.outer, col, row)
 }
 
 /// The read pane's inner content rect, for the drag edge-scroll.
 #[must_use]
 pub fn read_inner_rect(area: Rect, app: &App) -> Rect {
-    inner_rect(panes(area, app).diff)
+    panes(area, app).diff.inner
 }
 
 /// The file navigator's inner content rect, for the drag edge-scroll.
 #[must_use]
 pub fn files_inner_rect(area: Rect, app: &App) -> Rect {
-    inner_rect(panes(area, app).files)
+    panes(area, app).files.inner
 }
 
 /// The logical diff-row index a click at `(col, row)` lands on, or `None` if outside the
@@ -276,7 +393,7 @@ pub fn hit_diff(
     heights: &[usize],
     diff_scroll: usize,
 ) -> Option<usize> {
-    let inner = inner_rect(panes(area, app).diff);
+    let inner = panes(area, app).diff.inner;
     if !contains(inner, col, row) {
         return None;
     }
@@ -294,7 +411,7 @@ pub fn hit_diff(
 /// The number of diff rows visible in the diff pane, used to clamp the scroll.
 #[must_use]
 pub fn diff_viewport_height(area: Rect, app: &App) -> usize {
-    let h = inner_rect(panes(area, app).diff).height as usize;
+    let h = panes(area, app).diff.inner.height as usize;
     // The find band takes the pane's bottom row, so the cursor reveals above it
     if app.mode == crate::app::Mode::Find { h.saturating_sub(1) } else { h }
 }
@@ -302,7 +419,7 @@ pub fn diff_viewport_height(area: Rect, app: &App) -> usize {
 /// The display height (rows on screen) of each visible logical diff row, honoring wrap.
 #[must_use]
 pub fn diff_row_heights(app: &App, area: Rect) -> Vec<usize> {
-    let width = inner_rect(panes(area, app).diff).width as usize;
+    let width = panes(area, app).diff.inner.width as usize;
     let gutter_w = gutter_for(&app.diff);
     let p = app.palette();
     // A row's display height is its wrapped code lines plus any inline comment cards under
@@ -484,7 +601,7 @@ struct ReadPane {
 }
 
 fn read_pane(area: Rect, app: &App) -> ReadPane {
-    let inner = inner_rect(panes(area, app).diff);
+    let inner = panes(area, app).diff.inner;
     ReadPane { inner, prefix_w: gutter_prefix_width(gutter_for(&app.diff)) }
 }
 
@@ -493,7 +610,7 @@ fn read_pane(area: Rect, app: &App) -> ReadPane {
 /// scroll fires only past them.
 #[must_use]
 pub fn read_content_rect(area: Rect, app: &App) -> Rect {
-    let mut inner = inner_rect(panes(area, app).diff);
+    let mut inner = panes(area, app).diff.inner;
     if app.mode == Mode::Find {
         inner.height = inner.height.saturating_sub(1);
     }
@@ -607,7 +724,7 @@ fn render_text_selection(frame: &mut Frame, app: &App, area: Rect) {
     let (lo, hi) = drag.ordered();
     match drag.surface {
         Surface::Files => {
-            let inner = inner_rect(panes(area, app).files);
+            let inner = panes(area, app).files.inner;
             for y in inner.y..inner.y + inner.height {
                 let i = (y - inner.y) as usize + app.file_scroll;
                 if i >= lo.row && i <= hi.row && i < app.file_rows.len() {
@@ -709,7 +826,7 @@ fn render_text_selection(frame: &mut Frame, app: &App, area: Rect) {
             }
         }
         Surface::PrNav => {
-            let inner = inner_rect(panes(area, app).files);
+            let inner = panes(area, app).files.inner;
             let scroll = app.pr_nav_scroll();
             for off in 0..inner.height as usize {
                 let i = scroll + off;
@@ -900,7 +1017,7 @@ pub(crate) struct PaintedSel {
 
 /// The open painted surface: the `PR` read pane on the `PR` tab, else the markdown preview
 pub(crate) fn painted_sel(app: &App, area: Rect) -> Option<PaintedSel> {
-    let inner = inner_rect(panes(area, app).diff);
+    let inner = panes(area, app).diff.inner;
     if app.tab == Tab::Pr {
         let content = pr_read_content(app, inner);
         let notice_h = content.notice.len() as u16;
@@ -1003,7 +1120,7 @@ pub(crate) fn pr_nav_texts(app: &App) -> Vec<String> {
 /// The PR navigator display row under `(col, row)`; `clamp` snaps into the pane.
 #[must_use]
 pub fn pr_nav_display_row(area: Rect, app: &App, col: u16, row: u16, clamp: bool) -> Option<usize> {
-    let inner = inner_rect(panes(area, app).files);
+    let inner = panes(area, app).files.inner;
     if inner.height == 0 {
         return None;
     }
@@ -1057,7 +1174,7 @@ pub fn composer_content_width(width: usize) -> usize {
 /// reserve the comment box without a `Frame` (mirrors [`diff_viewport_height`]).
 #[must_use]
 pub fn diff_inner_width(area: Rect, app: &App) -> usize {
-    inner_rect(panes(area, app).diff).width as usize
+    panes(area, app).diff.inner.width as usize
 }
 
 /// The comment box's display lines over prebuilt box rows: each input line word-wrapped, with
@@ -1548,11 +1665,9 @@ const DIR_DOT: &str = "•";
 /// so a folder name elides the same way whether or not the dot is painted.
 const DIR_DOT_RESERVE: usize = 2;
 
-fn render_file_list(frame: &mut Frame, app: &App, area: Rect) {
+fn render_file_list(frame: &mut Frame, app: &App, pane: Pane) {
     let p = app.palette();
-    let block = bordered("Files", app.focus == Focus::Files, p);
-    let inner = block.inner(area);
-    frame.render_widget(block, area);
+    let inner = paint_pane(frame, app, pane, "Files", app.focus == Focus::Files);
 
     if app.file_rows.is_empty() {
         let gone = app.commits_gone_message();
@@ -1836,7 +1951,7 @@ fn truncate_width(s: &str, max: usize) -> String {
     out
 }
 
-fn render_diff_view(frame: &mut Frame, app: &App, area: Rect) {
+fn render_diff_view(frame: &mut Frame, app: &App, pane: Pane) {
     let p = app.palette();
     let mut title = match (&app.diff_path, &app.diff.previous_path) {
         (Some(new), Some(old)) => format!("{old} → {new}"),
@@ -1850,9 +1965,7 @@ fn render_diff_view(frame: &mut Frame, app: &App, area: Rect) {
     if app.preview_active() {
         title.push_str(" · preview");
     }
-    let block = bordered(&title, app.focus == Focus::Diff, p);
-    let inner = block.inner(area);
-    frame.render_widget(block, area);
+    let inner = paint_pane(frame, app, pane, &title, app.focus == Focus::Diff);
     app.note_diff_width(inner.width as usize);
 
     if app.visible.is_empty() {
@@ -1900,7 +2013,7 @@ fn render_diff_view(frame: &mut Frame, app: &App, area: Rect) {
         );
         render_overflow_scrollbar(
             frame,
-            area.inner(ratatui::layout::Margin { vertical: 1, horizontal: 0 }),
+            Rect::new(pane.track_x, inner.y, 1, inner.height),
             max,
             scroll,
             p,
@@ -4262,13 +4375,11 @@ fn checks_summary(s: &forge::PrSnapshot) -> String {
 
 /// The PR navigator: the checks list above the oldest-first comments list, with the cursor
 /// row filled and the view windowed to keep it on screen.
-fn render_pr_nav(frame: &mut Frame, app: &App, area: Rect) {
+fn render_pr_nav(frame: &mut Frame, app: &App, pane: Pane) {
     // Identity lives in the header; the read pane shows the selected comment, so the navigator
     // names its contents rather than repeating "PR".
     let p = app.palette();
-    let block = bordered("Checks & comments", app.focus == Focus::Files, p);
-    let inner = block.inner(area);
-    frame.render_widget(block, area);
+    let inner = paint_pane(frame, app, pane, "Checks & comments", app.focus == Focus::Files);
     let width = inner.width as usize;
     let rows = pr_nav_rows(app, width, std::time::SystemTime::now());
     let viewport = inner.height as usize;
@@ -4921,16 +5032,14 @@ fn pr_read_content(app: &App, inner: Rect) -> PrReadContent {
 
 /// The PR read pane: the whole conversation — description, then every comment oldest
 /// first — scrolled to the selected item, or the loading/degraded message.
-fn render_pr_read(frame: &mut Frame, app: &App, area: Rect) {
+fn render_pr_read(frame: &mut Frame, app: &App, pane: Pane) {
     let p = app.palette();
     let title = match app.pr_selected_comment() {
         Some(cm) => format!("@{} · {}", cm.author, cm.anchor),
         None if app.pr_on_description() => "description".to_string(),
         None => app.pr_forge.abbr().to_string(),
     };
-    let block = bordered(&title, app.focus == Focus::Diff, p);
-    let inner = block.inner(area);
-    frame.render_widget(block, area);
+    let inner = paint_pane(frame, app, pane, &title, app.focus == Focus::Diff);
     let content = pr_read_content(app, inner);
     let notice_height = content.notice.len() as u16;
     if notice_height > 0 {
@@ -4968,7 +5077,7 @@ fn render_pr_read(frame: &mut Frame, app: &App, area: Rect) {
     frame.render_widget(Paragraph::new(content.lines).scroll((saturating_row(scroll), 0)), body);
     render_overflow_scrollbar(
         frame,
-        Rect::new(area.x, body.y, area.width, body.height),
+        Rect::new(pane.track_x, body.y, 1, body.height),
         max,
         scroll,
         p,
@@ -5048,6 +5157,25 @@ fn check_glyph(p: &Palette, status: forge::CheckStatus) -> (&'static str, Color)
 }
 
 // --- helpers -------------------------------------------------------------------
+
+/// Paint a tiled pane's chrome and return its content rect. With `pane_outer_borders` on, a
+/// full border whose colour shows focus; off, a title-only top row — no border glyphs, the
+/// focused pane's title in the accent — and the divider painted once between the panes.
+fn paint_pane(frame: &mut Frame, app: &App, pane: Pane, title: &str, focused: bool) -> Rect {
+    let p = app.palette();
+    let block = if app.pane_outer_borders() {
+        bordered(title, focused, p)
+    } else {
+        let style = if focused {
+            Style::default().fg(p.blue).add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(p.dim1)
+        };
+        Block::default().title(framed_title(title)).title_style(style)
+    };
+    frame.render_widget(block, pane.outer);
+    pane.inner
+}
 
 fn bordered(title: &str, focused: bool, p: &Palette) -> Block<'static> {
     // A focused pane gets a blue border; an unfocused one recedes to a surface tone.
