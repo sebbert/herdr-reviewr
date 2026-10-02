@@ -570,7 +570,8 @@ fn fetch_checks(
         }
         let allow_failure = job["allow_failure"].as_bool().unwrap_or(false);
         let status = job_status(job["status"].as_str().unwrap_or_default(), allow_failure);
-        upsert_latest(&mut checks, Check { name, status });
+        let url = crate::forge::web_url(&job["web_url"]);
+        upsert_latest(&mut checks, Check { name, status, url });
     }
     // A header-less response past the cap can only be reported as capped.
     let capped = job_pages.map_or(rows.len() >= crate::forge::SURFACE_CAP, |total| total > 1);
@@ -579,7 +580,8 @@ fn fetch_checks(
         // while an unread job failed. The pipeline states its own verdict, which stands in for
         // the jobs left unread.
         let status = pipeline_status(pipeline["status"].as_str().unwrap_or_default());
-        upsert_latest(&mut checks, Check { name: "pipeline".to_string(), status });
+        let url = crate::forge::web_url(&pipeline["web_url"]);
+        upsert_latest(&mut checks, Check { name: "pipeline".to_string(), status, url });
     }
     Ok((checks, capped))
 }
@@ -639,7 +641,7 @@ fn build_snapshot(
         merge: derive_merge(mr),
         sync,
         checks,
-        comments: merge_comments(rows, approvals),
+        comments: merge_comments(rows, approvals, mr["web_url"].as_str().unwrap_or_default()),
         comments_truncated,
         checks_truncated,
         stack: Vec::new(),
@@ -700,7 +702,7 @@ fn is_comment_note(note: &Value) -> bool {
 }
 
 /// Replies beyond the root: every later comment note.
-fn replies_from_discussion(discussion: &Value) -> Vec<Reply> {
+fn replies_from_discussion(discussion: &Value, mr_url: &str) -> Vec<Reply> {
     let Some(notes) = discussion["notes"].as_array() else {
         return Vec::new();
     };
@@ -718,6 +720,7 @@ fn replies_from_discussion(discussion: &Value) -> Vec<Reply> {
                 body: note["body"].as_str().unwrap_or("").trim().to_string(),
                 created_at: note["created_at"].as_str().unwrap_or("").to_string(),
                 avatar_url: crate::forge::avatar_url(&note["author"]["avatar_url"]),
+                links: note_links(note, mr_url),
             }
         })
         .collect()
@@ -726,7 +729,7 @@ fn replies_from_discussion(discussion: &Value) -> Vec<Reply> {
 /// Merge the discussion threads and approvals into one oldest-first comment list:
 /// MR-level notes are `comment` rows, diff-position discussions are `finding` rows, and an
 /// approval is a `review` row.
-fn merge_comments(discussions: &[Value], approvals: &Value) -> Vec<Comment> {
+fn merge_comments(discussions: &[Value], approvals: &Value, mr_url: &str) -> Vec<Comment> {
     let mut out: Vec<Comment> = Vec::new();
     for discussion in discussions {
         let Some(root) = comment_root(discussion) else { continue };
@@ -761,8 +764,9 @@ fn merge_comments(discussions: &[Value], approvals: &Value) -> Vec<Comment> {
             review_state: None,
             is_resolved,
             is_outdated: false,
-            replies: replies_from_discussion(discussion),
+            replies: replies_from_discussion(discussion, mr_url),
             avatar_url: crate::forge::avatar_url(&root["author"]["avatar_url"]),
+            links: note_links(root, mr_url),
         });
     }
     for user in approvals["approved_by"].as_array().into_iter().flatten() {
@@ -782,10 +786,22 @@ fn merge_comments(discussions: &[Value], approvals: &Value) -> Vec<Comment> {
         );
         row.review_state = Some(crate::forge::ReviewState::Approved);
         row.avatar_url = crate::forge::avatar_url(&user["user"]["avatar_url"]);
+        // An approval is a standing state, not a note: it has an author but no page.
+        row.links.author = crate::forge::web_url(&user["user"]["web_url"]);
         out.push(row);
     }
     finish_comments(&mut out);
     out
+}
+
+/// A note's permalink — the merge request page's `#note_<id>` anchor — and its author's
+/// profile.
+fn note_links(note: &Value, mr_url: &str) -> crate::forge::Links {
+    let permalink = note["id"]
+        .as_u64()
+        .filter(|_| crate::hyperlink::safe_url(mr_url).is_some())
+        .map(|id| format!("{mr_url}#note_{id}"));
+    crate::forge::Links { permalink, author: crate::forge::web_url(&note["author"]["web_url"]) }
 }
 
 fn gitlab_position(position: &Value) -> ((Option<u64>, Option<u64>), Option<crate::model::Side>) {
@@ -870,7 +886,7 @@ mod tests {
             {"system": false, "body": "The real comment.", "author": {"username": "author"}}
         ]});
         assert_eq!(comment_root(&discussion).unwrap()["body"], "The real comment.");
-        assert!(replies_from_discussion(&discussion).is_empty());
+        assert!(replies_from_discussion(&discussion, "").is_empty());
     }
 
     #[test]
@@ -1197,7 +1213,7 @@ mod tests {
         ]);
         let approvals = json!({"approved_by": [{"user": {"username": "reviewer",
             "avatar_url": "https://gitlab.example/uploads/reviewer.png"}}]});
-        let comments = merge_comments(discussions.as_array().unwrap(), &approvals);
+        let comments = merge_comments(discussions.as_array().unwrap(), &approvals, MR_URL);
         assert_eq!(comments.len(), 4);
         let finding = comments.iter().find(|c| c.body == "Looks wrong.").unwrap();
         assert_eq!(finding.kind, CommentKind::Finding);
@@ -1221,6 +1237,34 @@ mod tests {
         );
         let dated: Vec<_> = comments[..3].iter().map(|c| c.created_at.as_str()).collect();
         assert!(dated.windows(2).all(|w| w[0] <= w[1]), "dated rows run oldest first: {dated:?}");
+    }
+
+    const MR_URL: &str = "https://gitlab.com/group/repo/-/merge_requests/42";
+
+    #[test]
+    fn notes_link_their_mr_anchor_and_author_and_approvals_their_approver() {
+        let discussions = json!([{ "notes": [
+            {"id": 501, "system": false, "body": "Root.", "created_at": "2026-07-22T11:00:00Z",
+             "author": {"username": "ann", "web_url": "https://gitlab.com/ann"},
+             "position": {"new_path": "a.rs", "new_line": 3}},
+            {"id": 502, "system": false, "body": "Reply.", "created_at": "2026-07-22T12:00:00Z",
+             "author": {"username": "bob", "web_url": "javascript:alert(1)"}}
+        ]}]);
+        let approvals = json!({"approved_by": [{"user": {"username": "cat",
+            "web_url": "https://gitlab.com/cat"}}]});
+        let comments = merge_comments(discussions.as_array().unwrap(), &approvals, MR_URL);
+        let root = &comments[0];
+        assert_eq!(root.links.permalink.as_deref(), Some(&*format!("{MR_URL}#note_501")));
+        assert_eq!(root.links.author.as_deref(), Some("https://gitlab.com/ann"));
+        let reply = &root.replies[0];
+        assert_eq!(reply.links.permalink.as_deref(), Some(&*format!("{MR_URL}#note_502")));
+        assert_eq!(reply.links.author, None, "a non-http profile links nowhere");
+        let approval = &comments[1];
+        assert_eq!(approval.links.permalink, None, "an approval has no page of its own");
+        assert_eq!(approval.links.author.as_deref(), Some("https://gitlab.com/cat"));
+        // With no MR page to anchor to, a note links its author only.
+        let bare = merge_comments(discussions.as_array().unwrap(), &json!({}), "");
+        assert_eq!(bare[0].links.permalink, None);
     }
 
     #[test]

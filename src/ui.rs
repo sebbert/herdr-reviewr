@@ -34,6 +34,7 @@ use crate::theme::Palette;
 pub fn render(frame: &mut Frame, app: &App) {
     render_frame(frame, app);
     settle_ambiguous_widths(frame.buffer_mut());
+    app.settle_hyperlinks(frame.buffer_mut());
 }
 
 /// Rewrite every cell whose grapheme terminals disagree on the width of, so the width
@@ -2068,6 +2069,7 @@ fn render_diff_view(frame: &mut Frame, app: &App, pane: Pane) {
             Paragraph::new(rendered.lines).scroll((saturating_row(scroll), 0)),
             inner,
         );
+        app.tag_painted_links(frame.buffer_mut());
         render_overflow_scrollbar(
             frame,
             Rect::new(pane.track_x, inner.y, 1, inner.height),
@@ -4386,18 +4388,26 @@ fn render_pr_header(frame: &mut Frame, app: &App, area: Rect) {
         let name =
             truncate_width(&s.title, w.saturating_sub(lead_tabs + chip_w + 2 + head_w).max(4));
         let pad = w.saturating_sub(lead_tabs + name.width() + head_w + 2 + chip_w);
+        // The title and the chip lead to the PR, the branch to its head branch.
+        let pr_url = Some(s.url.as_str());
+        let branch_url = if s.head_is_fork {
+            None
+        } else {
+            forge::branch_url(app.pr_forge, &s.url, &s.head_ref)
+        };
         spans.push(Span::styled(" ".repeat(pad), bar));
-        spans.push(Span::styled(name, bar.fg(p.dim0)));
+        spans.push(Span::styled(name, app.link(bar.fg(p.dim0), pr_url)));
         if head_w > 0 {
             spans.push(Span::styled("  ", bar));
-            spans.push(Span::styled(head, bar.fg(p.dim2)));
+            spans.push(Span::styled(head, app.link(bar.fg(p.dim2), branch_url.as_deref())));
         }
         spans.push(Span::styled("  ", bar));
-        spans.push(Span::styled(status, bar.fg(color).add_modifier(Modifier::BOLD)));
-        spans.push(Span::styled(" ", bar));
-        spans.push(Span::styled(number, bar.fg(p.yellow).add_modifier(Modifier::BOLD)));
+        let chip = |style: Style| app.link(style, pr_url);
+        spans.push(Span::styled(status, chip(bar.fg(color).add_modifier(Modifier::BOLD))));
+        spans.push(Span::styled(" ", chip(bar)));
+        spans.push(Span::styled(number, chip(bar.fg(p.yellow).add_modifier(Modifier::BOLD))));
         // The arrow shares the PR number's colour, reading as part of the clickable chip.
-        spans.push(Span::styled(" ↗", bar.fg(p.yellow)));
+        spans.push(Span::styled(" ↗", chip(bar.fg(p.yellow))));
     }
 
     // Fill the rest of the bar (the Pr arm already reaches the right edge).
@@ -4597,14 +4607,14 @@ fn pr_nav_rows(app: &App, width: usize, now: std::time::SystemTime) -> Vec<PrNav
         let (glyph, color) = check_glyph(p, check.status);
         rows.push(PrNavRow::text(vec![
             Span::styled(format!(" {glyph} "), Style::default().fg(color)),
-            Span::styled(check.name.clone(), text_style(p)),
+            Span::styled(check.name.clone(), app.link(text_style(p), check.url.as_deref())),
         ]));
     }
     rows.push(parting());
     rows.push(PrNavRow::text(vec![Span::styled(format!("comments · {}", s.comments.len()), dim)]));
     let offset = app.pr_description_offset();
     rows.extend(s.comments.iter().enumerate().map(|(index, comment)| PrNavRow {
-        spans: pr_comment_row(comment, width, now, p),
+        spans: pr_comment_row(app, comment, width, now),
         cursor: Some(index + offset),
         ..PrNavRow::default()
     }));
@@ -4648,9 +4658,15 @@ fn push_stack_rows(rows: &mut Vec<PrNavRow>, app: &App, stack: &[forge::StackEnt
         } else {
             Style::default().fg(p.dim0)
         };
+        // The number leads to that PR on the forge; its trailing space stays out of the link.
+        let number_style = Style::default().fg(p.yellow);
         let mut spans = vec![
             Span::styled(lead, Style::default().fg(mark_color).add_modifier(Modifier::BOLD)),
-            Span::styled(number, Style::default().fg(p.yellow)),
+            Span::styled(
+                number.trim_end().to_string(),
+                app.link(number_style, entry.url.as_deref()),
+            ),
+            Span::styled(" ", number_style),
             Span::styled(state, Style::default().fg(color)),
             Span::styled(title, title_style),
         ];
@@ -4706,11 +4722,12 @@ fn pr_checks_header(s: &forge::PrSnapshot) -> String {
 /// One comment row: `@author anchor` (a review's verdict in place of the bare `review`
 /// word), then a trailing reply count and `resolved`/`outdated` marker or the age.
 fn pr_comment_row(
+    app: &App,
     cm: &forge::Comment,
     width: usize,
     now: std::time::SystemTime,
-    p: &Palette,
 ) -> Vec<Span<'static>> {
+    let p = app.palette();
     let author_color = if cm.author_is_bot { p.dim1 } else { p.orange };
     let status = if cm.is_resolved {
         "resolved".to_string()
@@ -4734,9 +4751,14 @@ fn pr_comment_row(
         None => (cm.anchor.clone(), text_style(p)),
     };
     let anchor = elide_head(&anchor, budget);
+    // The author leads to their profile and the anchor to the comment; the trailing space
+    // after the name stays out of the link.
+    let name = author.trim_end().to_string();
+    let author_style = Style::default().fg(author_color);
     vec![
-        Span::styled(author, Style::default().fg(author_color)),
-        Span::styled(anchor, anchor_style),
+        Span::styled(name, app.link(author_style, cm.links.author.as_deref())),
+        Span::styled(" ", author_style),
+        Span::styled(anchor, app.link(anchor_style, cm.links.permalink.as_deref())),
         Span::styled(format!("  {trailing}"), Style::default().fg(p.dim2)),
     ]
 }
@@ -4883,22 +4905,35 @@ fn push_comment_rule(lines: &mut Vec<Line<'static>>, width: usize, p: &Palette) 
     lines.push(Line::from(Span::styled("─".repeat(width.max(1)), Style::default().fg(p.dim2))));
 }
 
+/// One turn's byline: `@author`, linked to their profile, and the age, linked to the turn's
+/// own page on the forge.
 fn push_comment_byline(
     lines: &mut Vec<Line<'static>>,
-    author: &str,
-    is_bot: bool,
-    created_at: &str,
+    app: &App,
+    turn: &Turn<'_>,
     now: std::time::SystemTime,
     p: &Palette,
 ) {
-    let author_color = if is_bot { p.dim1 } else { p.orange };
-    let mut spans = vec![Span::styled(format!("@{author}"), Style::default().fg(author_color))];
-    let age = relative_age(created_at, now);
+    let author_color = if turn.bot { p.dim1 } else { p.orange };
+    let author = app.link(Style::default().fg(author_color), turn.links.author.as_deref());
+    let mut spans = vec![Span::styled(format!("@{}", turn.author), author)];
+    let age = relative_age(turn.created, now);
     if !age.is_empty() {
         spans.push(Span::styled(SEP, Style::default().fg(p.dim2)));
-        spans.push(Span::styled(age, Style::default().fg(p.dim2)));
+        let style = app.link(Style::default().fg(p.dim2), turn.links.permalink.as_deref());
+        spans.push(Span::styled(age, style));
     }
     lines.push(Line::from(spans));
+}
+
+/// One turn of a card — the root comment or a reply — as its byline and body paint it.
+struct Turn<'a> {
+    author: &'a str,
+    bot: bool,
+    created: &'a str,
+    body: &'a str,
+    avatar: Option<&'a str>,
+    links: &'a forge::Links,
 }
 
 /// The PR read pane's painted content — one builder shared by the renderer and the
@@ -4963,26 +4998,27 @@ fn build_card(app: &App, cm: &forge::Comment, cw: usize, p: &Palette) -> Card {
         snippets: snippet.into_iter().collect(),
     };
     let now = std::time::SystemTime::now();
-    let root = (
-        cm.author.as_str(),
-        cm.author_is_bot,
-        cm.created_at.as_str(),
-        cm.body.as_str(),
-        cm.avatar_url.as_deref(),
-    );
+    let root = Turn {
+        author: &cm.author,
+        bot: cm.author_is_bot,
+        created: &cm.created_at,
+        body: &cm.body,
+        avatar: cm.avatar_url.as_deref(),
+        links: &cm.links,
+    };
     let turns: Vec<_> = std::iter::once(root)
-        .chain(cm.replies.iter().map(|r| {
-            (
-                r.author.as_str(),
-                r.author_is_bot,
-                r.created_at.as_str(),
-                r.body.as_str(),
-                r.avatar_url.as_deref(),
-            )
+        .chain(cm.replies.iter().map(|r| Turn {
+            author: &r.author,
+            bot: r.author_is_bot,
+            created: &r.created_at,
+            body: &r.body,
+            avatar: r.avatar_url.as_deref(),
+            links: &r.links,
         }))
         .collect();
     let last = turns.len() - 1;
-    for (t, (author, bot, created, body, avatar)) in turns.into_iter().enumerate() {
+    for (t, turn) in turns.into_iter().enumerate() {
+        let (bot, body, avatar) = (turn.bot, turn.body, turn.avatar);
         let after = if t < last { Rail::Line } else { Rail::Blank };
         if t > 0 {
             card.lines.push((Line::raw(""), Rail::Line));
@@ -4990,7 +5026,7 @@ fn build_card(app: &App, cm: &forge::Comment, cw: usize, p: &Palette) -> Card {
         // Every turn is byline then body. The byline names who spoke and when, including
         // the root, so a reply cannot look like the next paragraph of the same comment.
         let mut byline = Vec::new();
-        push_comment_byline(&mut byline, author, bot, created, now, p);
+        push_comment_byline(&mut byline, app, &turn, now, p);
         let dot = if bot { p.dim1 } else { p.orange };
         if let Some(url) = avatar {
             card.avatars.push((card.lines.len(), url.to_string()));
@@ -5152,6 +5188,7 @@ fn push_card_edge(
 /// A folded card: its header in the top border and a one-line summary — the root's author
 /// and first line, dimmed — in the bottom border, so the closed thread still says what it was.
 fn push_folded_card(
+    app: &App,
     content: &mut PrReadContent,
     header: Vec<Span<'static>>,
     cm: &forge::Comment,
@@ -5161,8 +5198,8 @@ fn push_folded_card(
 ) {
     push_card_edge(content, true, header, width, selected, p);
     let author_color = if cm.author_is_bot { p.dim1 } else { p.orange };
-    let mut summary =
-        vec![Span::styled(format!("@{}", cm.author), Style::default().fg(author_color))];
+    let author = app.link(Style::default().fg(author_color), cm.links.author.as_deref());
+    let mut summary = vec![Span::styled(format!("@{}", cm.author), author)];
     if let Some(first) = cm.body.lines().map(str::trim).find(|l| !l.is_empty()) {
         summary.push(Span::styled(format!(" {first}"), Style::default().fg(p.dim2)));
     }
@@ -5197,13 +5234,15 @@ fn push_heavy_rule(lines: &mut Vec<Line<'static>>, label: &str, width: usize, p:
 
 /// One comment card's header: what it is anchored to (a finding's `path:line` with its
 /// thread state, a review's verdict, or `comment`). The selected card's header carries the
-/// accent with its border, so the reader can see which card the navigator points at.
-fn card_header(cm: &forge::Comment, selected: bool, p: &Palette) -> Vec<Span<'static>> {
+/// accent with its border, so the reader can see which card the navigator points at. The
+/// anchor links to the comment's page on the forge.
+fn card_header(app: &App, cm: &forge::Comment, selected: bool, p: &Palette) -> Vec<Span<'static>> {
     let base = if selected {
         Style::default().fg(p.blue).add_modifier(Modifier::BOLD)
     } else {
         text_style(p).add_modifier(Modifier::BOLD)
     };
+    let base = app.link(base, cm.links.permalink.as_deref());
     let dim = Style::default().fg(p.dim2);
     let mut spans = Vec::new();
     match (cm.kind, cm.review_state) {
@@ -5310,7 +5349,7 @@ fn pr_read_content(app: &App, inner: Rect) -> PrReadContent {
         // The box's top line is the card's top: a selection scrolls its border to the edge.
         content.tops.push(content.lines.len());
         let selected = app.pr_cursor == i + offset;
-        let mut header = card_header(cm, selected, p);
+        let mut header = card_header(app, cm, selected, p);
         if !cm.is_collapsible() {
             let card = build_card(app, cm, cw, p);
             push_card(&mut content, header, card, width, selected, app.avatar_geometry(), p);
@@ -5321,7 +5360,7 @@ fn pr_read_content(app: &App, inner: Rect) -> PrReadContent {
         let head = content.lines.len();
         content.toggles.push((head, cm.key()));
         if collapsed {
-            push_folded_card(&mut content, header, cm, width, selected, p);
+            push_folded_card(app, &mut content, header, cm, width, selected, p);
             content.toggles.push((head + 1, cm.key()));
         } else {
             let card = build_card(app, cm, cw, p);
@@ -5382,6 +5421,7 @@ fn render_pr_read(frame: &mut Frame, app: &App, pane: Pane) {
     }
     note_pr_read_folds(app, &content, body, scroll);
     frame.render_widget(Paragraph::new(content.lines).scroll((saturating_row(scroll), 0)), body);
+    app.tag_painted_links(frame.buffer_mut());
     render_overflow_scrollbar(
         frame,
         Rect::new(pane.track_x, body.y, 1, body.height),

@@ -163,6 +163,8 @@ pub struct StackEntry {
     pub is_draft: bool,
     pub head_ref: String,
     pub base_ref: String,
+    /// The PR's web page, when the read named one.
+    pub url: Option<String>,
     /// Steps from the current PR: below it (toward the trunk) negative, the current one
     /// zero, above it positive. Two PRs stacked on one branch share a level.
     pub level: i32,
@@ -203,6 +205,8 @@ pub enum Sync {
 pub struct Check {
     pub name: String,
     pub status: CheckStatus,
+    /// The run's details page (a CI job, a status's target), when the forge names one.
+    pub url: Option<String>,
 }
 
 /// A check's outcome, normalised across check runs and commit statuses.
@@ -240,6 +244,16 @@ pub struct Comment {
     /// The author's avatar image URL as the forge names it — a string only: the PR fetch
     /// never downloads it (the avatar worker does, after the snapshot paints).
     pub avatar_url: Option<String>,
+    /// Where the comment and its author live on the forge, for the painted links.
+    pub links: Links,
+}
+
+/// A comment's or reply's web pages: the comment itself and its author's profile — each
+/// `None` when the forge names none, which paints plain text.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Links {
+    pub permalink: Option<String>,
+    pub author: Option<String>,
 }
 
 /// A comment's identity across snapshots: who posted it, when, and where. A refresh that
@@ -276,6 +290,8 @@ pub struct Reply {
     pub created_at: String,
     /// The author's avatar image URL, as on [`Comment::avatar_url`].
     pub avatar_url: Option<String>,
+    /// As on [`Comment::links`].
+    pub links: Links,
 }
 
 /// What a comment is anchored to.
@@ -1209,12 +1225,12 @@ fn build_batch_query(numbers: &[u64]) -> String {
 const PR_DETAIL_FIELDS: &str = "number title url body isDraft state mergeable mergeStateStatus baseRefName headRefName \
          headRefOid isCrossRepository \
          commits(last:1){nodes{commit{statusCheckRollup{contexts(first:100){pageInfo{hasNextPage} nodes{__typename \
-         ... on CheckRun{name status conclusion} ... on StatusContext{context state}}}}}}} \
-         reviews(last:100){pageInfo{hasPreviousPage} nodes{author{login avatarUrl(size:64)} body state submittedAt}} \
-         comments(last:100){pageInfo{hasPreviousPage} nodes{author{login avatarUrl(size:64)} body createdAt}} \
+         ... on CheckRun{name status conclusion detailsUrl url} ... on StatusContext{context state targetUrl}}}}}}} \
+         reviews(last:100){pageInfo{hasPreviousPage} nodes{author{login avatarUrl(size:64) url} body state submittedAt url}} \
+         comments(last:100){pageInfo{hasPreviousPage} nodes{author{login avatarUrl(size:64) url} body createdAt url}} \
          reviewThreads(last:100){pageInfo{hasPreviousPage} nodes{id isResolved isOutdated path \
          startLine line originalStartLine originalLine diffSide \
-         comments(first:100){pageInfo{hasNextPage endCursor} nodes{author{login avatarUrl(size:64)} body createdAt diffHunk}}}}";
+         comments(first:100){pageInfo{hasNextPage endCursor} nodes{author{login avatarUrl(size:64) url} body createdAt diffHunk url}}}}";
 
 /// What a stack read decides for the snapshot. The stack is secondary: a failed read lists
 /// no stack and never costs the PR its snapshot. Only a cancelled fetch propagates, since
@@ -1311,7 +1327,8 @@ impl StackWalk {
         if self.down.is_none() && self.up.is_empty() {
             return None;
         }
-        let fields = "nodes{number title state isDraft headRefName baseRefName isCrossRepository}";
+        let fields =
+            "nodes{number title url state isDraft headRefName baseRefName isCrossRepository}";
         let mut decl = String::from("query($o:String!,$n:String!");
         let mut body = String::new();
         let mut vars = Vec::new();
@@ -1411,6 +1428,7 @@ fn stack_entry(node: &Value, level: i32) -> Option<StackEntry> {
         is_draft: node["isDraft"].as_bool().unwrap_or(false),
         head_ref: node["headRefName"].as_str().unwrap_or_default().to_string(),
         base_ref: node["baseRefName"].as_str().unwrap_or_default().to_string(),
+        url: web_url(&node["url"]),
         level,
     })
 }
@@ -1603,7 +1621,12 @@ fn normalize_checks(rollup: &Value) -> Vec<Check> {
             continue;
         }
         let status = check_status(node);
-        upsert_latest(&mut out, Check { name, status });
+        // A check run's details page is where its CI shows the run; GitHub's own check page
+        // stands in when the run names none. A commit status names its target.
+        let url = web_url(&node["detailsUrl"])
+            .or_else(|| web_url(&node["url"]))
+            .or_else(|| web_url(&node["targetUrl"]));
+        upsert_latest(&mut out, Check { name, status, url });
     }
     out
 }
@@ -1647,6 +1670,7 @@ fn merge_comments(reviews: &Value, issues: &Value, threads: &Value) -> Vec<Comme
         let mut row =
             prose_comment(CommentKind::Review, &r["author"], body, r["submittedAt"].as_str());
         row.review_state = state;
+        row.links = github_links(r);
         out.push(row);
     }
 
@@ -1656,7 +1680,10 @@ fn merge_comments(reviews: &Value, issues: &Value, threads: &Value) -> Vec<Comme
         if body.is_empty() {
             continue;
         }
-        out.push(prose_comment(CommentKind::Comment, &c["author"], body, c["createdAt"].as_str()));
+        let mut row =
+            prose_comment(CommentKind::Comment, &c["author"], body, c["createdAt"].as_str());
+        row.links = github_links(c);
+        out.push(row);
     }
 
     // Inline review threads (the `finding` cards), with resolved/outdated and replies.
@@ -1698,6 +1725,7 @@ fn merge_comments(reviews: &Value, issues: &Value, threads: &Value) -> Vec<Comme
             is_outdated: t["isOutdated"].as_bool().unwrap_or(false),
             replies: replies_from_nodes(&nodes[root_i..]),
             avatar_url: avatar_url(&root["author"]["avatarUrl"]),
+            links: github_links(root),
         });
     }
 
@@ -1720,6 +1748,45 @@ fn prose_comment(
 
 /// An avatar URL field, kept only when it is an `http(s)` URL — anything else stays a dot.
 pub(crate) fn avatar_url(value: &Value) -> Option<String> {
+    web_url(value)
+}
+
+/// A branch's page in the repository a PR's `pr_url` lives in — GitHub's `/tree/<branch>`,
+/// GitLab's `/-/tree/<branch>`, Azure DevOps' `?version=GB<branch>` — or `None` when the PR
+/// URL is not the forge's PR page shape or the branch is empty. A fork head lives elsewhere;
+/// the caller leaves it unlinked.
+#[must_use]
+pub fn branch_url(forge: crate::git::Forge, pr_url: &str, branch: &str) -> Option<String> {
+    use crate::git::Forge;
+    if branch.is_empty() || crate::hyperlink::safe_url(pr_url).is_none() {
+        return None;
+    }
+    let marker = match forge {
+        Forge::GitHub => "/pull/",
+        Forge::GitLab => "/-/merge_requests/",
+        Forge::AzureDevOps => "/pullrequest/",
+    };
+    let cut = pr_url.rfind(marker)?;
+    let (repo, number) = (&pr_url[..cut], &pr_url[cut + marker.len()..]);
+    if number.is_empty() || !number.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    // A branch name's `/` separators stay path separators; everything else is encoded.
+    let path = branch.split('/').map(urlencode).collect::<Vec<_>>().join("/");
+    Some(match forge {
+        Forge::GitHub => format!("{repo}/tree/{path}"),
+        Forge::GitLab => format!("{repo}/-/tree/{path}"),
+        Forge::AzureDevOps => format!("{repo}?version=GB{}", urlencode(branch)),
+    })
+}
+
+/// A GitHub comment, review, or review comment node's permalink and its author's profile.
+fn github_links(node: &Value) -> Links {
+    Links { permalink: web_url(&node["url"]), author: web_url(&node["author"]["url"]) }
+}
+
+/// A web page URL field, kept only when it is an `http(s)` URL — anything else links nowhere.
+pub(crate) fn web_url(value: &Value) -> Option<String> {
     value
         .as_str()
         .map(str::trim)
@@ -1797,6 +1864,7 @@ pub(crate) fn prose_row(
         is_outdated: false,
         replies: Vec::new(),
         avatar_url: None,
+        links: Links::default(),
     }
 }
 
@@ -1817,6 +1885,7 @@ fn replies_from_nodes(nodes: &[Value]) -> Vec<Reply> {
                 body: body.to_string(),
                 created_at: n["createdAt"].as_str().unwrap_or("").to_string(),
                 avatar_url: avatar_url(&n["author"]["avatarUrl"]),
+                links: github_links(n),
             })
         })
         .collect()
@@ -2013,7 +2082,10 @@ mod tests {
             base_ref: String::new(),
             merge: Merge::Clean,
             sync: Sync::InSync,
-            checks: statuses.iter().map(|&s| Check { name: "c".into(), status: s }).collect(),
+            checks: statuses
+                .iter()
+                .map(|&s| Check { name: "c".into(), status: s, url: None })
+                .collect(),
             comments: Vec::new(),
             comments_truncated: false,
             checks_truncated: false,
@@ -2589,7 +2661,102 @@ mod tests {
         assert_eq!(cs[2].replies[0].avatar_url.as_deref(), Some("https://avatars.example/dan"));
         // The query asks for small avatars on every author it reads.
         let query = build_detail_query(1);
-        assert_eq!(query.matches("author{login avatarUrl(size:64)}").count(), 3, "{query}");
+        assert_eq!(query.matches("author{login avatarUrl(size:64) url}").count(), 3, "{query}");
+    }
+
+    #[test]
+    fn every_surface_links_its_page_and_author_and_each_check_its_run() {
+        let author = |login: &str| serde_json::json!({"login": login, "url": format!("https://github.com/{login}")});
+        let reviews = serde_json::json!([{"author": author("ann"), "state": "APPROVED",
+            "body": "", "submittedAt": "2026-06-27T09:00:00Z",
+            "url": "https://github.com/o/r/pull/1#pullrequestreview-1"}]);
+        let issues = serde_json::json!([{"author": author("bob"), "body": "hi",
+            "createdAt": "2026-06-27T10:00:00Z",
+            "url": "https://github.com/o/r/pull/1#issuecomment-2"}]);
+        let threads = serde_json::json!([{"path": "a.rs", "line": 1, "comments": {"nodes": [
+            {"author": author("cat"), "body": "root", "createdAt": "2026-06-27T11:00:00Z",
+             "url": "https://github.com/o/r/pull/1#discussion_r3"},
+            {"author": {"login": "dan", "url": "javascript:alert(1)"}, "body": "reply",
+             "createdAt": "2026-06-27T11:30:00Z", "url": "https://github.com/o/r/pull/1#discussion_r4"}
+        ]}}]);
+        let cs = merge_comments(&reviews, &issues, &threads);
+        let links: Vec<_> =
+            cs.iter().map(|c| (c.links.permalink.as_deref(), c.links.author.as_deref())).collect();
+        assert_eq!(
+            links,
+            [
+                (
+                    Some("https://github.com/o/r/pull/1#pullrequestreview-1"),
+                    Some("https://github.com/ann")
+                ),
+                (
+                    Some("https://github.com/o/r/pull/1#issuecomment-2"),
+                    Some("https://github.com/bob")
+                ),
+                (
+                    Some("https://github.com/o/r/pull/1#discussion_r3"),
+                    Some("https://github.com/cat")
+                ),
+            ]
+        );
+        let reply = &cs[2].replies[0].links;
+        assert_eq!(reply.permalink.as_deref(), Some("https://github.com/o/r/pull/1#discussion_r4"));
+        assert_eq!(reply.author, None, "a non-http profile links nowhere");
+
+        let rollup = serde_json::json!([
+            {"__typename": "CheckRun", "name": "build", "status": "COMPLETED", "conclusion": "SUCCESS",
+             "detailsUrl": "https://ci.example/build/7", "url": "https://github.com/o/r/runs/7"},
+            {"__typename": "CheckRun", "name": "lint", "status": "COMPLETED", "conclusion": "SUCCESS",
+             "detailsUrl": null, "url": "https://github.com/o/r/runs/8"},
+            {"__typename": "StatusContext", "context": "deploy", "state": "SUCCESS",
+             "targetUrl": "https://deploy.example/9"},
+            {"__typename": "StatusContext", "context": "bare", "state": "SUCCESS"}
+        ]);
+        let urls: Vec<_> = normalize_checks(&rollup).into_iter().map(|c| c.url).collect();
+        assert_eq!(
+            urls,
+            [
+                Some("https://ci.example/build/7".to_string()),
+                Some("https://github.com/o/r/runs/8".to_string()),
+                Some("https://deploy.example/9".to_string()),
+                None,
+            ]
+        );
+        let query = build_detail_query(1);
+        for field in ["detailsUrl", "targetUrl", "createdAt url}", "submittedAt url}"] {
+            assert!(query.contains(field), "{field} in {query}");
+        }
+    }
+
+    #[test]
+    fn a_stack_row_carries_its_prs_page() {
+        let node = serde_json::json!({"number": 5, "url": "https://github.com/o/r/pull/5"});
+        let entry = stack_entry(&node, 1).unwrap();
+        assert_eq!(entry.url.as_deref(), Some("https://github.com/o/r/pull/5"));
+        assert_eq!(stack_entry(&serde_json::json!({"number": 6}), 1).unwrap().url, None);
+    }
+
+    #[test]
+    fn a_branch_page_follows_each_forges_pr_url_shape() {
+        use crate::git::Forge;
+        let gh = "https://github.com/o/r/pull/12";
+        assert_eq!(
+            branch_url(Forge::GitHub, gh, "feat/a b").as_deref(),
+            Some("https://github.com/o/r/tree/feat/a%20b")
+        );
+        let gl = "https://gitlab.com/g/sub/r/-/merge_requests/3";
+        assert_eq!(
+            branch_url(Forge::GitLab, gl, "feat/x").as_deref(),
+            Some("https://gitlab.com/g/sub/r/-/tree/feat/x")
+        );
+        let az = "https://dev.azure.com/org/proj/_git/repo/pullrequest/7";
+        assert_eq!(
+            branch_url(Forge::AzureDevOps, az, "feat/x").as_deref(),
+            Some("https://dev.azure.com/org/proj/_git/repo?version=GBfeat%2Fx")
+        );
+        assert_eq!(branch_url(Forge::GitHub, gh, ""), None, "no branch, no link");
+        assert_eq!(branch_url(Forge::GitHub, "u", "main"), None, "not a PR page");
+        assert_eq!(branch_url(Forge::GitLab, gh, "main"), None, "another forge's shape");
     }
 
     #[test]
@@ -2762,6 +2929,7 @@ mod tests {
             is_outdated: false,
             replies: Vec::new(),
             avatar_url: None,
+            links: Links::default(),
         };
         let mut out = vec![
             row(CommentKind::Review, "review", "approved", ""),

@@ -7,6 +7,23 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ## [Unreleased]
 
 ### Added
+- **The PR tab links to the forge (OSC 8 hyperlinks).** Authors lead to their profiles, a
+  byline's age and a card's `path:line`/`review`/`comment` header to that comment, a check
+  to its run, the header's title, chip, and branch and a stack row's `#N` to that PR and
+  branch, and markdown links (PR tab and file preview) to their targets. The fetches ask for
+  the URLs in the queries they already make: GitHub's comment, review, and author `url`, a
+  check run's `detailsUrl` (or its own page) and a status's `targetUrl`; GitLab's note
+  anchors, author `web_url`, and job and pipeline `web_url`; Azure DevOps' thread
+  `discussionId` links and status `targetUrl`. A forge that names no page leaves the text
+  plain. `hyperlinks = false` turns them off.
+  A link never touches a cell's text: the paint tags linked cells, the tags are stripped
+  before ratatui diffs the frame, and a backend wrapping crossterm writes the OSC 8 open and
+  close around each run of cells it prints. It keeps a shadow of the terminal, so a link that
+  changed under unchanged text is printed again, and every flush closes its last link.
+  Widths, the diffed redraw, the emoji settling, and the avatar cells are untouched. Replaying
+  the real escape stream through a terminal model shows no drifted cell and every cell's
+  link correct across scrolling, a selection move, a link-only refresh, switching links off
+  and on, and a tab switch.
 - **Browse a PR stack without checking anything out.** Stack rows on the PR tab are cursor
   stops. `Enter` or a click views that PR's state, checks, description, and conversation. The
   header reads `viewing #12 · not checked out`, and `o` opens it. The shown PR's stack row is

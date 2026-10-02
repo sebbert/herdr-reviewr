@@ -830,6 +830,11 @@ pub struct App {
     /// The link regions painted this frame — a click resolves against the painted
     /// frame.
     painted_links: std::cell::RefCell<Vec<PaintedLink>>,
+    /// This frame's hyperlink URLs, each named by the tag its cells are painted with
+    /// (`hyperlink.rs`).
+    link_table: std::cell::RefCell<crate::hyperlink::LinkTable>,
+    /// The OSC 8 runs the frame on screen carries, settled from the tags after its paint.
+    painted_hyperlinks: std::cell::RefCell<Vec<crate::hyperlink::LinkRun>>,
     /// Every avatar this session asked for, keyed by URL (`crate::avatar`). Session memory:
     /// a config recovery carries it, so nothing transmitted is ever orphaned.
     pub avatars: crate::avatar::Store,
@@ -1102,6 +1107,8 @@ impl App {
             preview_scrolled: false,
             pane_width: std::cell::Cell::new(0),
             painted_links: std::cell::RefCell::new(Vec::new()),
+            link_table: std::cell::RefCell::new(crate::hyperlink::LinkTable::default()),
+            painted_hyperlinks: std::cell::RefCell::new(Vec::new()),
             avatars: crate::avatar::Store::default(),
             avatar_graphics: None,
             avatar_cell: None,
@@ -2156,6 +2163,7 @@ impl App {
     /// pane's display-line layout; the renderer calls this each frame.
     pub(crate) fn clear_painted_frame(&self) {
         self.painted_links.borrow_mut().clear();
+        self.link_table.borrow_mut().clear();
         self.painted_anchors.borrow_mut().clear();
         self.painted_details.borrow_mut().clear();
         self.painted_card_toggles.borrow_mut().clear();
@@ -2174,6 +2182,43 @@ impl App {
     #[must_use]
     pub(crate) fn painted_slots(&self) -> Vec<crate::ui::Slot> {
         self.painted_slots.borrow().clone()
+    }
+
+    /// `style` tagged to carry an OSC 8 link to `url` (`hyperlink.rs`); unchanged without one.
+    pub(crate) fn link(
+        &self,
+        style: ratatui::style::Style,
+        url: Option<&str>,
+    ) -> ratatui::style::Style {
+        self.link_table.borrow_mut().tag(style, url)
+    }
+
+    /// Strip the frame's link tags from `buf` and keep the runs they marked — none while
+    /// `hyperlinks` is off. The renderer calls this once the frame is painted.
+    pub(crate) fn settle_hyperlinks(&self, buf: &mut ratatui::buffer::Buffer) {
+        let runs = crate::hyperlink::settle(buf, &self.link_table.borrow());
+        *self.painted_hyperlinks.borrow_mut() = if self.hyperlinks() { runs } else { Vec::new() };
+    }
+
+    /// Tag the markdown links noted so far onto the cells just painted under them, so they
+    /// carry OSC 8 like every other linked text. The painters call this right after the
+    /// body paints, before anything (a popup) can paint over it.
+    pub(crate) fn tag_painted_links(&self, buf: &mut ratatui::buffer::Buffer) {
+        for l in self.painted_links.borrow().iter() {
+            let style = self.link(ratatui::style::Style::default(), Some(&l.url));
+            let Some(tag) = style.underline_color else { continue };
+            for x in l.x_start..l.x_end {
+                if let Some(cell) = buf.cell_mut((x, l.y)) {
+                    cell.underline_color = tag;
+                }
+            }
+        }
+    }
+
+    /// The OSC 8 runs of the frame last painted, for the backend that flushes it.
+    #[must_use]
+    pub fn painted_hyperlinks(&self) -> Vec<crate::hyperlink::LinkRun> {
+        self.painted_hyperlinks.borrow().clone()
     }
 
     /// Note one painted link region, in absolute screen cells.
@@ -2341,6 +2386,13 @@ impl App {
     #[must_use]
     pub fn pane_outer_borders(&self) -> bool {
         self.plugin_config().is_none_or(crate::config::PluginConfig::pane_outer_borders)
+    }
+
+    /// Whether the painted frame carries OSC 8 hyperlinks — the config's `hyperlinks`, on
+    /// while the config is blocked (its screen carries none anyway).
+    #[must_use]
+    pub fn hyperlinks(&self) -> bool {
+        self.plugin_config().is_none_or(crate::config::PluginConfig::hyperlinks)
     }
 
     /// Whether the PR navigator rules its sections apart — the config's `pr_nav_separators`,
