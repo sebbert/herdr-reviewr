@@ -1,9 +1,11 @@
 //! PR stack ranges and trees: what a stack PR (or the stack's base) resolves to locally, and
 //! the opt-in fetch that brings a stack PR's head into reviewr's private refs.
 //!
-//! An end is a stack PR by number, or the trunk the bottom PR targets. Its commit is read
-//! from refs that already exist — the PR's local branch, then its `origin/` tracking branch,
-//! then reviewr's own fetched ref, then the forge's head oid if that object is present.
+//! An end is a stack PR by number, or the trunk the bottom PR targets. A PR means the PR as
+//! its reviewers see it: the forge's head commit when that object is present, then its
+//! `origin/` tracking branch, then reviewr's own fetched ref. The local branch of the same
+//! name is used only when the reader asks for it on that row; the checked-out PR is always
+//! the worktree's `HEAD`.
 //! Nothing here checks out, stages, or moves a branch. The one write is
 //! [`fetch_stack_heads`], and only with `stack_fetch = true`: refs under
 //! `refs/worktree/reviewr/stack/` and the objects they bring into the store.
@@ -25,6 +27,18 @@ pub enum StackEnd {
     Pr(u64),
 }
 
+/// Which commit a PR end stands for.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum EndSource {
+    /// The PR as the forge reports it (the base: its trunk).
+    #[default]
+    Pr,
+    /// The local branch of the PR's head name, by the reader's choice on that row.
+    Local,
+    /// The checked-out PR: the worktree's `HEAD`.
+    Worktree,
+}
+
 /// What one end is and how to find it: the identity, the label the header paints, the
 /// branch it names on the forge, and the forge's head commit for a PR when the read named one.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -37,26 +51,37 @@ pub struct EndSpec {
     /// The forge's head commit for a PR, from the latest read of it. `None` for the base, or
     /// a PR not read yet.
     pub head_oid: Option<String>,
+    /// Which commit the end stands for.
+    pub source: EndSource,
 }
 
 impl EndSpec {
-    /// The ref spellings tried, in order. A PR prefers the local branch — a stack is
-    /// authored locally, and an unpushed commit is part of it — then its `origin/` tracking
-    /// branch, then reviewr's fetched ref. The base prefers `origin/`: the trunk moves on the
-    /// forge, and a stale local trunk would push the merge-base back and pull trunk commits
-    /// into the diff.
+    /// The ref spellings tried after the forge's head, in order. A PR's `origin/` tracking
+    /// branch, then reviewr's fetched ref: a stale local branch of the same name never
+    /// stands in for the PR. The base prefers `origin/`: the trunk moves on the forge, and a
+    /// stale local trunk would push the merge-base back and pull trunk commits into the diff.
     #[must_use]
     pub fn candidates(&self) -> Vec<String> {
         let b = &self.branch;
-        match self.end {
-            StackEnd::Pr(n) => {
-                vec![
-                    format!("refs/heads/{b}"),
-                    format!("refs/remotes/origin/{b}"),
-                    git::stack_ref(n),
-                ]
+        match (self.end, self.source) {
+            (_, EndSource::Worktree) => vec!["HEAD".to_string()],
+            (StackEnd::Pr(_), EndSource::Local) => vec![format!("refs/heads/{b}")],
+            (StackEnd::Pr(n), EndSource::Pr) => {
+                vec![format!("refs/remotes/origin/{b}"), git::stack_ref(n)]
             }
-            StackEnd::Base => vec![format!("refs/remotes/origin/{b}"), format!("refs/heads/{b}")],
+            (StackEnd::Base, _) => {
+                vec![format!("refs/remotes/origin/{b}"), format!("refs/heads/{b}")]
+            }
+        }
+    }
+
+    /// The same end as the PR itself, for a local branch that is gone.
+    #[must_use]
+    pub fn as_pr(&self) -> Self {
+        Self {
+            label: self.label.trim_end_matches(" (local)").to_string(),
+            source: EndSource::Pr,
+            ..self.clone()
         }
     }
 
@@ -72,23 +97,46 @@ impl EndSpec {
 pub struct Resolved {
     pub oid: String,
     pub via: String,
+    /// The end asked for its local branch, which is gone: it shows the PR head instead.
+    pub local_gone: bool,
 }
 
-/// Resolve `spec` from what the repository already holds, in [`EndSpec::candidates`] order,
-/// then the forge's head oid if that commit is present. `None` when nothing local names it:
-/// the not-fetched state.
+/// Resolve `spec` from what the repository already holds: a PR's forge head if that commit
+/// is present, then [`EndSpec::candidates`] in order. A local end whose branch is gone falls
+/// back to the PR, marked. `None` when nothing local names it: the not-fetched state.
 pub fn resolve(repo: &Path, spec: &EndSpec) -> Option<Resolved> {
+    if spec.source == EndSource::Local {
+        return resolve_refs(repo, spec)
+            .or_else(|| resolve(repo, &spec.as_pr()).map(|r| Resolved { local_gone: true, ..r }));
+    }
+    if spec.source == EndSource::Pr
+        && let Some(oid) = spec.head_oid.as_deref().filter(|o| git::commit_exists(repo, o))
+    {
+        return Some(Resolved {
+            oid: oid.to_string(),
+            via: format!("{} head", spec.label),
+            local_gone: false,
+        });
+    }
+    resolve_refs(repo, spec)
+}
+
+fn resolve_refs(repo: &Path, spec: &EndSpec) -> Option<Resolved> {
     for candidate in spec.candidates() {
         if let Ok(Some(oid)) = git::resolve_commit(repo, &candidate) {
-            let via = candidate
-                .strip_prefix("refs/heads/")
-                .or_else(|| candidate.strip_prefix("refs/remotes/"))
-                .map_or_else(|| format!("{} fetched", spec.label), str::to_string);
-            return Some(Resolved { oid, via });
+            let via = if candidate == "HEAD" {
+                "worktree".to_string()
+            } else {
+                candidate
+                    .strip_prefix("refs/heads/")
+                    .map(|b| format!("local {b}"))
+                    .or_else(|| candidate.strip_prefix("refs/remotes/").map(str::to_string))
+                    .unwrap_or_else(|| format!("{} fetched", spec.label))
+            };
+            return Some(Resolved { oid, via, local_gone: false });
         }
     }
-    let oid = spec.head_oid.as_deref().filter(|o| git::commit_exists(repo, o))?;
-    Some(Resolved { oid: oid.to_string(), via: git::abbreviate_oid(oid) })
+    None
 }
 
 /// A picked stack range, frozen at the pick: both ends' specs and the commits they resolved
@@ -162,6 +210,63 @@ impl TreeSource {
         self.at.is_some()
             && resolve(repo, &self.spec).map(|r| r.oid) != self.at.as_ref().map(|r| r.oid.clone())
     }
+}
+
+/// A stack PR's local branch where it differs from the PR head: its tip, and how far it is
+/// ahead of and behind the PR head, when the PR head is in the store.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LocalBranch {
+    pub oid: String,
+    pub counts: Option<(u32, u32)>,
+}
+
+impl LocalBranch {
+    /// The row's badge: `local +2 -3`, or `local` when the PR head is not in the store.
+    #[must_use]
+    pub fn badge(&self) -> String {
+        match self.counts {
+            Some((ahead, behind)) => format!("local +{ahead} -{behind}"),
+            None => "local".to_string(),
+        }
+    }
+}
+
+/// Ahead/behind counts by `(local, pr)` commit pair: a pair's counts never change, so each is
+/// computed once per session, on the world worker.
+type CountCache = std::collections::HashMap<(String, String), (u32, u32)>;
+static COUNTS: std::sync::LazyLock<std::sync::Mutex<CountCache>> =
+    std::sync::LazyLock::new(Default::default);
+
+/// Each stack PR whose local branch of the same name exists and differs from the PR head,
+/// read in one `for-each-ref` plus a cached `rev-list --left-right --count` per new pair.
+/// Runs inside the world build, never on the frame loop.
+pub fn local_branches(repo: &Path, prs: &[EndSpec]) -> std::collections::HashMap<u64, LocalBranch> {
+    let mut out = std::collections::HashMap::new();
+    if prs.is_empty() {
+        return out;
+    }
+    let tips = git::local_branch_tips(repo);
+    for spec in prs {
+        let StackEnd::Pr(n) = spec.end else { continue };
+        let Some(local) = tips.get(&spec.branch) else { continue };
+        let pr = resolve(repo, &spec.as_pr()).map(|r| r.oid);
+        if pr.as_deref() == Some(local.as_str()) {
+            continue;
+        }
+        let counts = pr.and_then(|pr| {
+            let key = (local.clone(), pr);
+            if let Some(c) = COUNTS.lock().ok().and_then(|m| m.get(&key).copied()) {
+                return Some(c);
+            }
+            let c = git::ahead_behind(repo, &key.0, &key.1)?;
+            if let Ok(mut m) = COUNTS.lock() {
+                m.insert(key, c);
+            }
+            Some(c)
+        });
+        out.insert(n, LocalBranch { oid: local.clone(), counts });
+    }
+    out
 }
 
 /// What one world build found a stack range to be: the merge-base its old side reads, and the
@@ -295,7 +400,7 @@ fn run_git_timed(repo: &Path, args: &[String], timeout: Duration) -> Result<(), 
 
 #[cfg(test)]
 mod tests {
-    use super::{EndSpec, StackEnd, fetch_args, refspec};
+    use super::{EndSource, EndSpec, StackEnd, fetch_args, refspec};
 
     fn pr(n: u64, branch: &str) -> EndSpec {
         EndSpec {
@@ -303,24 +408,33 @@ mod tests {
             label: format!("#{n}"),
             branch: branch.into(),
             head_oid: None,
+            source: EndSource::Pr,
         }
     }
 
     #[test]
-    fn a_pr_prefers_its_local_branch_then_origin_then_the_private_ref() {
+    fn a_pr_reads_as_reviewers_see_it_and_its_local_branch_only_on_request() {
+        // After the forge head (checked in `resolve`): origin, then the private ref. The
+        // same-named local branch is never a fallback.
         assert_eq!(
             pr(12, "feature-b").candidates(),
-            [
-                "refs/heads/feature-b",
-                "refs/remotes/origin/feature-b",
-                "refs/worktree/reviewr/stack/12"
-            ]
+            ["refs/remotes/origin/feature-b", "refs/worktree/reviewr/stack/12"]
         );
+        let local = EndSpec {
+            source: EndSource::Local,
+            label: "#12 (local)".into(),
+            ..pr(12, "feature-b")
+        };
+        assert_eq!(local.candidates(), ["refs/heads/feature-b"]);
+        assert_eq!(local.as_pr(), pr(12, "feature-b"));
+        let worktree = EndSpec { source: EndSource::Worktree, ..pr(11, "feature-a") };
+        assert_eq!(worktree.candidates(), ["HEAD"]);
         let base = EndSpec {
             end: StackEnd::Base,
             label: "main".into(),
             branch: "main".into(),
             head_oid: None,
+            source: EndSource::Pr,
         };
         assert_eq!(base.candidates(), ["refs/remotes/origin/main", "refs/heads/main"]);
         assert_eq!(pr(12, "feature-b").fetch_hint(), "git fetch origin feature-b");

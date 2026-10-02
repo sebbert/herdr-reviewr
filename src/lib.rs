@@ -2036,23 +2036,6 @@ pub fn handle_key(app: &mut App, key: KeyEvent, area: Rect, keymap: &Keymap) -> 
         return Ok(());
     }
 
-    // The stack picker: the movement bindings move the highlight, `enter` picks (the compared
-    // PR, then what it is compared against), the literal `p` and `b` pick this PR against its
-    // parent or the stack's base, and `esc` steps back. Every other key is inert.
-    if app.mode == Mode::StackPick {
-        let bare = key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT;
-        match (action, key.code) {
-            (_, Esc) => app.stack_picker_escape(),
-            (_, Enter) => app.stack_picker_pick()?,
-            (_, Char('p')) if bare => app.stack_picker_shortcut(false)?,
-            (_, Char('b')) if bare => app.stack_picker_shortcut(true)?,
-            (Some(K::Down), _) => app.stack_picker_move(1),
-            (Some(K::Up), _) => app.stack_picker_move(-1),
-            _ => {}
-        }
-        return Ok(());
-    }
-
     // The read-only PR tab: navigate the snapshot and open links; authoring actions are inert.
     if app.tab == crate::app::Tab::Pr {
         match (action, key.code) {
@@ -2105,6 +2088,53 @@ pub fn handle_key(app: &mut App, key: KeyEvent, area: Rect, keymap: &Keymap) -> 
         return Ok(());
     }
 
+    // The navigator's stack list holds the keyboard: the movement bindings move its
+    // highlight, `enter` activates the row, `stack-against` and `stack-local` act on it, and
+    // `esc` hands the keys back to the file list. Everything else works as anywhere.
+    if app.focus == Focus::Stack && !app.stack_list_shown() {
+        app.focus = Focus::Files;
+    }
+    if app.focus == Focus::Stack {
+        let handled = match (action, key.code) {
+            (Some(K::Down), _) => {
+                app.stack_list_move(1);
+                true
+            }
+            (Some(K::Up), _) => {
+                app.stack_list_move(-1);
+                true
+            }
+            (Some(K::PageDown | K::HalfDown), _) => {
+                app.stack_list_move(PAGE);
+                true
+            }
+            (Some(K::PageUp | K::HalfUp), _) => {
+                app.stack_list_move(-PAGE);
+                true
+            }
+            (Some(K::StackAgainst), _) => {
+                app.stack_list_against()?;
+                true
+            }
+            (Some(K::StackLocal), _) => {
+                app.stack_list_toggle_local()?;
+                true
+            }
+            (_, Enter) => {
+                app.stack_list_activate()?;
+                true
+            }
+            (_, Esc) => {
+                app.focus = Focus::Files;
+                true
+            }
+            _ => false,
+        };
+        if handled {
+            return Ok(());
+        }
+    }
+
     if let Some(action) = action {
         match action {
             K::Quit => app.should_quit = true,
@@ -2151,7 +2181,7 @@ pub fn handle_key(app: &mut App, key: KeyEvent, area: Rect, keymap: &Keymap) -> 
             K::ScopeCommits => app.set_scope(Scope::Commits)?,
             K::BasePick => app.open_base_picker(),
             K::CommitPick => app.open_commit_picker(),
-            K::StackPick => app.open_stack_picker(),
+            K::StackList => app.focus_stack_list(),
             K::Select => app.toggle_select(),
             K::Comment => app.start_comment(),
             // `edit`/`delete` act on the comment under the diff cursor, so they only fire with
@@ -2175,7 +2205,8 @@ pub fn handle_key(app: &mut App, key: KeyEvent, area: Rect, keymap: &Keymap) -> 
             K::CheckedOutPr => app.back_to_checked_out()?,
             // `delete` off the diff, and `open-pr` and `toggle-thread` off the `PR` tab, are
             // inert. `edit` is not: it reaches the navigator's file rows too.
-            K::Delete | K::OpenPr | K::ToggleThread => {}
+            // Off the stack list, `stack-against` and `stack-local` name no row: inert.
+            K::Delete | K::OpenPr | K::ToggleThread | K::StackAgainst | K::StackLocal => {}
         }
         return Ok(());
     }
@@ -2728,15 +2759,6 @@ pub fn handle_mouse(
                     None => {}
                 }
             }
-            MouseEventKind::Down(MouseButton::Left) if app.mode == Mode::StackPick => {
-                match ui::hit_stack_picker_row(area, app, m.column, m.row) {
-                    Some(i) if app.stack_picker.as_ref().is_some_and(|sp| sp.cursor == i) => {
-                        app.stack_picker_pick()?;
-                    }
-                    Some(i) => app.stack_picker_goto(i),
-                    None => {}
-                }
-            }
             // And in the commit picker, the run included.
             MouseEventKind::Down(MouseButton::Left) if app.mode == Mode::CommitPick => {
                 match ui::hit_commit_picker_row(area, app, m.column, m.row) {
@@ -2852,7 +2874,16 @@ pub fn handle_mouse(
                     // label names the base without offering a choice.
                     ui::HeaderHit::Base => app.open_base_picker(),
                     ui::HeaderHit::Pick => app.open_commit_picker(),
-                    ui::HeaderHit::Stack => app.open_stack_picker(),
+                    ui::HeaderHit::Stack => app.focus_stack_list(),
+                }
+            } else if let Some((i, on_badge)) = ui::hit_stack_row(area, app, m.column, m.row) {
+                // A click on a row activates it; with ctrl or alt it sets what the range
+                // compares against; on the row's local badge it toggles the local branch.
+                if on_badge {
+                    app.stack_list_click_local(i)?;
+                } else {
+                    let against = m.modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT);
+                    app.stack_list_click(i, against)?;
                 }
             } else if let Some(row) = ui::gutter_row_at(area, app, m.column, m.row) {
                 // The gutter owns mouse commenting: click a line or drag a range, and the
@@ -2925,6 +2956,12 @@ pub fn handle_mouse(
         }
         MouseEventKind::ScrollUp if ui::in_files_pane(area, app, m.column, m.row) => {
             app.wheel_files(-3);
+        }
+        MouseEventKind::ScrollDown if ui::in_stack_pane(area, app, m.column, m.row) => {
+            app.scroll_stack_list(1);
+        }
+        MouseEventKind::ScrollUp if ui::in_stack_pane(area, app, m.column, m.row) => {
+            app.scroll_stack_list(-1);
         }
         MouseEventKind::ScrollDown => app.wheel_diff(3),
         MouseEventKind::ScrollUp => app.wheel_diff(-3),

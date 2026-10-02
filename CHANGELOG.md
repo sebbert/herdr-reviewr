@@ -7,12 +7,25 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ## [Unreleased]
 
 ### Added
-- **Compare a stack's PRs on the Changes tab.** `P` (`stack-pick`, rebindable) opens the
-  checked-out PR's stack, top first, then the stack's base (the trunk the bottom PR targets).
-  `Enter` picks the PR to read, `Enter` again what to compare it against; the second step
-  opens on the PR's parent, so `P Enter Enter` is this PR against its parent. `p` and `b` are
-  the shortcuts for the highlighted PR against its parent and against the stack's base. The
-  new **stack** scope shows the range, and the header names it: `[stack] #14 vs #12 · read-only`.
+- **A stack list in the navigator, on the Changes and All files tabs.** While the checked-out
+  PR is part of a GitHub stack, the navigator shows it above the file list
+  (`stack_list_position = "bottom"` puts it below, validated like every key): each PR top
+  first with number, state, and title, the checked-out one marked `●` as on the PR tab, and
+  the stack's base last. It fits the stack up to six rows and scrolls beyond; a short navigator
+  shrinks it, and one too short for both keeps only the files. Framed it is its own box;
+  with `pane_outer_borders = false` a one-row divider parts it from the files. Without a stack
+  there is no box at all. It is not drag-resizable: its height follows the stack. `P`
+  (`stack-list`) moves the keyboard into it and back (`tab` and `esc` leave it too); rows are
+  clickable. Its highlight and scroll are place state, the highlight kept by PR number, so a
+  stack refresh that adds or drops a PR never moves it; the file list keeps its own cursor and
+  scroll.
+- **Compare a stack's PRs on the Changes tab.** `Enter` on a PR row shows that PR against its
+  parent, the common case. `A` (`stack-against`), or a ctrl- or alt-click, on another row sets
+  what it is compared against: another PR, or the base. With no range shown, `A` compares the
+  checked-out PR. The rows wear their roles: the shown PR in the PR tab's viewed-row violet
+  and tagged `head`, the other end tagged `against`. The new **stack** scope shows the range,
+  and the header names it: `[stack] #14 vs #12 · read-only`. `Enter` on the checked-out PR's
+  row, or `0` (`checked-out-pr`), goes back to the scope the range was entered from.
   Decisions:
   - It rides the commits scope's two-tree machinery (`changed_between`, `file_content`), not a
     second diff engine.
@@ -20,29 +33,37 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     does. Two-dot would also show the other end's later commits reversed, so a parent rebased
     or moved on after the child branched would read as the child's change. Unrelated
     histories fall back to the other tip.
-  - Each end resolves from refs that already exist: a PR's local branch (a stack is authored
-    locally, unpushed commits included), then `origin/<head>`, then reviewr's fetched
-    `refs/worktree/reviewr/stack/<N>`, then the forge's head oid if that object is present.
-    The base prefers `origin/<base>`, since a stale local trunk would push the merge-base
-    back. An end nothing local names paints `#12's branch isn't fetched — git fetch origin
-    feature-b` in both panes, never an empty diff, and the picker marks its row `not fetched`.
+  - A PR row is the PR as its reviewers see it: the forge's head oid when that object is in
+    the store, then `origin/<head>`, then reviewr's fetched `refs/worktree/reviewr/stack/<N>`.
+    A stale local branch of the same name never wins. The checked-out PR's row is always the
+    worktree's `HEAD`. The base prefers `origin/<base>`, since a stale local trunk would push
+    the merge-base back. An end nothing local names paints `#12's branch isn't fetched — git
+    fetch origin feature-b` in both panes, never an empty diff.
+  - A same-named local branch that differs from the PR head shows on its row as
+    `local +2 -3`, ahead/behind the PR head by `rev-list --left-right --count`, read by the
+    world worker with one `for-each-ref` per build and the counts cached per commit pair, never
+    on the frame loop. `W` (`stack-local`), or a click on the badge, uses that branch for the
+    row (`[local +2 -3]`, and the header reads `#14 (local) vs #12`), and again goes back. The
+    choice is place state by PR number and survives refreshes. A local branch that disappears
+    falls back to the PR head, with `#14's local branch is gone — PR head` in the header. The
+    checked-out row has no toggle.
   - A range is read-only: it is not the checked-out work. The comment key says why it does
     nothing, the gutter offers no `+`, the editor key does nothing, and no comment renders on
     it or can be edited from the list there. The store is untouched, so every comment is
-    back on the way out. `0` (`checked-out-pr`) returns to the scope the range was entered
-    from. Your own work against the parent stays the **branch** scope's job.
+    back on the way out. Your own work against the parent stays the **branch** scope's job.
   - Continuity: the range is place state, frozen at the pick. A world build only reports that
     an end's ref moved, and the PR tab's stack read reporting a new head marks it too, as
     `#12 moved — r follows` in the header. Nothing re-resolves a shown end but the reader's
-    `r`, which follows each end by PR number and keeps the open file. An end that was not
-    fetched fills in when it becomes resolvable, since it showed nothing to move.
+    own input (`r`, or the local toggle), which follows each end by PR number and keeps the
+    open file. An end that was not fetched fills in when it becomes resolvable, since it
+    showed nothing to move.
   - The `stack` scope is never a chip stop or a `default_scope` value.
-- **Browse a stack PR's tree on the All files tab.** `P` there lists the worktree and the
-  stack's PRs. A PR's tree is read from the object store (`ls-tree`, `show`), nothing checked
-  out, with the same tree, preview, and find. The header reads `#12 tree 1a2b3c4 · read-only`,
-  comments are off, and `0` goes back to the worktree on the same file. Not fetched paints the
-  same hint. Both stack views are offered only where a stack is known, so GitLab and Azure
-  DevOps, which list none, never show them.
+- **Browse a stack PR's tree on the All files tab.** `Enter` on a stack list row switches the
+  tab's source to that PR's head, read from the object store (`ls-tree`, `show`), nothing
+  checked out, with the same tree, preview, and find; the row is tagged `tree`. The header
+  reads `#12 tree 1a2b3c4 · read-only`, comments are off, and the checked-out row or `0` goes
+  back to the worktree on the same file. Not fetched paints the same hint. GitLab and Azure
+  DevOps list no stack, so neither view is offered there.
 - **`stack_fetch = true` fetches stack PRs for you** (off by default, validated like every key
   and part of `--resolve-plugin-config`). Once the stack read names a PR's head and the store
   lacks it, reviewr runs, off the frame loop, one batched

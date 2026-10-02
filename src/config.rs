@@ -66,7 +66,7 @@ impl Config {
     }
 }
 
-const PLUGIN_CONFIG_KEYS: [&str; 20] = [
+const PLUGIN_CONFIG_KEYS: [&str; 21] = [
     "theme",
     "default_scope",
     "navigator_position",
@@ -78,6 +78,7 @@ const PLUGIN_CONFIG_KEYS: [&str; 20] = [
     "pr_nav_separators",
     "hyperlinks",
     "stack_fetch",
+    "stack_list_position",
     "avatars",
     "avatar_width",
     "avatar_fit",
@@ -88,6 +89,23 @@ const PLUGIN_CONFIG_KEYS: [&str; 20] = [
     "url_opener",
     "keybindings",
 ];
+
+/// Where the stack list sits in the navigator: above the file list, or below it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum StackListPosition {
+    #[default]
+    Top,
+    Bottom,
+}
+
+impl StackListPosition {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Top => "top",
+            Self::Bottom => "bottom",
+        }
+    }
+}
 
 /// Where the navigator sits around the read pane.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -216,6 +234,8 @@ pub struct PluginConfig {
     /// Opt-in: fetch each stack PR's head into reviewr's private `refs/worktree/reviewr/stack/`
     /// refs, so a stack range or tree can read a PR whose branch was never fetched.
     stack_fetch: bool,
+    /// Where the stack list sits in the navigator.
+    stack_list_position: StackListPosition,
     /// Opt-in: paint each PR conversation turn's dot as the author's avatar where the
     /// terminal speaks the Kitty graphics protocol.
     avatars: bool,
@@ -245,6 +265,7 @@ impl Default for PluginConfig {
             pr_nav_separators: false,
             hyperlinks: true,
             stack_fetch: false,
+            stack_list_position: StackListPosition::Top,
             avatars: false,
             avatar_width: 1,
             avatar_fit: crate::avatar::Fit::Height,
@@ -303,6 +324,10 @@ impl PluginConfig {
 
     pub fn stack_fetch(&self) -> bool {
         self.stack_fetch
+    }
+
+    pub fn stack_list_position(&self) -> StackListPosition {
+        self.stack_list_position
     }
 
     pub fn avatars(&self) -> bool {
@@ -375,6 +400,7 @@ impl PluginConfig {
             "pr_nav_separators": self.pr_nav_separators,
             "hyperlinks": self.hyperlinks,
             "stack_fetch": self.stack_fetch,
+            "stack_list_position": self.stack_list_position.as_str(),
             "avatars": self.avatars,
             "avatar_width": self.avatar_width,
             "avatar_fit": self.avatar_fit.as_str(),
@@ -565,6 +591,16 @@ fn parse_plugin_config(path: &Path) -> Result<PluginConfig, PluginConfigError> {
     if let Some(value) = table.get("stack_fetch") {
         config.stack_fetch =
             value.as_bool().ok_or_else(|| value_error(path, "stack_fetch", "a boolean"))?;
+    }
+    if let Some(value) = table.get("stack_list_position") {
+        config.stack_list_position =
+            match string_value(path, "stack_list_position", value, "\"top\" or \"bottom\"")? {
+                "top" => StackListPosition::Top,
+                "bottom" => StackListPosition::Bottom,
+                _ => {
+                    return Err(value_error(path, "stack_list_position", "\"top\" or \"bottom\""));
+                }
+            };
     }
     if let Some(value) = table.get("avatars") {
         config.avatars =
@@ -911,6 +947,7 @@ mod tests {
         assert!(!config.avatars(), "avatars are opt-in");
         assert!(config.hyperlinks(), "hyperlinks are on by default");
         assert!(!config.stack_fetch(), "stack fetching is opt-in");
+        assert_eq!(config.stack_list_position(), super::StackListPosition::Top);
         assert_eq!(config.avatar_width(), 1);
         assert_eq!(config.avatar_fit(), crate::avatar::Fit::Height);
         assert_eq!(config.github_host(), None);
@@ -934,6 +971,7 @@ mod tests {
                 "pr_nav_separators = true\n",
                 "hyperlinks = false\n",
                 "stack_fetch = true\n",
+                "stack_list_position = \"bottom\"\n",
                 "avatars = true\n",
                 "avatar_width = 2\n",
                 "avatar_fit = \"width\"\n",
@@ -957,6 +995,8 @@ mod tests {
         assert_eq!(config.to_json()["hyperlinks"], false);
         assert!(config.stack_fetch());
         assert_eq!(config.to_json()["stack_fetch"], true);
+        assert_eq!(config.stack_list_position(), super::StackListPosition::Bottom);
+        assert_eq!(config.to_json()["stack_list_position"], "bottom");
         assert!(config.avatars());
         assert_eq!(config.avatar_width(), 2);
         assert_eq!(config.to_json()["avatars"], true);
@@ -1062,6 +1102,8 @@ mod tests {
             ("pr_nav_separators = \"yes\"\n", "`pr_nav_separators`"),
             ("hyperlinks = \"yes\"\n", "`hyperlinks`"),
             ("stack_fetch = \"yes\"\n", "`stack_fetch`"),
+            ("stack_list_position = \"left\"\n", "`stack_list_position`"),
+            ("stack_list_position = true\n", "`stack_list_position`"),
             ("avatars = \"yes\"\n", "`avatars`"),
             ("avatar_width = 0\n", "`avatar_width`"),
             ("avatar_width = 3\n", "`avatar_width`"),
@@ -1360,6 +1402,7 @@ mod tests {
         assert_eq!(object["auto_open"], true);
         assert_eq!(object["pr_nav_separators"], false);
         assert_eq!(object["stack_fetch"], false);
+        assert_eq!(object["stack_list_position"], "top");
         assert!(object["github_host"].is_null());
         let keybindings = object["keybindings"].as_object().unwrap();
         assert_eq!(

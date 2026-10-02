@@ -1402,16 +1402,42 @@ fn the_commit_scope_writes_nothing() {
 mod stack {
     use super::common::Repo;
     use herdr_reviewr::stack::{
-        EndSpec, FetchJob, StackEnd, StackRange, fetch_stack_heads, resolve,
+        EndSource, EndSpec, FetchJob, StackEnd, StackRange, fetch_stack_heads, local_branches,
+        resolve,
     };
     use std::time::Duration;
 
     fn pr(n: u64, branch: &str, head_oid: Option<String>) -> EndSpec {
-        EndSpec { end: StackEnd::Pr(n), label: format!("#{n}"), branch: branch.into(), head_oid }
+        EndSpec {
+            end: StackEnd::Pr(n),
+            label: format!("#{n}"),
+            branch: branch.into(),
+            head_oid,
+            source: EndSource::Pr,
+        }
+    }
+
+    /// A PR whose forge head is its branch's current tip, as a fresh stack read reports it.
+    fn pr_at(r: &Repo, n: u64, branch: &str) -> EndSpec {
+        pr(n, branch, Some(oid(r, branch)))
+    }
+
+    fn local(n: u64, branch: &str, head_oid: Option<String>) -> EndSpec {
+        EndSpec {
+            source: EndSource::Local,
+            label: format!("#{n} (local)"),
+            ..pr(n, branch, head_oid)
+        }
     }
 
     fn base(branch: &str) -> EndSpec {
-        EndSpec { end: StackEnd::Base, label: branch.into(), branch: branch.into(), head_oid: None }
+        EndSpec {
+            end: StackEnd::Base,
+            label: branch.into(),
+            branch: branch.into(),
+            head_oid: None,
+            source: EndSource::Pr,
+        }
     }
 
     fn oid(r: &Repo, rev: &str) -> String {
@@ -1444,6 +1470,7 @@ mod stack {
             commit_pick: None,
             stack_range: Some(range.clone()),
             files_tree: None,
+            stack_prs: Vec::new(),
             toggled_dirs: std::collections::HashSet::default(),
         };
         let build = herdr_reviewr::world::build_changed(&input).unwrap();
@@ -1451,26 +1478,41 @@ mod stack {
     }
 
     #[test]
-    fn a_pr_end_resolves_from_its_branch_then_origin_then_the_private_ref_then_its_oid() {
+    fn a_pr_end_resolves_as_reviewers_see_it_and_a_stale_local_branch_never_wins() {
         let r = stack_repo();
         let b = oid(&r, "feature-b");
         let a = oid(&r, "feature-a");
-        let got = resolve(r.path(), &pr(12, "feature-b", None)).unwrap();
-        assert_eq!((got.oid.as_str(), got.via.as_str()), (b.as_str(), "feature-b"));
+        // The forge's head first, when it is in the store — even with a local branch of the
+        // same name sitting elsewhere.
+        let got = resolve(r.path(), &pr(12, "feature-a", Some(b.clone()))).unwrap();
+        assert_eq!((got.oid.as_str(), got.via.as_str()), (b.as_str(), "#12 head"));
 
-        // No local branch: the tracking branch.
-        r.git(&["update-ref", "refs/remotes/origin/feature-x", &a]);
-        let got = resolve(r.path(), &pr(13, "feature-x", None)).unwrap();
-        assert_eq!((got.oid.as_str(), got.via.as_str()), (a.as_str(), "origin/feature-x"));
+        // A forge head not in the store: the tracking branch, never the stale local one.
+        let absent = "0123456789abcdef0123456789abcdef01234567".to_string();
+        r.git(&["update-ref", "refs/remotes/origin/feature-a", &b]);
+        let got = resolve(r.path(), &pr(11, "feature-a", Some(absent.clone()))).unwrap();
+        assert_eq!((got.oid.as_str(), got.via.as_str()), (b.as_str(), "origin/feature-a"));
 
-        // Neither: reviewr's fetched ref.
+        // No tracking branch: reviewr's fetched ref.
         r.git(&["update-ref", "refs/worktree/reviewr/stack/14", &b]);
-        let got = resolve(r.path(), &pr(14, "feature-y", None)).unwrap();
+        let got = resolve(r.path(), &pr(14, "feature-b", None)).unwrap();
         assert_eq!((got.oid.as_str(), got.via.as_str()), (b.as_str(), "#14 fetched"));
 
-        // No ref at all, but the forge's head is in the store.
-        let got = resolve(r.path(), &pr(15, "feature-z", Some(a.clone()))).unwrap();
-        assert_eq!(got.oid, a);
+        // Only a local branch: that is not the PR, so it is not fetched.
+        assert_eq!(resolve(r.path(), &pr(15, "feature-b", None)), None);
+        // Unless the reader asks for it on that row.
+        let got = resolve(r.path(), &local(15, "feature-b", None)).unwrap();
+        assert_eq!(
+            (got.oid.as_str(), got.via.as_str(), got.local_gone),
+            (b.as_str(), "local feature-b", false)
+        );
+        // A local branch that is gone falls back to the PR, marked.
+        let got = resolve(r.path(), &local(16, "no-such-branch", Some(a.clone()))).unwrap();
+        assert_eq!((got.oid.as_str(), got.local_gone), (a.as_str(), true));
+
+        // The checked-out PR is the worktree's `HEAD`.
+        let worktree = EndSpec { source: EndSource::Worktree, ..pr(12, "anything", None) };
+        assert_eq!(resolve(r.path(), &worktree).unwrap().oid, b);
 
         // The base prefers `origin/`: a stale local trunk would pull trunk commits in.
         r.git(&["update-ref", "refs/remotes/origin/main", &a]);
@@ -1478,12 +1520,35 @@ mod stack {
     }
 
     #[test]
+    fn a_local_branch_that_differs_from_the_pr_head_is_badged_with_ahead_and_behind() {
+        let r = stack_repo();
+        let pushed = oid(&r, "feature-b");
+        // The local branch moves on twice and drops nothing: +2 -0.
+        for n in 0..2 {
+            r.write(&format!("local{n}.rs"), "x\n");
+            r.commit_all("local work");
+        }
+        let prs = [pr(12, "feature-b", Some(pushed.clone())), pr_at(&r, 11, "feature-a")];
+        let locals = local_branches(r.path(), &prs);
+        assert_eq!(locals.len(), 1, "#11's local branch is the PR head: no badge");
+        assert_eq!(locals[&12].badge(), "local +2 -0");
+        assert_eq!(locals[&12].oid, oid(&r, "feature-b"));
+        // A PR head not in the store still badges the branch, without counts.
+        let absent = "0123456789abcdef0123456789abcdef01234567".to_string();
+        let locals = local_branches(r.path(), &[pr(12, "feature-b", Some(absent))]);
+        assert_eq!(locals[&12].badge(), "local");
+    }
+
+    #[test]
     fn an_end_nothing_local_names_is_not_fetched() {
         let r = stack_repo();
         let absent = "0123456789abcdef0123456789abcdef01234567".to_string();
         assert_eq!(resolve(r.path(), &pr(20, "never-fetched", Some(absent))), None);
-        let range =
-            StackRange::resolve(r.path(), pr(20, "never-fetched", None), pr(11, "feature-a", None));
+        let range = StackRange::resolve(
+            r.path(),
+            pr(20, "never-fetched", None),
+            pr_at(&r, 11, "feature-a"),
+        );
         assert_eq!(range.missing().map(|s| s.label.as_str()), Some("#20"));
         assert!(changed(&r, &range).is_empty(), "a missing end lists nothing, never a fake diff");
     }
@@ -1498,16 +1563,19 @@ mod stack {
         r.git(&["checkout", "-q", "feature-b"]);
 
         let range =
-            StackRange::resolve(r.path(), pr(12, "feature-b", None), pr(11, "feature-a", None));
+            StackRange::resolve(r.path(), pr_at(&r, 12, "feature-b"), pr_at(&r, 11, "feature-a"));
         assert_eq!(range.label(), "#12 vs #11");
         // Only the child's own work: two-dot would also list `a2.rs` as deleted.
         assert_eq!(changed(&r, &range), ["b.rs"]);
         // Against the base: the whole stack below it.
+        // Against the base: the whole stack below it. #12 reads from its tracking branch.
+        r.git(&["update-ref", "refs/remotes/origin/feature-b", &oid(&r, "feature-b")]);
         let range = StackRange::resolve(r.path(), pr(12, "feature-b", None), base("main"));
         assert_eq!(changed(&r, &range), ["a.rs", "b.rs"]);
         // A ref that moves after the pick is noticed, never followed.
         r.write("b2.rs", "more\n");
         r.commit_all("b moves on");
+        r.git(&["update-ref", "refs/remotes/origin/feature-b", &oid(&r, "feature-b")]);
         assert_eq!(range.moved(r.path()), ["#12"]);
         assert_eq!(changed(&r, &range), ["a.rs", "b.rs"], "the frozen tip still shows");
     }

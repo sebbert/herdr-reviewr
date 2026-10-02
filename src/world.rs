@@ -46,6 +46,9 @@ pub struct WorldInput {
     pub stack_range: Option<crate::stack::StackRange>,
     /// The `All files` tab's stack PR tree, when it browses one instead of the worktree.
     pub files_tree: Option<crate::stack::TreeSource>,
+    /// The stack's PRs other than the checked-out one, as the forge reports them, whose
+    /// same-named local branches the stack list badges.
+    pub stack_prs: Vec<crate::stack::EndSpec>,
     /// Expanded ignored directories whose children the `All files` tree loads.
     pub toggled_dirs: HashSet<String>,
 }
@@ -66,6 +69,8 @@ pub struct WorldSnapshot {
     pub stack_status: Option<crate::stack::StackStatus>,
     /// Whether the browsed stack PR tree's refs moved past the commit it shows.
     pub tree_moved: bool,
+    /// Each stack PR whose local branch differs from the PR head, by number.
+    pub stack_locals: HashMap<u64, crate::stack::LocalBranch>,
     /// The commit `HEAD` named when the build ran, the commit picker's universe key
     /// `None` in an unborn repository.
     pub head: Option<String>,
@@ -116,6 +121,7 @@ pub fn build(input: &WorldInput) -> Result<WorldSnapshot> {
             pick_status: None,
             stack_status: None,
             tree_moved: false,
+            stack_locals: HashMap::new(),
             head: None,
         });
     }
@@ -147,6 +153,7 @@ pub fn build(input: &WorldInput) -> Result<WorldSnapshot> {
         // `Changes` (the `PR` tab never builds a snapshot).
         _ => changed.iter().map(Entry::from_changed).collect(),
     };
+    let stack_locals = crate::stack::local_branches(&input.repo, &input.stack_prs);
     Ok(WorldSnapshot {
         changed: changed_map,
         entries,
@@ -154,6 +161,7 @@ pub fn build(input: &WorldInput) -> Result<WorldSnapshot> {
         pick_status,
         stack_status,
         tree_moved,
+        stack_locals,
         head,
     })
 }

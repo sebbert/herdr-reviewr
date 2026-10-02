@@ -24,7 +24,7 @@ use crate::theme::{self, Palette};
 use crate::world::{PickStatus, PickVerdict};
 
 mod stack_view;
-pub use stack_view::{StackPicker, StackPickerPurpose, StackRow};
+pub use stack_view::StackListRow;
 
 /// Navigator shares and bounds, as percentages of the body's split axis.
 const DEFAULT_SIDE_PCT: u16 = 32;
@@ -55,6 +55,8 @@ enum DividerDrag {
 pub enum Focus {
     Files,
     Diff,
+    /// The navigator's stack list, above or below the file list while a stack is known.
+    Stack,
 }
 
 /// What the file-list cursor points at, by path, so it can be restored to the same target
@@ -453,9 +455,6 @@ pub enum Mode {
     /// Choosing the `commits` scope's pick. Its state lives
     /// in [`App::commit_picker`].
     CommitPick,
-    /// Choosing a stack range (`Changes`) or a stack PR tree (`All files`). Its state lives
-    /// in [`App::stack_picker`].
-    StackPick,
     /// The search screen, replacing the body from any tab. Its state
     /// lives in [`App::search`].
     Search,
@@ -474,12 +473,7 @@ impl Mode {
     pub fn is_modal(&self) -> bool {
         matches!(
             self,
-            Mode::Composing { .. }
-                | Mode::List
-                | Mode::Picker
-                | Mode::BasePick
-                | Mode::CommitPick
-                | Mode::StackPick
+            Mode::Composing { .. } | Mode::List | Mode::Picker | Mode::BasePick | Mode::CommitPick
         )
     }
 }
@@ -705,14 +699,13 @@ pub enum FooterAction {
     OpenPr,
     /// Fold or unfold the selected PR thread card; the label names what the key does next.
     ToggleThread,
-    /// Open the stack picker: a range on `Changes`, a PR tree on `All files`.
-    StackPick,
-    /// The stack picker's own bar: pick the highlight, the `p`/`b` shortcuts, move, and `esc`.
-    PickStackRow,
-    StackParent,
-    StackBase,
-    MoveStackRow,
-    CloseStackPicker,
+    /// Move the keyboard into the navigator's stack list.
+    StackFocus,
+    /// The stack list's own row-1 actions: activate the highlighted row (the label names what
+    /// it does there), set it as what the range compares against, and toggle its local branch.
+    StackActivate,
+    StackAgainst,
+    StackLocal,
     /// Back from a stack range or tree to the checked-out work.
     StackBack,
     /// `enter` on a stack row: view that PR on the `PR` tab.
@@ -773,8 +766,18 @@ pub struct App {
     pub files_source: Option<crate::stack::TreeSource>,
     /// Whether the latest landed `All files` build found the browsed tree's refs moved.
     tree_moved: bool,
-    /// The stack picker's rows and highlight while `Mode::StackPick` is open.
-    pub stack_picker: Option<StackPicker>,
+    /// The stack list's highlighted row by identity, and its last index as the fallback when
+    /// that end leaves the stack. Place state, like the file list's cursor.
+    stack_cursor: (Option<crate::stack::StackEnd>, usize),
+    /// The stack list's top visible row, settled by the renderer.
+    stack_scroll: std::cell::Cell<usize>,
+    /// A keyboard move asks the renderer to reveal the highlighted row.
+    reveal_stack: std::cell::Cell<bool>,
+    /// Stack PRs whose row reads the same-named local branch instead of the PR head, by the
+    /// reader's choice. Place state by PR number.
+    pub stack_local: HashSet<u64>,
+    /// Each stack PR's differing local branch, from the latest landed file-tab build.
+    stack_locals: HashMap<u64, crate::stack::LocalBranch>,
     /// The opt-in stack fetch's bookkeeping (`stack_fetch`).
     stack_fetch: stack_view::StackFetch,
     /// Bumped by each pick made in this pane, so an in-flight build that read the old pick
@@ -1116,7 +1119,11 @@ impl App {
             stack_return: None,
             files_source: None,
             tree_moved: false,
-            stack_picker: None,
+            stack_cursor: (None, 0),
+            stack_scroll: std::cell::Cell::new(0),
+            reveal_stack: std::cell::Cell::new(false),
+            stack_local: HashSet::new(),
+            stack_locals: HashMap::new(),
             stack_fetch: stack_view::StackFetch::default(),
             base_epoch: 0,
             pr_base: None,
@@ -1337,6 +1344,9 @@ impl App {
         self.stack_range = old.stack_range.take();
         self.stack_return = old.stack_return.take();
         self.files_source = old.files_source.take();
+        self.stack_local = std::mem::take(&mut old.stack_local);
+        self.stack_cursor = old.stack_cursor;
+        self.stack_locals = std::mem::take(&mut old.stack_locals);
         // The fetch's tag and in-flight job ride along, so the job already running lands here.
         self.stack_fetch = std::mem::take(&mut old.stack_fetch);
         self.navigator_side_pct = old.navigator_side_pct;
@@ -1380,11 +1390,7 @@ impl App {
             // before the mode is stored, so none reaches recovery; the search query is not
             // restored and the picker's frozen rows are not either.
             Mode::Normal | Mode::Search | Mode::Find | Mode::Picker => {}
-            Mode::List
-            | Mode::Composing { .. }
-            | Mode::BasePick
-            | Mode::CommitPick
-            | Mode::StackPick => {
+            Mode::List | Mode::Composing { .. } | Mode::BasePick | Mode::CommitPick => {
                 self.scope = old.scope;
                 self.tab = old.tab;
                 self.active_file_tab = old.active_file_tab;
@@ -1427,7 +1433,6 @@ impl App {
                 self.base_picker = old.base_picker.take();
                 // So does the commit picker, with its highlight and anchor.
                 self.commit_picker = old.commit_picker.take();
-                self.stack_picker = old.stack_picker.take();
             }
         }
     }
@@ -1579,6 +1584,7 @@ impl App {
             // Only the `stack` scope reads the range, and only `All files` the tree.
             stack_range: if self.scope == Scope::Stack { self.stack_range.clone() } else { None },
             files_tree: if self.tab == Tab::AllFiles { self.files_source.clone() } else { None },
+            stack_prs: self.stack_badge_specs(),
             // `Changes` never reads the toggled set, so it stays out of that tab's tag —
             // a directory toggle there must not invalidate an in-flight build.
             toggled_dirs: if self.tab == Tab::AllFiles {
@@ -1643,6 +1649,7 @@ impl App {
         if self.tab == Tab::AllFiles {
             self.tree_moved = snapshot.tree_moved;
         }
+        self.stack_locals = snapshot.stack_locals;
         self.rebuild_file_rows();
         self.file_cursor = anchor
             .and_then(|a| self.row_of_anchor(&a))
@@ -2475,6 +2482,15 @@ impl App {
         self.plugin_config().is_none_or(crate::config::PluginConfig::pane_outer_borders)
     }
 
+    /// Where the navigator's stack list sits: the config's `stack_list_position`, top while
+    /// the config is blocked.
+    #[must_use]
+    pub fn stack_list_position(&self) -> crate::config::StackListPosition {
+        self.plugin_config()
+            .map(crate::config::PluginConfig::stack_list_position)
+            .unwrap_or_default()
+    }
+
     /// Whether the painted frame carries OSC 8 hyperlinks — the config's `hyperlinks`, on
     /// while the config is blocked (its screen carries none anyway).
     #[must_use]
@@ -2768,9 +2784,9 @@ impl App {
     /// in progress is never stranded against a different diff.
     pub fn set_scope(&mut self, scope: Scope) -> Result<()> {
         self.ensure_config_ready()?;
-        // `stack` is entered by its picker: without a range, the picker opens instead.
+        // `stack` is entered from the stack list: without a range, the list takes the keys.
         if scope == Scope::Stack && self.stack_range.is_none() && !self.composing() {
-            self.open_stack_picker();
+            self.focus_stack_list();
             return Ok(());
         }
         // `commits` with no pick, or a `gone` one, has nothing to show: the picker opens
@@ -2853,6 +2869,10 @@ impl App {
             return Ok(());
         }
         self.tab = tab;
+        // The stack list lives on the file tabs; the PR tab's navigator takes its keys back.
+        if tab == Tab::Pr && self.focus == Focus::Stack {
+            self.focus = Focus::Files;
+        }
         // Entering the PR tab leaves the file tabs frozen in place and fetches the PR. A
         // `loading` frame draws before the blocking fetch the event loop services, and a
         // re-entry keeps the last snapshot on screen while it refetches.
@@ -3623,9 +3643,10 @@ impl App {
             self.reveal_files = true;
             return;
         }
+        // `tab` keeps its files ↔ diff swing; from the stack list it lands on the files.
         self.focus = match self.focus {
             Focus::Files => Focus::Diff,
-            Focus::Diff => Focus::Files,
+            Focus::Diff | Focus::Stack => Focus::Files,
         };
     }
 
@@ -3659,6 +3680,7 @@ impl App {
                     self.reveal_diff = true;
                 }
             }
+            Focus::Stack => self.stack_list_move(delta),
         }
         Ok(())
     }
@@ -4387,7 +4409,7 @@ impl App {
             Mode::Search => self.search.as_mut().map(|s| (&mut s.query, &mut s.caret)),
             Mode::Find => self.find.as_mut().map(|f| (&mut f.query, &mut f.caret)),
             Mode::BasePick => self.base_picker.as_mut().map(|b| (&mut b.query, &mut b.caret)),
-            Mode::Normal | Mode::List | Mode::Picker | Mode::CommitPick | Mode::StackPick => None,
+            Mode::Normal | Mode::List | Mode::Picker | Mode::CommitPick => None,
         }
     }
 
@@ -4697,7 +4719,6 @@ impl App {
             | Mode::Picker
             | Mode::BasePick
             | Mode::CommitPick
-            | Mode::StackPick
             | Mode::Search
             | Mode::Find => None,
         }
@@ -5228,19 +5249,6 @@ impl App {
                 }
                 return out;
             }
-            Mode::StackPick => {
-                let mut out = vec![(A::PickStackRow, Primary), (A::CloseStackPicker, Do)];
-                if self
-                    .stack_picker
-                    .as_ref()
-                    .is_some_and(|sp| sp.purpose == StackPickerPurpose::Range)
-                {
-                    out.push((A::StackParent, Do));
-                    out.push((A::StackBase, Do));
-                }
-                out.push((A::MoveStackRow, Do));
-                return out;
-            }
             Mode::Search => {
                 // With nothing pickable — warming, errored, or no matches — only the
                 // mode flip and the exit are offered, so the bar never lists a key that
@@ -5307,7 +5315,21 @@ impl App {
         // Whether the diff-jump is already the primary, so the `go` band doesn't repeat the toggle.
         let mut pane_is_primary = false;
 
-        if self.preview_active() && self.focus == Focus::Diff {
+        if self.focus == Focus::Stack {
+            // The stack list: its row's act leads, named for what it does there; the other
+            // end, the local branch, and the way back follow.
+            out.push((A::StackActivate, Primary));
+            if self.tab == Tab::Changes {
+                out.push((A::StackAgainst, Do));
+            }
+            let rows = self.stack_list_rows();
+            if rows.get(self.stack_list_cursor()).is_some_and(|r| r.local.is_some()) {
+                out.push((A::StackLocal, Do));
+            }
+            if self.read_only_view() {
+                out.push((A::StackBack, Do));
+            }
+        } else if self.preview_active() && self.focus == Focus::Diff {
             // The read-only preview: the way back to the commentable source leads, and
             // no comment key is offered; the shared tail below adds the
             // scope, send, and band actions. With the file list focused, the tree's own
@@ -5325,8 +5347,8 @@ impl App {
             out.push((A::Refresh, Do));
         } else if self.file_rows.is_empty() && self.read_only_view() {
             // A stack range or tree with nothing to list — an end not fetched, or a range
-            // that adds nothing: another pick, the way back, or a refresh that follows.
-            out.push((A::StackPick, Primary));
+            // that adds nothing: the stack list, the way back, or a refresh that follows.
+            out.push((A::StackFocus, Primary));
             out.push((A::StackBack, Do));
             out.push((A::Refresh, Do));
         } else if self.commits_gone() && self.tab == Tab::Changes {
@@ -5368,8 +5390,8 @@ impl App {
         } else if self.on_fold() {
             out.push((A::ExpandFold, Primary));
         } else if self.read_only_view() {
-            // Read-only: no comment key. Another pick leads, the way back follows.
-            out.push((A::StackPick, Primary));
+            // Read-only: no comment key. The stack list leads, the way back follows.
+            out.push((A::StackFocus, Primary));
             out.push((A::StackBack, Do));
             if self.previewable() {
                 out.push((A::Preview, Do));
@@ -5432,8 +5454,11 @@ impl App {
             out.push((A::CommitPick, Go));
         }
         // The stack picker's key shows only where a stack is known.
-        if self.stack_available() && !out.iter().any(|&(a, _)| a == A::StackPick) {
-            out.push((A::StackPick, Go));
+        if self.stack_list_shown()
+            && self.focus != Focus::Stack
+            && !out.iter().any(|&(a, _)| a == A::StackFocus)
+        {
+            out.push((A::StackFocus, Go));
         }
         out.push((A::Search, Go));
         // In-file find shows wherever the read pane has content to search.

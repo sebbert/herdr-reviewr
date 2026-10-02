@@ -122,6 +122,12 @@ fn render_frame(frame: &mut Frame, app: &App) {
         render_diff_view(frame, app, p.diff);
         if !app.navigator_hidden_here() {
             render_file_list(frame, app, p.files);
+            if let Some(stack) = p.stack {
+                render_stack_list(frame, app, stack);
+            }
+            if let Some(line) = p.stack_divider {
+                render_divider(frame, app, line);
+            }
         }
     }
     // The active text drag's highlight paints over the finished body, in the same geometry
@@ -138,7 +144,6 @@ fn render_frame(frame: &mut Frame, app: &App) {
         Mode::Picker => Some(render_agent_picker),
         Mode::BasePick => Some(render_base_picker),
         Mode::CommitPick => Some(render_commit_picker),
-        Mode::StackPick => Some(render_stack_picker),
         Mode::Normal | Mode::Composing { .. } | Mode::Search | Mode::Find => None,
     };
     if let Some(render_popup) = popup {
@@ -191,6 +196,11 @@ struct Panes {
     /// The one-cell line between the two tiled panes when `pane_outer_borders` is off; with
     /// it on, each pane's own border meets the other's and there is no separate divider.
     divider: Option<Rect>,
+    /// The navigator's stack list, above or below the file list, while a stack is known.
+    stack: Option<Pane>,
+    /// The one-row line between the stack list and the file list when `pane_outer_borders`
+    /// is off; framed, the two boxes' own borders meet instead.
+    stack_divider: Option<Rect>,
     body: Rect,
     status: Rect,
 }
@@ -268,7 +278,44 @@ fn panes(area: Rect, app: &App) -> Panes {
         };
         (Pane::borderless(diff, track), Pane::borderless(files, Track::None))
     };
-    Panes { tab: rows[0], diff, files, divider, body, status: rows[2] }
+    let (files, stack, stack_divider) = split_stack(files, app, framed);
+    Panes { tab: rows[0], diff, files, divider, stack, stack_divider, body, status: rows[2] }
+}
+
+/// The most stack list rows shown before it scrolls.
+const STACK_LIST_MAX: u16 = 6;
+
+/// Carve the stack list out of the navigator: as tall as its rows up to [`STACK_LIST_MAX`],
+/// above or below the file list (`stack_list_position`), each part in its own chrome — a box
+/// framed, a title row and a one-row divider borderless. A navigator too short to keep the
+/// file list usable shows no stack list rather than a crushed one.
+fn split_stack(files: Pane, app: &App, framed: bool) -> (Pane, Option<Pane>, Option<Rect>) {
+    let nav = files.outer;
+    if !app.stack_list_shown() || nav.height == 0 || nav.width == 0 {
+        return (files, None, None);
+    }
+    let rows = u16::try_from(app.stack_list_rows().len()).unwrap_or(u16::MAX);
+    // Framed: two borders each. Borderless: a title row each, and the divider between.
+    let (chrome, divider, files_min) = if framed { (2, 0, 4) } else { (1, 1, 3) };
+    let room = nav.height.saturating_sub(files_min + chrome + divider);
+    let shown = rows.min(STACK_LIST_MAX).min(room);
+    if shown == 0 {
+        return (files, None, None);
+    }
+    let stack_h = shown + chrome;
+    let files_h = nav.height - stack_h - divider;
+    let top = app.stack_list_position() == crate::config::StackListPosition::Top;
+    let (stack_y, divider_y, files_y) = if top {
+        (nav.y, nav.y + stack_h, nav.y + stack_h + divider)
+    } else {
+        (nav.y + files_h + divider, nav.y + files_h, nav.y)
+    };
+    let stack_outer = Rect::new(nav.x, stack_y, nav.width, stack_h);
+    let files_outer = Rect::new(nav.x, files_y, nav.width, files_h);
+    let pane =
+        |outer| if framed { Pane::framed(outer) } else { Pane::borderless(outer, Track::None) };
+    let line = (!framed).then(|| Rect::new(nav.x, divider_y, nav.width, 1));
+    (pane(files_outer), Some(pane(stack_outer)), line)
 }
 
 /// Take the one-cell divider out of the split, on the split boundary itself — the cell a
@@ -2837,9 +2884,7 @@ fn action_key_label(app: &App, action: FooterAction) -> (String, String) {
             let n = app.commit_picker.as_ref().map_or(0, crate::app::CommitPicker::run_len);
             return ("enter".into(), if n > 1 { format!("open {n}") } else { "open".into() });
         }
-        A::MoveCommitRow | A::MoveStackRow => {
-            (format!("{} {}", hint(K::Down), hint(K::Up)), "move")
-        }
+        A::MoveCommitRow => (format!("{} {}", hint(K::Down), hint(K::Up)), "move"),
         A::CloseCommitPicker => {
             let anchored = app.commit_picker.as_ref().is_some_and(|cp| cp.anchor.is_some());
             ("esc".into(), if anchored { "clear" } else { "cancel" })
@@ -2873,20 +2918,15 @@ fn action_key_label(app: &App, action: FooterAction) -> (String, String) {
         // `enter` opens the highlight in every list: a search result, a base, a commit run.
         A::OpenResult | A::PickBaseRow => ("enter".into(), "open"),
         A::OpenPr => (hint(K::OpenPr), "open ↗"),
-        A::StackPick => {
-            (hint(K::StackPick), if app.tab == Tab::AllFiles { "tree" } else { "stack" })
-        }
-        A::PickStackRow => {
-            let first = app.stack_picker.as_ref().is_some_and(|sp| {
-                sp.purpose == crate::app::StackPickerPurpose::Range && sp.to.is_none()
-            });
-            ("enter".into(), if first { "compare" } else { "open" })
-        }
-        A::StackParent => ("p".into(), "vs parent"),
-        A::StackBase => ("b".into(), "vs base"),
-        A::CloseStackPicker => {
-            let second = app.stack_picker.as_ref().is_some_and(|sp| sp.to.is_some());
-            ("esc".into(), if second { "back" } else { "cancel" })
+        A::StackFocus => (hint(K::StackList), "stack"),
+        A::StackActivate => return ("enter".into(), stack_activate_label(app).into()),
+        A::StackAgainst => (hint(K::StackAgainst), "against"),
+        A::StackLocal => {
+            let chosen = app
+                .stack_list_rows()
+                .get(app.stack_list_cursor())
+                .is_some_and(|r| r.local.as_ref().is_some_and(|(_, on)| *on));
+            (hint(K::StackLocal), if chosen { "pr head" } else { "local" })
         }
         A::ViewStackPr => ("enter".into(), "view"),
         A::CheckedOutPr | A::StackBack => (hint(K::CheckedOutPr), "checked out"),
@@ -3763,91 +3803,181 @@ pub fn hit_commit_picker_row(area: Rect, app: &App, col: u16, row: u16) -> Optio
     menu_hit(inner, 0, first, shown, col, row)
 }
 
-// --- Stack picker -------------------------------------------
+// --- Stack list ---------------------------------------------------------------------
 
-/// One stack picker row's parts: the `▸` on the compared PR (the range picker's second
-/// step), the label, the title, and the dim trail — `checked out`, and how the end resolves
-/// or that it is not fetched.
-fn stack_row_parts(row: &crate::app::StackRow, picked: bool) -> (String, String, String, String) {
-    let mark = if picked { "▸ " } else { "  " }.to_string();
-    let mut trail: Vec<String> = Vec::new();
-    if row.checked_out && row.end.is_some() {
-        trail.push("checked out".into());
+/// What `enter` does on the stack list's highlighted row, for the footer.
+fn stack_activate_label(app: &App) -> &'static str {
+    let rows = app.stack_list_rows();
+    let Some(row) = rows.get(app.stack_list_cursor()) else { return "open" };
+    match (app.tab, row.checked_out, row.end) {
+        (Tab::AllFiles, true, _) => "worktree",
+        (Tab::AllFiles, false, _) => "tree",
+        (_, true, _) => "checked out",
+        (_, false, crate::stack::StackEnd::Base) => "open",
+        (_, false, crate::stack::StackEnd::Pr(_)) => "vs parent",
     }
-    if row.end.is_some() {
-        trail.push(row.via.clone().unwrap_or_else(|| "not fetched".into()));
-    }
-    (mark, row.label.clone(), row.title.clone(), trail.join(" · "))
 }
 
-fn stack_picker_popup(area: Rect, app: &App) -> Rect {
-    let Some(sp) = &app.stack_picker else { return Rect::default() };
-    let widest = sp
-        .rows
-        .iter()
-        .map(|r| {
-            let (mark, label, title, trail) = stack_row_parts(r, false);
-            mark.width() + label.width() + 2 + title.width() + 2 + trail.width() + 1
-        })
-        .max()
-        .unwrap_or(0);
-    menu_popup(area, app, widest, &sp.title(), sp.rows.len().max(1) + 2)
-}
-
-fn render_stack_picker(frame: &mut Frame, app: &App, area: Rect) {
-    let Some(sp) = &app.stack_picker else { return };
+/// One stack list row's spans for `width` cells, in the PR tab's stack vocabulary — the
+/// checked-out `●`, the number, the state, the title — then the trail: the local branch's
+/// badge, and the row's role (`head` / `against`, `tree` on All files). Also the badge's cell
+/// range, the local toggle's click target. The title clips first; the role never does.
+fn stack_list_line(
+    app: &App,
+    row: &crate::app::StackListRow,
+    width: usize,
+) -> (Vec<Span<'static>>, Option<(usize, usize)>) {
     let p = app.palette();
-    let popup = stack_picker_popup(area, app);
-    frame.render_widget(Clear, popup);
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(p.purple))
-        .title(framed_title(&sp.title()));
-    let inner = picker_inner(popup);
-    frame.render_widget(block, popup);
-    if inner.height == 0 {
-        return;
+    let role = match (row.head, row.against) {
+        (true, _) if app.tab == Tab::AllFiles => "tree",
+        (true, _) => "head",
+        (_, true) => "against",
+        _ => "",
+    };
+    let badge =
+        row.local.as_ref().map(|(l, on)| if *on { format!("[{}]", l.badge()) } else { l.badge() });
+    let (lead, lead_color) = if row.checked_out { (" ● ", p.green) } else { ("   ", p.dim2) };
+    let mut spans =
+        vec![Span::styled(lead, Style::default().fg(lead_color).add_modifier(Modifier::BOLD))];
+    let mut used = lead.width();
+    let role_w = if role.is_empty() { 0 } else { 2 + role.width() };
+    if let Some((state, draft)) = row.state {
+        let entry = forge::StackEntry {
+            number: 0,
+            title: String::new(),
+            state,
+            is_draft: draft,
+            head_ref: String::new(),
+            base_ref: String::new(),
+            url: None,
+            level: 0,
+        };
+        let (word, color) = stack_state(p, &entry);
+        let number = format!("{} ", row.label);
+        used += number.width();
+        spans.push(Span::styled(number, Style::default().fg(p.yellow)));
+        // A narrow pane drops the state word before the role can clip.
+        let state = format!("{word:<6} ");
+        if width >= used + state.width() + role_w {
+            used += state.width();
+            spans.push(Span::styled(state, Style::default().fg(color)));
+        }
+    } else {
+        let base = format!("└ {} ", row.label);
+        used += base.width();
+        spans.push(Span::styled(base, Style::default().fg(p.dim2)));
     }
+    let trail_w = |b: &Option<String>| {
+        b.as_ref().map_or(0, |b| 2 + b.width()) + if role.is_empty() { 0 } else { 2 + role.width() }
+    };
+    // A narrow pane sheds the badge before the role, and the title before both.
+    let fits = width >= used + trail_w(&badge) + 4;
+    let badge = badge.filter(|_| fits);
+    let trail = trail_w(&badge);
+    let marked = row.checked_out || row.head;
+    let title_style = if marked {
+        text_style(p).add_modifier(Modifier::BOLD)
+    } else if row.state.is_none() {
+        Style::default().fg(p.dim2)
+    } else {
+        Style::default().fg(p.dim0)
+    };
+    let title = truncate_width(&row.title, width.saturating_sub(used + trail));
+    used += title.width();
+    spans.push(Span::styled(title, title_style));
+    let pad = width.saturating_sub(used + trail);
+    spans.push(Span::raw(" ".repeat(pad)));
+    used += pad;
+    let mut target = None;
+    if let Some(badge) = badge {
+        spans.push(Span::raw("  "));
+        let start = used + 2;
+        let chosen = row.local.as_ref().is_some_and(|(_, on)| *on);
+        spans.push(Span::styled(
+            badge.clone(),
+            Style::default().fg(if chosen { p.orange } else { p.dim2 }),
+        ));
+        used = start + badge.width();
+        target = Some((start, used));
+    }
+    if !role.is_empty() {
+        let color = if row.against { p.orange } else { p.purple };
+        spans.push(Span::styled(
+            format!("  {role}"),
+            Style::default().fg(color).add_modifier(Modifier::BOLD),
+        ));
+    }
+    (spans, target)
+}
+
+/// The stack list's scroll for a `viewport`: the kept top, moved only to reveal the
+/// highlighted row after a keyboard move.
+fn stack_list_scroll(app: &App, viewport: usize, reveal: bool) -> usize {
+    let rows = app.stack_list_rows().len();
+    settle_pr_nav_scroll(
+        rows,
+        Some(app.stack_list_cursor()),
+        viewport,
+        app.stack_list_scroll(),
+        reveal,
+    )
+    .0
+}
+
+fn render_stack_list(frame: &mut Frame, app: &App, pane: Pane) {
+    let p = app.palette();
+    let rows = app.stack_list_rows();
+    let prs = rows.iter().filter(|r| r.state.is_some()).count();
+    let focused = app.focus == Focus::Stack;
+    let inner = paint_pane(frame, app, pane, &format!("Stack · {prs}"), focused);
     let width = inner.width as usize;
-    let first = menu_scroll(sp.cursor, sp.rows.len(), inner.height as usize);
-    let items: Vec<ListItem> = sp
-        .rows
+    let viewport = inner.height as usize;
+    let reveal = viewport > 0 && app.take_stack_reveal();
+    let scroll = stack_list_scroll(app, viewport, reveal);
+    app.set_stack_list_scroll(scroll);
+    let cursor = app.stack_list_cursor();
+    let items: Vec<ListItem> = rows
         .iter()
         .enumerate()
-        .skip(first)
-        .take(inner.height as usize)
+        .skip(scroll)
+        .take(viewport)
         .map(|(i, row)| {
-            let (mark, label, title, trail) = stack_row_parts(row, sp.to == Some(i));
-            // The trail right-aligns; the title clips first, so the label and the fetch
-            // state always show.
-            let fixed = mark.width() + label.width() + 2;
-            let trail_w = if trail.is_empty() { 0 } else { trail.width() + 2 };
-            let title = truncate_width(&title, width.saturating_sub(fixed + trail_w));
-            let trail = truncate_width(&trail, width.saturating_sub(fixed + title.width() + 2));
-            let pad = width.saturating_sub(fixed + title.width() + trail.width());
-            let missing = row.end.is_some() && row.via.is_none();
-            let spans = vec![
-                Span::styled(mark, Style::default().fg(p.yellow)),
-                Span::styled(label, Style::default().fg(p.blue)),
-                Span::styled("  ", text_style(p)),
-                Span::styled(title, text_style(p)),
-                Span::styled(
-                    format!("{}{trail}", " ".repeat(pad)),
-                    Style::default().fg(if missing { p.orange } else { p.dim2 }),
-                ),
-            ];
-            selectable_row(p, spans, width, (i == sp.cursor).then_some(p.surface2))
+            let (spans, _) = stack_list_line(app, row, width);
+            // The head row wears the PR tab's viewed-row violet, a step stronger under the
+            // cursor; the cursor shows only while the list holds the keyboard.
+            let under = focused && i == cursor;
+            let fill = match (under, row.head) {
+                (true, true) => Some(p.view_cursor_bg),
+                (true, false) => Some(p.cursor_bg(true)),
+                (false, true) => Some(p.view_bg),
+                (false, false) => None,
+            };
+            selectable_row(p, spans, width, fill)
         })
         .collect();
     frame.render_widget(List::new(items), inner);
 }
 
-/// The stack-picker row under the pointer.
-pub fn hit_stack_picker_row(area: Rect, app: &App, col: u16, row: u16) -> Option<usize> {
-    let sp = app.stack_picker.as_ref()?;
-    let inner = picker_inner(stack_picker_popup(area, app));
-    let first = menu_scroll(sp.cursor, sp.rows.len(), inner.height as usize);
-    menu_hit(inner, 0, first, sp.rows.len(), col, row)
+/// The stack list row a click at `(col, row)` lands on, and whether it hit the row's local
+/// badge (the toggle's target), from the painted geometry and scroll.
+#[must_use]
+pub fn hit_stack_row(area: Rect, app: &App, col: u16, row: u16) -> Option<(usize, bool)> {
+    let inner = panes(area, app).stack?.inner;
+    if !contains(inner, col, row) {
+        return None;
+    }
+    let rows = app.stack_list_rows();
+    let i = (row - inner.y) as usize + app.stack_list_scroll();
+    let hit = rows.get(i)?;
+    let (_, target) = stack_list_line(app, hit, inner.width as usize);
+    let x = (col - inner.x) as usize;
+    Some((i, target.is_some_and(|(a, b)| (a..b).contains(&x))))
+}
+
+/// Whether `(col, row)` falls in the stack list, so the wheel scrolls the list it is over.
+#[must_use]
+pub fn in_stack_pane(area: Rect, app: &App, col: u16, row: u16) -> bool {
+    panes(area, app).stack.is_some_and(|s| contains(s.outer, col, row))
 }
 
 // --- Search screen -------------------------------------------------------
