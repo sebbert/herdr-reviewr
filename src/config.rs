@@ -66,7 +66,7 @@ impl Config {
     }
 }
 
-const PLUGIN_CONFIG_KEYS: [&str; 18] = [
+const PLUGIN_CONFIG_KEYS: [&str; 19] = [
     "theme",
     "default_scope",
     "navigator_position",
@@ -76,6 +76,7 @@ const PLUGIN_CONFIG_KEYS: [&str; 18] = [
     "auto_open",
     "pane_outer_borders",
     "pr_nav_separators",
+    "hyperlinks",
     "avatars",
     "avatar_width",
     "avatar_fit",
@@ -208,6 +209,9 @@ pub struct PluginConfig {
     /// Opt-in: rule lines between the PR navigator's stack, checks, and comments sections
     /// in place of the blank rows that part them.
     pr_nav_separators: bool,
+    /// The PR tab's authors, timestamps, checks, PR numbers, and markdown links carry OSC 8
+    /// hyperlinks to the forge; `false` paints them as plain text.
+    hyperlinks: bool,
     /// Opt-in: paint each PR conversation turn's dot as the author's avatar where the
     /// terminal speaks the Kitty graphics protocol.
     avatars: bool,
@@ -235,6 +239,7 @@ impl Default for PluginConfig {
             auto_open: true,
             pane_outer_borders: true,
             pr_nav_separators: false,
+            hyperlinks: true,
             avatars: false,
             avatar_width: 1,
             avatar_fit: crate::avatar::Fit::Height,
@@ -285,6 +290,10 @@ impl PluginConfig {
 
     pub fn pr_nav_separators(&self) -> bool {
         self.pr_nav_separators
+    }
+
+    pub fn hyperlinks(&self) -> bool {
+        self.hyperlinks
     }
 
     pub fn avatars(&self) -> bool {
@@ -355,6 +364,7 @@ impl PluginConfig {
             "auto_open": self.auto_open,
             "pane_outer_borders": self.pane_outer_borders,
             "pr_nav_separators": self.pr_nav_separators,
+            "hyperlinks": self.hyperlinks,
             "avatars": self.avatars,
             "avatar_width": self.avatar_width,
             "avatar_fit": self.avatar_fit.as_str(),
@@ -537,6 +547,10 @@ fn parse_plugin_config(path: &Path) -> Result<PluginConfig, PluginConfigError> {
     if let Some(value) = table.get("pane_outer_borders") {
         config.pane_outer_borders =
             value.as_bool().ok_or_else(|| value_error(path, "pane_outer_borders", "a boolean"))?;
+    }
+    if let Some(value) = table.get("hyperlinks") {
+        config.hyperlinks =
+            value.as_bool().ok_or_else(|| value_error(path, "hyperlinks", "a boolean"))?;
     }
     if let Some(value) = table.get("avatars") {
         config.avatars =
@@ -881,6 +895,7 @@ mod tests {
         assert!(config.pane_outer_borders(), "today's framed look by default");
         assert!(!config.pr_nav_separators(), "separators are opt-in");
         assert!(!config.avatars(), "avatars are opt-in");
+        assert!(config.hyperlinks(), "hyperlinks are on by default");
         assert_eq!(config.avatar_width(), 1);
         assert_eq!(config.avatar_fit(), crate::avatar::Fit::Height);
         assert_eq!(config.github_host(), None);
@@ -902,6 +917,7 @@ mod tests {
                 "auto_open = false\n",
                 "pane_outer_borders = false\n",
                 "pr_nav_separators = true\n",
+                "hyperlinks = false\n",
                 "avatars = true\n",
                 "avatar_width = 2\n",
                 "avatar_fit = \"width\"\n",
@@ -921,6 +937,8 @@ mod tests {
         assert_eq!(config.to_json()["pane_outer_borders"], false);
         assert!(config.pr_nav_separators());
         assert_eq!(config.to_json()["pr_nav_separators"], true);
+        assert!(!config.hyperlinks());
+        assert_eq!(config.to_json()["hyperlinks"], false);
         assert!(config.avatars());
         assert_eq!(config.avatar_width(), 2);
         assert_eq!(config.to_json()["avatars"], true);
@@ -1022,6 +1040,7 @@ mod tests {
             ("pane_outer_borders = \"false\"\n", "`pane_outer_borders`"),
             ("pane_outer_borders = 0\n", "`pane_outer_borders`"),
             ("pr_nav_separators = \"yes\"\n", "`pr_nav_separators`"),
+            ("hyperlinks = \"yes\"\n", "`hyperlinks`"),
             ("avatars = \"yes\"\n", "`avatars`"),
             ("avatar_width = 0\n", "`avatar_width`"),
             ("avatar_width = 3\n", "`avatar_width`"),

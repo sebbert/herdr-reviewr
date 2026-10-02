@@ -462,14 +462,16 @@ fn build_snapshot(
     checks_truncated: bool,
 ) -> PrSnapshot {
     let id = pr["pullRequestId"].as_u64().unwrap_or_default();
+    let url = format!(
+        "{org_url}/{}/_git/{}/pullrequest/{id}",
+        crate::forge::urlencode(target.project()),
+        crate::forge::urlencode(target.name())
+    );
     PrSnapshot {
         number: id,
         title: pr["title"].as_str().unwrap_or_default().to_string(),
-        url: format!(
-            "{org_url}/{}/_git/{}/pullrequest/{id}",
-            crate::forge::urlencode(target.project()),
-            crate::forge::urlencode(target.name())
-        ),
+        comments: merge_comments(rows, pr, &url),
+        url,
         body: pr["description"].as_str().unwrap_or_default().to_string(),
         // A missing status must not read as reviewable: the empty string falls through
         // `parse_state` to the closed arm — stale, never wrong.
@@ -482,7 +484,6 @@ fn build_snapshot(
         merge: derive_merge(pr, evaluations),
         sync,
         checks,
-        comments: merge_comments(rows, pr),
         comments_truncated,
         checks_truncated,
         stack: Vec::new(),
@@ -531,7 +532,8 @@ fn build_checks(evaluations: &Value, statuses: &Value) -> Vec<Check> {
         }
         let blocking = row["configuration"]["isBlocking"].as_bool().unwrap_or(false);
         let status = policy_status(row["status"].as_str().unwrap_or_default(), blocking);
-        upsert_latest(&mut checks, Check { name: name.to_string(), status });
+        // A policy evaluation has no page of its own beyond the pull request's.
+        upsert_latest(&mut checks, Check { name: name.to_string(), status, url: None });
     }
     // Statuses arrive newest-first; iterate oldest-first so a re-run replaces its earlier run.
     let rows = statuses["value"].as_array().map(Vec::as_slice).unwrap_or_default();
@@ -541,7 +543,8 @@ fn build_checks(evaluations: &Value, statuses: &Value) -> Vec<Check> {
             continue;
         }
         let status = commit_status(row["state"].as_str().unwrap_or_default());
-        upsert_latest(&mut checks, Check { name: name.to_string(), status });
+        let url = crate::forge::web_url(&row["targetUrl"]);
+        upsert_latest(&mut checks, Check { name: name.to_string(), status, url });
     }
     checks
 }
@@ -614,7 +617,7 @@ fn is_comment(comment: &Value) -> bool {
 }
 
 /// Replies beyond the root: every later rendering comment.
-fn replies_from_thread(thread: &Value) -> Vec<Reply> {
+fn replies_from_thread(thread: &Value, pr_url: &str) -> Vec<Reply> {
     let Some(comments) = thread["comments"].as_array() else {
         return Vec::new();
     };
@@ -632,6 +635,7 @@ fn replies_from_thread(thread: &Value) -> Vec<Reply> {
                 body: comment["content"].as_str().unwrap_or("").trim().to_string(),
                 created_at: comment["publishedDate"].as_str().unwrap_or("").to_string(),
                 avatar_url: azure_avatar(&comment["author"]),
+                links: thread_links(thread, pr_url),
             }
         })
         .collect()
@@ -652,7 +656,7 @@ fn thread_line_range(context: &Value) -> (Option<u64>, Option<u64>) {
 /// are `comment` rows, file-position threads are `finding` rows with the thread's resolved
 /// status, and a reviewer vote is a `review` row. A thread
 /// carries no code context, so a finding has no snippet.
-fn merge_comments(threads: &[&Value], pr: &Value) -> Vec<Comment> {
+fn merge_comments(threads: &[&Value], pr: &Value, pr_url: &str) -> Vec<Comment> {
     let mut out: Vec<Comment> = Vec::new();
     for thread in threads {
         let Some(root) = comment_root(thread) else { continue };
@@ -693,8 +697,9 @@ fn merge_comments(threads: &[&Value], pr: &Value) -> Vec<Comment> {
             review_state: None,
             is_resolved,
             is_outdated: false,
-            replies: replies_from_thread(thread),
+            replies: replies_from_thread(thread, pr_url),
             avatar_url: azure_avatar(&root["author"]),
+            links: thread_links(thread, pr_url),
         });
     }
     for reviewer in pr["reviewers"].as_array().into_iter().flatten() {
@@ -719,6 +724,17 @@ fn merge_comments(threads: &[&Value], pr: &Value) -> Vec<Comment> {
     }
     finish_comments(&mut out);
     out
+}
+
+/// A thread's page — the pull request opened on that discussion — for its root and every
+/// reply, since Azure DevOps addresses a thread, not a comment. An identity has no public
+/// profile page, so no author links.
+fn thread_links(thread: &Value, pr_url: &str) -> crate::forge::Links {
+    let permalink = thread["id"]
+        .as_u64()
+        .filter(|_| crate::hyperlink::safe_url(pr_url).is_some())
+        .map(|id| format!("{pr_url}?discussionId={id}"));
+    crate::forge::Links { permalink, author: None }
 }
 
 /// An identity's avatar link. Azure DevOps serves it behind the organization's sign-in, so
@@ -766,7 +782,7 @@ mod tests {
              "author": {"displayName": "Author"}}
         ]});
         assert_eq!(comment_root(&thread).unwrap()["content"], "The real comment.");
-        assert!(replies_from_thread(&thread).is_empty());
+        assert!(replies_from_thread(&thread, "").is_empty());
     }
 
     #[test]
@@ -858,6 +874,31 @@ mod tests {
         assert_eq!(fork.closed_at, "");
     }
 
+    const PR_URL: &str = "https://dev.azure.com/org/proj/_git/repo/pullrequest/7";
+
+    #[test]
+    fn a_thread_links_its_discussion_and_a_status_its_target() {
+        let thread = json!({"id": 31, "status": "active", "comments": [
+            {"commentType": "text", "content": "Root.", "publishedDate": "2026-02-18T05:00:00Z",
+             "author": {"displayName": "Ann"}},
+            {"commentType": "text", "content": "Reply.", "author": {"displayName": "Bob"}},
+        ]});
+        let comments = merge_comments(&[&thread], &json!({}), PR_URL);
+        let want = format!("{PR_URL}?discussionId=31");
+        assert_eq!(comments[0].links.permalink.as_deref(), Some(want.as_str()));
+        assert_eq!(comments[0].replies[0].links.permalink.as_deref(), Some(want.as_str()));
+        assert_eq!(comments[0].links.author, None, "no profile page to link");
+
+        let statuses = json!({"value": [{"context": {"name": "ci/build"}, "state": "succeeded",
+            "targetUrl": "https://ci.example/run/9"}]});
+        let evaluations = json!({"value": [{"status": "approved",
+            "configuration": {"isBlocking": true, "type": {"displayName": "Build"}}}]});
+        let checks = build_checks(&evaluations, &statuses);
+        let url = |name: &str| checks.iter().find(|c| c.name == name).unwrap().url.clone();
+        assert_eq!(url("ci/build").as_deref(), Some("https://ci.example/run/9"));
+        assert_eq!(url("Build"), None, "a policy has no page of its own");
+    }
+
     #[test]
     fn threads_map_to_comments_findings_and_votes() {
         let threads_value = json!({"value": [
@@ -892,7 +933,7 @@ mod tests {
             {"displayName": "Quiet Reviewer", "vote": 0},
             {"displayName": "Leads", "vote": 10, "isContainer": true},
         ]});
-        let comments = merge_comments(&rows, &pr);
+        let comments = merge_comments(&rows, &pr, PR_URL);
         let finding = comments.iter().find(|c| c.kind == CommentKind::Finding).unwrap();
         assert_eq!(finding.anchor, "src/main.rs:12-14");
         assert!(finding.is_resolved);

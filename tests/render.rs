@@ -899,7 +899,7 @@ fn the_pr_footer_keeps_the_open_action_when_the_state_line_is_long() {
         number: 226,
         merge: Merge::Conflicting, // a long state line: conflicts · behind · failing · +more
         sync: Sync::Behind(3),
-        checks: vec![Check { name: "ci".into(), status: CheckStatus::Failure }],
+        checks: vec![Check { name: "ci".into(), status: CheckStatus::Failure, url: None }],
         comments_truncated: true,
         checks_truncated: true,
         ..common::pr_snapshot()
@@ -924,7 +924,7 @@ fn the_pr_footer_names_a_capped_list_in_the_pane() {
     assert!(!footer.contains("+more on"), "{footer}");
 
     app.pr = PrView::Pr(Box::new(PrSnapshot {
-        checks: vec![Check { name: "ci".into(), status: CheckStatus::Success }],
+        checks: vec![Check { name: "ci".into(), status: CheckStatus::Success, url: None }],
         checks_truncated: true,
         ..common::pr_snapshot()
     }));
@@ -1334,7 +1334,7 @@ fn a_loading_pr_navigator_does_not_consume_selection_reveal() {
     let _ = render(&app); // a useful viewport, but no selected row yet
 
     let checks = (0..20)
-        .map(|i| Check { name: format!("check-{i:02}"), status: CheckStatus::Success })
+        .map(|i| Check { name: format!("check-{i:02}"), status: CheckStatus::Success, url: None })
         .collect();
     let comments = vec![Comment { author: "selected".into(), ..common::comment() }];
     app.apply_pr(PrView::Pr(Box::new(PrSnapshot { checks, comments, ..common::pr_snapshot() })));
@@ -1697,6 +1697,7 @@ fn the_read_pane_shows_the_description_then_every_comment_oldest_first() {
                 body: "THREAD_REPLY".into(),
                 created_at: "2026-06-27T10:30:00Z".into(),
                 avatar_url: None,
+                links: herdr_reviewr::forge::Links::default(),
             }],
             ..common::comment()
         },
@@ -1996,7 +1997,7 @@ fn pr_nav_clicks_map_the_description_and_comment_rows() {
     let comment = |author: &str| Comment { author: author.into(), ..common::comment() };
     app.pr = PrView::Pr(Box::new(PrSnapshot {
         body: "the description".into(),
-        checks: vec![Check { name: "ci".into(), status: CheckStatus::Success }],
+        checks: vec![Check { name: "ci".into(), status: CheckStatus::Success, url: None }],
         comments: vec![comment("ann"), comment("bob")],
         ..common::pr_snapshot()
     }));
@@ -2028,7 +2029,7 @@ fn pr_navigator_scroll_is_independent_and_preserved() {
     app.set_tab(Tab::Pr).unwrap();
     app.navigator_position = NavigatorPosition::Bottom;
     let checks: Vec<Check> = (0..14)
-        .map(|i| Check { name: format!("check-{i:02}"), status: CheckStatus::Success })
+        .map(|i| Check { name: format!("check-{i:02}"), status: CheckStatus::Success, url: None })
         .collect();
     let comments: Vec<Comment> = (0..8)
         .map(|i| Comment {
@@ -2549,6 +2550,7 @@ fn a_finding_paints_its_replies_in_the_read_pane() {
                 body: "Addressed in abc".into(),
                 created_at: "2026-06-27T11:30:00Z".into(),
                 avatar_url: None,
+                links: herdr_reviewr::forge::Links::default(),
             }],
             ..common::comment()
         }],
@@ -4704,6 +4706,7 @@ fn the_pr_navigator_lists_the_stack_top_first_with_this_pr_marked() {
         head_ref: String::new(),
         base_ref: base.to_string(),
         level,
+        url: None,
     };
     app.apply_pr(PrView::Pr(Box::new(PrSnapshot {
         number: 11,
@@ -4916,6 +4919,7 @@ fn avatar_pr_app() -> App {
                 body: "REPLY_BODY".into(),
                 created_at: "2026-06-27T11:00:00Z".into(),
                 avatar_url: Some("https://avatars.example/bob.png".into()),
+                links: herdr_reviewr::forge::Links::default(),
             }],
             ..common::comment()
         }],
@@ -5196,12 +5200,13 @@ fn stack_pr(number: u64) -> herdr_reviewr::forge::PrSnapshot {
         head_ref: format!("head-{n}"),
         base_ref: base.to_string(),
         level: i32::try_from(n).unwrap() - i32::try_from(number).unwrap(),
+        url: None,
     };
     herdr_reviewr::forge::PrSnapshot {
         number,
         title: format!("Work {number}"),
         stack: vec![entry(10, "main"), entry(11, "head-10"), entry(12, "head-11")],
-        checks: vec![Check { name: "ci".into(), status: CheckStatus::Success }],
+        checks: vec![Check { name: "ci".into(), status: CheckStatus::Success, url: None }],
         comments: vec![common::comment()],
         repo: herdr_reviewr::git::RepoTarget::new("github.com", "o", "r"),
         ..common::pr_snapshot()
@@ -5351,8 +5356,13 @@ impl std::io::Write for Sink {
 /// position absolutely, every other escape is ignored, a printable codepoint takes its
 /// `unicode-width` cells, a zero-width one joins the cell before it, and VS16 (U+FE0F) widens
 /// that cell to two — the emoji presentation the terminal paints.
+///
+/// It also keeps OSC 8 the way Ghostty does: `ESC ] 8 ; params ; URL ST` sets the pen's link
+/// (an empty URL clears it), and every cell printed takes the pen's link.
 struct GraphemeTerminal {
     cells: Vec<Vec<String>>,
+    links: Vec<Vec<Option<String>>>,
+    pen: Option<String>,
     x: usize,
     y: usize,
     last: Option<(usize, usize)>,
@@ -5360,7 +5370,14 @@ struct GraphemeTerminal {
 
 impl GraphemeTerminal {
     fn new(w: usize, h: usize) -> Self {
-        Self { cells: vec![vec![" ".to_string(); w]; h], x: 0, y: 0, last: None }
+        Self {
+            cells: vec![vec![" ".to_string(); w]; h],
+            links: vec![vec![None; w]; h],
+            pen: None,
+            x: 0,
+            y: 0,
+            last: None,
+        }
     }
 
     fn feed(&mut self, bytes: &[u8]) {
@@ -5385,6 +5402,24 @@ impl GraphemeTerminal {
                         }
                         params.push(c);
                     }
+                } else if chars.peek() == Some(&']') {
+                    chars.next();
+                    // An OSC runs to ST (`ESC \`) or BEL.
+                    let mut body = String::new();
+                    while let Some(c) = chars.next() {
+                        if c == '\x07' {
+                            break;
+                        }
+                        if c == '\x1b' {
+                            chars.next();
+                            break;
+                        }
+                        body.push(c);
+                    }
+                    if let Some(rest) = body.strip_prefix("8;") {
+                        let url = rest.split_once(';').map_or("", |(_, url)| url);
+                        self.pen = (!url.is_empty()).then(|| url.to_string());
+                    }
                 }
                 continue;
             }
@@ -5395,6 +5430,7 @@ impl GraphemeTerminal {
                         self.cells[ly][lx].push(ch);
                         if ch == '\u{FE0F}' && lx + 1 < w && self.x == lx + 1 {
                             self.cells[ly][lx + 1] = String::new();
+                            self.links[ly][lx + 1].clone_from(&self.pen);
                             self.x += 1;
                         }
                     }
@@ -5410,9 +5446,11 @@ impl GraphemeTerminal {
                             row[self.x - 1] = " ".to_string();
                         }
                         self.cells[self.y][self.x] = ch.to_string();
+                        self.links[self.y][self.x].clone_from(&self.pen);
                         for k in 1..cw {
                             if self.x + k < w {
                                 self.cells[self.y][self.x + k] = String::new();
+                                self.links[self.y][self.x + k].clone_from(&self.pen);
                             }
                         }
                         self.last = Some((self.x, self.y));
@@ -5421,6 +5459,28 @@ impl GraphemeTerminal {
                 }
             }
         }
+    }
+
+    /// Every cell whose link differs from the frame's runs: `(x, y, wanted, shown)`.
+    fn link_disagreements(
+        &self,
+        runs: &[herdr_reviewr::hyperlink::LinkRun],
+    ) -> Vec<(usize, usize, Option<String>, Option<String>)> {
+        let mut want = vec![vec![None; self.links[0].len()]; self.links.len()];
+        for run in runs {
+            for x in run.x0..run.x1 {
+                want[run.y as usize][x as usize] = Some(run.url.to_string());
+            }
+        }
+        let mut out = Vec::new();
+        for (y, row) in self.links.iter().enumerate() {
+            for (x, got) in row.iter().enumerate() {
+                if *got != want[y][x] {
+                    out.push((x, y, want[y][x].clone(), got.clone()));
+                }
+            }
+        }
+        out
     }
 
     /// Every cell the terminal shows that disagrees with the buffer ratatui believes is there.
@@ -5442,24 +5502,42 @@ impl GraphemeTerminal {
     }
 }
 
+type LinkTerminal = Terminal<herdr_reviewr::hyperlink::HyperlinkBackend<Sink>>;
+
+/// The production terminal stack — crossterm under the OSC 8 backend — writing into `sink`.
+fn link_terminal(sink: &Sink, area: Rect) -> LinkTerminal {
+    use ratatui::{TerminalOptions, Viewport};
+    Terminal::with_options(
+        herdr_reviewr::hyperlink::HyperlinkBackend::new(sink.clone()),
+        TerminalOptions { viewport: Viewport::Fixed(area) },
+    )
+    .unwrap()
+}
+
+/// One frame the way the event loop draws it: render, hand the backend the frame's links,
+/// flush. Returns the buffer ratatui believes is on screen.
+fn draw_linked(terminal: &mut LinkTerminal, app: &App) -> Buffer {
+    let links = terminal.backend().links();
+    let frame = terminal
+        .draw(|f| {
+            ui::render(f, app);
+            *links.borrow_mut() = app.painted_hyperlinks();
+        })
+        .unwrap();
+    frame.buffer.clone()
+}
+
 /// Draw `app` through a real crossterm backend into a grapheme-aware terminal model, scroll
 /// the read pane by `pages` between frames, and report what the terminal ends up showing
 /// differently from ratatui's buffer.
 fn replay_scrolled(app: &mut App, w: u16, h: u16, pages: usize) -> Vec<(u16, u16, String, String)> {
-    use ratatui::backend::CrosstermBackend;
-    use ratatui::{TerminalOptions, Viewport};
     let sink = Sink::default();
     let area = Rect::new(0, 0, w, h);
-    let mut terminal = Terminal::with_options(
-        CrosstermBackend::new(sink.clone()),
-        TerminalOptions { viewport: Viewport::Fixed(area) },
-    )
-    .unwrap();
+    let mut terminal = link_terminal(&sink, area);
     let mut screen = GraphemeTerminal::new(w as usize, h as usize);
     let mut worst = Vec::new();
     for _ in 0..=pages {
-        let frame = terminal.draw(|f| ui::render(f, app)).unwrap();
-        let buffer = frame.buffer.clone();
+        let buffer = draw_linked(&mut terminal, app);
         screen.feed(&sink.0.borrow_mut().split_off(0));
         let bad = screen.disagreements(&buffer);
         if bad.len() > worst.len() {
@@ -5626,5 +5704,230 @@ fn the_read_thumb_tracks_top_middle_and_end_on_its_one_column_in_every_layout() 
                 );
             }
         }
+    }
+}
+
+const PR_URL: &str = "https://github.com/o/r/pull/1";
+
+/// A PR whose every navigable piece names its page: the PR and its branch, a check, a stack
+/// PR, a review, a thread with a reply, and a comment with a markdown link.
+fn linked_snapshot(check_url: &str) -> herdr_reviewr::forge::PrSnapshot {
+    use herdr_reviewr::forge::{
+        Check, CheckStatus, Comment, CommentKind, Links, PrSnapshot, PrState, Reply, ReviewState,
+        StackEntry,
+    };
+    let links = |author: &str, anchor: &str| Links {
+        permalink: Some(format!("{PR_URL}#{anchor}")),
+        author: Some(format!("https://github.com/{author}")),
+    };
+    let entry = |number: u64, level: i32| StackEntry {
+        number,
+        title: format!("stack pr {number}"),
+        state: PrState::Open,
+        is_draft: false,
+        head_ref: format!("b{number}"),
+        base_ref: "main".into(),
+        url: Some(format!("https://github.com/o/r/pull/{number}")),
+        level,
+    };
+    let long = (0..14).map(|n| format!("para {n}")).collect::<Vec<_>>().join("\n\n");
+    PrSnapshot {
+        title: "Add feature".into(),
+        url: PR_URL.into(),
+        head_ref: "feat".into(),
+        checks: vec![Check {
+            name: "build".into(),
+            status: CheckStatus::Success,
+            url: Some(check_url.into()),
+        }],
+        stack: vec![entry(1, 0), entry(2, 1)],
+        comments: vec![
+            Comment {
+                kind: CommentKind::Review,
+                author: "ann".into(),
+                anchor: "review".into(),
+                body: "Looks good.".into(),
+                review_state: Some(ReviewState::Approved),
+                created_at: "2026-06-27T09:00:00Z".into(),
+                links: links("ann", "review-1"),
+                ..common::comment()
+            },
+            Comment {
+                kind: CommentKind::Finding,
+                author: "bob".into(),
+                anchor: "x.rs:3".into(),
+                body: "Thread root.".into(),
+                created_at: "2026-06-27T10:00:00Z".into(),
+                replies: vec![Reply {
+                    author: "cat".into(),
+                    author_is_bot: false,
+                    body: "Reply.".into(),
+                    created_at: "2026-06-27T10:30:00Z".into(),
+                    avatar_url: None,
+                    links: links("cat", "discussion-r2"),
+                }],
+                links: links("bob", "discussion-r1"),
+                ..common::comment()
+            },
+            Comment {
+                // A wide-glyph name: its link covers both halves of every glyph.
+                author: "dan日本".into(),
+                body: format!("See [the docs](https://docs.example/x) first.\n\n{long}"),
+                created_at: "2026-06-27T11:00:00Z".into(),
+                links: links("dan", "issuecomment-3"),
+                ..common::comment()
+            },
+        ],
+        ..common::pr_snapshot()
+    }
+}
+
+fn linked_app(framed: bool) -> App {
+    use herdr_reviewr::forge::PrView;
+    let r = Repo::init();
+    r.write("x.rs", "y\n");
+    r.commit_all("init");
+    let mut app = app_on(&r);
+    if !framed {
+        borderless(&mut app);
+    }
+    app.set_tab(Tab::Pr).unwrap();
+    app.apply_pr(PrView::Pr(Box::new(linked_snapshot("https://ci.example/build/1"))));
+    app.focus = Focus::Diff;
+    app
+}
+
+/// Each link's painted texts, as the frame's runs cover them.
+fn link_texts(app: &App, buf: &Buffer) -> std::collections::BTreeMap<String, Vec<String>> {
+    let mut out = std::collections::BTreeMap::<String, Vec<String>>::new();
+    for run in app.painted_hyperlinks() {
+        // A wide glyph's hidden trailing cell is part of its run but not of its text.
+        let (mut text, mut x) = (String::new(), run.x0);
+        while x < run.x1 {
+            let symbol = buf[(x, run.y)].symbol();
+            text.push_str(symbol);
+            x += unicode_width::UnicodeWidthStr::width(symbol).max(1) as u16;
+        }
+        out.entry(run.url.to_string()).or_default().push(text);
+    }
+    out
+}
+
+#[test]
+fn every_navigable_piece_carries_its_link_and_nothing_else_does() {
+    for framed in [true, false] {
+        let app = linked_app(framed);
+        let buf = render_buffer(&app);
+        let out = dump(&buf);
+        let texts = link_texts(&app, &buf);
+        let of = |url: &str| texts.get(url).cloned().unwrap_or_default();
+        let profile = |who: &str| of(&format!("https://github.com/{who}"));
+        // Authors lead to their profiles: in the navigator row and in the byline.
+        assert_eq!(profile("ann"), ["@ann", "@ann"], "{out}");
+        assert_eq!(profile("bob"), ["@bob", "@bob"], "{out}");
+        assert_eq!(profile("cat"), ["@cat"], "a reply's byline:\n{out}");
+        assert_eq!(profile("dan"), ["@dan日本", "@dan日本"], "{out}");
+        // A comment's anchor and its age lead to the comment.
+        let thread = of(&format!("{PR_URL}#discussion-r1"));
+        assert!(thread.iter().filter(|t| *t == "x.rs:3").count() == 2, "{thread:?}\n{out}");
+        assert!(thread.iter().any(|t| t.ends_with('w') || t.ends_with('d')), "the age: {thread:?}");
+        let review = of(&format!("{PR_URL}#review-1"));
+        assert!(review.contains(&"review".to_string()), "the review's header: {review:?}");
+        assert!(review.contains(&"✓ approved".to_string()), "its navigator verdict: {review:?}");
+        // The check, the stack PR, the PR itself, its branch, and a markdown link.
+        assert_eq!(of("https://ci.example/build/1"), ["build"], "{out}");
+        assert_eq!(of("https://github.com/o/r/pull/2"), ["#2"], "{out}");
+        // The PR itself: the header's title and chip, and its own stack row.
+        assert_eq!(of(PR_URL), ["Add feature", "open #1 ↗", "#1"], "{out}");
+        assert_eq!(of("https://github.com/o/r/tree/feat"), ["feat"], "{out}");
+        // A markdown link carries its target over the region a click opens.
+        assert_eq!(of("https://docs.example/x"), ["the docs (https://docs.example/x)"], "{out}");
+        // No link reaches past its text into a border, a separator, or padding.
+        for (url, runs) in &texts {
+            for t in runs {
+                assert_eq!(t.trim(), t, "{url} links padding: {t:?}");
+                assert!(!t.contains('│') && !t.contains('╮') && !t.contains('·'), "{url}: {t:?}");
+            }
+        }
+        // The tags that carried the links never reach the terminal.
+        assert!(buf.content.iter().all(|c| c.underline_color == ratatui::style::Color::Reset));
+    }
+}
+
+#[test]
+fn hyperlinks_off_paints_the_same_frame_without_a_link() {
+    let on = linked_app(true);
+    let mut off = linked_app(true);
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("config.toml"), "hyperlinks = false\n").unwrap();
+    off.set_plugin_config(herdr_reviewr::config::plugin_config_in(dir.path()).unwrap());
+    let (a, b) = (render_buffer(&on), render_buffer(&off));
+    assert!(!on.painted_hyperlinks().is_empty());
+    assert!(off.painted_hyperlinks().is_empty(), "off paints no link");
+    assert_eq!(a, b, "and the cells are exactly the linked frame's");
+}
+
+#[test]
+fn osc8_links_open_and_close_on_their_runs_without_moving_a_cell() {
+    use herdr_reviewr::forge::PrView;
+    for framed in [true, false] {
+        let mut app = linked_app(framed);
+        let (w, h) = (120, 30);
+        let area = Rect::new(0, 0, w, h);
+        let sink = Sink::default();
+        let mut terminal = link_terminal(&sink, area);
+        let mut screen = GraphemeTerminal::new(w as usize, h as usize);
+        let mut frame = |app: &App, step: &str| {
+            let buffer = draw_linked(&mut terminal, app);
+            let bytes = sink.0.borrow_mut().split_off(0);
+            screen.feed(&bytes);
+            let drift = screen.disagreements(&buffer);
+            assert!(drift.is_empty(), "{step} (framed {framed}): cells drifted: {drift:?}");
+            let links = screen.link_disagreements(&app.painted_hyperlinks());
+            assert!(links.is_empty(), "{step} (framed {framed}): links wrong: {links:?}");
+            assert_eq!(screen.pen, None, "{step}: the draw left a link open");
+            let unlinked = screen.links.iter().flatten().all(Option::is_none);
+            (bytes, unlinked)
+        };
+        let (first, _) = frame(&app, "first frame");
+        assert!(String::from_utf8_lossy(&first).contains("\x1b]8;;https://github.com/ann\x1b\\"));
+        // Scrolling moves linked text under the diff; a selection moves the accent.
+        for step in ["page 1", "page 2", "page 3"] {
+            handle_key(&mut app, KeyEvent::from(KeyCode::PageDown), area, &Keymap::default())
+                .unwrap();
+            frame(&app, step);
+        }
+        handle_key(&mut app, KeyEvent::from(KeyCode::Char('j')), area, &Keymap::default()).unwrap();
+        frame(&app, "next comment");
+        // A refresh that changes only a link: the text is identical, so ratatui's diff is
+        // empty there, and the backend must reprint the cells under the new link.
+        app.apply_pr(PrView::Pr(Box::new(linked_snapshot("https://ci.example/build/2"))));
+        let (bytes, _) = frame(&app, "link-only refresh");
+        assert!(String::from_utf8_lossy(&bytes).contains("https://ci.example/build/2"));
+        // Switched off, every link leaves the screen; back on, they all return.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("config.toml"), "hyperlinks = false\n").unwrap();
+        app.set_plugin_config(herdr_reviewr::config::plugin_config_in(dir.path()).unwrap());
+        if !framed {
+            borderless(&mut app);
+            std::fs::write(
+                dir.path().join("config.toml"),
+                "hyperlinks = false\npane_outer_borders = false\n",
+            )
+            .unwrap();
+            app.set_plugin_config(herdr_reviewr::config::plugin_config_in(dir.path()).unwrap());
+        }
+        assert!(frame(&app, "hyperlinks off").1, "no link left on screen");
+        let dir = tempfile::tempdir().unwrap();
+        let on = if framed { "" } else { "pane_outer_borders = false\n" };
+        std::fs::write(dir.path().join("config.toml"), on).unwrap();
+        app.set_plugin_config(herdr_reviewr::config::plugin_config_in(dir.path()).unwrap());
+        frame(&app, "hyperlinks back on");
+        // A tab away and back repaints every row, links and all.
+        handle_key(&mut app, KeyEvent::from(KeyCode::Char('1')), area, &Keymap::default()).unwrap();
+        common::land_world(&mut app);
+        assert!(frame(&app, "changes tab").1, "the diff tab links nothing");
+        handle_key(&mut app, KeyEvent::from(KeyCode::Char('3')), area, &Keymap::default()).unwrap();
+        frame(&app, "back to PR");
     }
 }

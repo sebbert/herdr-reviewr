@@ -207,6 +207,7 @@ pub fn comment() -> herdr_reviewr::forge::Comment {
         is_outdated: false,
         replies: Vec::new(),
         avatar_url: None,
+        links: herdr_reviewr::forge::Links::default(),
     }
 }
 
@@ -232,6 +233,7 @@ pub fn thread(
             body: format!("{author} reply"),
             created_at: format!("2026-06-27T{created:02}:30:00Z"),
             avatar_url: None,
+            links: herdr_reviewr::forge::Links::default(),
         }],
         ..comment()
     }

@@ -3466,8 +3466,8 @@ fn pr_navigator_walks_comments_only_and_clamps() {
     };
     let snap = PrSnapshot {
         checks: vec![
-            Check { name: "build".into(), status: CheckStatus::Success },
-            Check { name: "test".into(), status: CheckStatus::Failure },
+            Check { name: "build".into(), status: CheckStatus::Success, url: None },
+            Check { name: "test".into(), status: CheckStatus::Failure, url: None },
         ],
         comments: vec![finding("first"), finding("second")],
         ..common::pr_snapshot()
@@ -7090,6 +7090,7 @@ fn a_drag_across_a_comment_box_copies_its_text_without_the_border() {
                 body: "gamma".into(),
                 created_at: "2026-06-27T11:00:00Z".into(),
                 avatar_url: None,
+                links: herdr_reviewr::forge::Links::default(),
             }],
             ..common::comment()
         }],
@@ -8160,6 +8161,7 @@ fn stack_snapshot(number: u64, base: &str, title: &str) -> herdr_reviewr::forge:
         head_ref: format!("head-{number}"),
         base_ref: base.to_string(),
         level,
+        url: None,
     };
     let at = i32::try_from(number).unwrap() - 11;
     herdr_reviewr::forge::PrSnapshot {
@@ -8392,6 +8394,7 @@ fn the_viewed_pr_falling_due_supersedes_a_batch_that_lacks_it() {
         head_ref: format!("head-{n}"),
         base_ref: format!("head-{}", n - 1),
         level: 0,
+        url: None,
     };
     let stack = (10..=16).map(entry).collect();
     app.apply_pr(PrView::Pr(Box::new(PrSnapshot { stack, ..stack_snapshot(11, "x", "home") })));
@@ -8508,4 +8511,34 @@ fn a_browsed_pr_outlives_leaving_the_stack_and_survives_the_file_tabs() {
     app.set_tab(herdr_reviewr::app::Tab::Pr).unwrap();
     assert_eq!(app.pr_viewing(), Some(12), "a tab round trip is no way back");
     assert_eq!(shown_number(&app), Some(12));
+}
+
+#[test]
+fn copying_linked_text_copies_the_text_and_never_the_link() {
+    use herdr_reviewr::forge::{Comment, Links};
+    let r = Repo::init();
+    r.write("x.rs", "y\n");
+    r.commit_all("init");
+    let mut app = pr_app(
+        &r,
+        vec![Comment {
+            author: "ann".into(),
+            body: "See [docs](https://docs.example/x).".into(),
+            links: Links {
+                permalink: Some("https://github.com/o/r/pull/1#issuecomment-1".into()),
+                author: Some("https://github.com/ann".into()),
+            },
+            ..common::comment()
+        }],
+    );
+    assert!(painted_cell(&app, "@ann ·").is_some(), "the byline paints");
+    assert!(!app.painted_hyperlinks().is_empty(), "the frame carries links");
+    let inner = herdr_reviewr::ui::read_inner_rect(SEL_AREA, &app);
+    sel_mouse(&mut app, MouseEventKind::Down(MouseButton::Left), inner.x, inner.y);
+    sel_mouse(&mut app, MouseEventKind::Drag(MouseButton::Left), inner.x + 100, inner.y + 6);
+    sel_mouse(&mut app, MouseEventKind::Up(MouseButton::Left), inner.x + 100, inner.y + 6);
+    let copied = last_copy().expect("the drag copies");
+    assert!(copied.contains("\n@ann · "), "the linked byline copies as text: {copied:?}");
+    assert!(copied.contains("See docs"), "{copied:?}");
+    assert!(!copied.contains('\x1b') && !copied.contains("https://github.com"), "{copied:?}");
 }

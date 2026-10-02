@@ -185,6 +185,7 @@ and click a stack row to view that PR.
   root's first line. Click the header or press `a` to unfold it (`▾`), and again to fold it.
   Any thread folds this way, on every forge. Your folds stick to their threads across
   refreshes. A thread resolved while you read it stays open until you move to another one.
+  Names, ages, checks, and PR numbers are [links](#hyperlinks) to the forge.
   reviewr never writes to the forge.
 
 ## Diff scopes
@@ -238,6 +239,7 @@ split_ratio = 0.33
 auto_open = false
 pane_outer_borders = false
 pr_nav_separators = true
+hyperlinks = false
 avatars = true
 github_host = "github.example.com"
 editor = "code -g {file}:{line}"
@@ -383,6 +385,31 @@ A PR that stacks on nothing shows no stack section. Reading the stack costs one 
 query per refresh, plus one per further level. The stack's PRs are read in batches of up to 5
 per GitHub query, one batch at a time. GitLab and Azure DevOps show no stack, but their
 MR or PR target still sets the [base](#base-branch).
+
+### Hyperlinks
+
+The PR tab's text that names something on the forge is a terminal hyperlink (OSC 8). How you
+open one depends on your terminal: in Ghostty it is ⌘-click on macOS and ctrl-click elsewhere.
+A plain click still does what it always did in reviewr.
+
+| Text | Leads to |
+| --- | --- |
+| `@author` in a byline, a folded thread, or the navigator | the author's profile |
+| a byline's age (`2d`) | that comment or reply |
+| a card's `path:line`, `review`, or `comment` header, and the navigator's anchor or verdict | that comment |
+| a check in the navigator | its run or details page |
+| the header's title and `open #12 ↗` chip, and a stack row's `#12` | that PR |
+| the header's branch | the branch (not a fork's) |
+| a markdown link in a description or comment, and in a file's preview | its target |
+
+Only `http(s)` URLs link. What a forge doesn't name stays plain text: an Azure DevOps author
+(it has no public profile page), an Azure DevOps policy check, or a GitLab approval's own page.
+The link never changes what the cell shows, and copying text never copies a link. To paint
+plain text instead:
+
+```toml
+hyperlinks = false   # default: true
+```
 
 ### Navigator separators
 

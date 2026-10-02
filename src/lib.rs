@@ -22,6 +22,7 @@ pub mod git;
 pub mod gitlab;
 pub mod herdr;
 pub mod highlight;
+pub mod hyperlink;
 pub mod keymap;
 #[macro_use]
 pub mod log;
@@ -44,7 +45,6 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
-use ratatui::DefaultTerminal;
 use ratatui::crossterm::event::{
     self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
     Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, KeyboardEnhancementFlags, MouseButton,
@@ -81,7 +81,11 @@ pub fn run() -> Result<()> {
     let mut initial_config = config::plugin_config(cfg.plugin_config_dir.as_deref());
     let mut app = app_for(&cfg, &initial_config);
 
-    let mut terminal = ratatui::init();
+    // `ratatui::init` claims raw mode and the alternate screen and installs the panic hook
+    // that restores them; its terminal is dropped for one drawing through the hyperlink
+    // backend (`hyperlink.rs`).
+    drop(ratatui::init());
+    let mut terminal = Term::new(hyperlink::HyperlinkBackend::new(io::stdout()))?;
     // The kitty keyboard protocol reports modifiers on keys the legacy encoding drops — most
     // notably Ctrl/Alt+arrows — so word-jump by arrow works where the terminal supports it.
     let kbd = supports_keyboard_enhancement().unwrap_or(false);
@@ -94,7 +98,7 @@ pub fn run() -> Result<()> {
     // (issue #4). Paint the empty frame first; then the initial load, non-fatal — an error
     // opens the pane with the reason in the status line, the same contract as a failed poll
     // refresh.
-    if let Err(error) = terminal.draw(|f| ui::render(f, &app)) {
+    if let Err(error) = draw(&mut terminal, &app) {
         restore_terminal(kbd);
         return Err(error.into());
     }
@@ -114,7 +118,7 @@ pub fn run() -> Result<()> {
         .then(|| {
             herdr::plugin_config_dir_with(|| {
                 app.status = RESOLVING_NOTE.into();
-                let _ = terminal.draw(|f| ui::render(f, &app));
+                let _ = draw(&mut terminal, &app);
             })
         })
         .flatten();
@@ -122,7 +126,7 @@ pub fn run() -> Result<()> {
         cfg.plugin_config_dir = Some(dir.into());
         initial_config = config::plugin_config(cfg.plugin_config_dir.as_deref());
         app = app_for(&cfg, &initial_config);
-        if let Err(error) = terminal.draw(|f| ui::render(f, &app)) {
+        if let Err(error) = draw(&mut terminal, &app) {
             restore_terminal(kbd);
             herdr::clear_pane_label();
             return Err(error.into());
@@ -131,7 +135,7 @@ pub fn run() -> Result<()> {
     // A slow lookup that then resolved nothing leaves its note behind; retract it.
     if app.status == RESOLVING_NOTE {
         app.status.clear();
-        let _ = terminal.draw(|f| ui::render(f, &app));
+        let _ = draw(&mut terminal, &app);
     }
     if initial_config.is_ok()
         && let Err(e) = app.reload()
@@ -142,6 +146,19 @@ pub fn run() -> Result<()> {
     let result = event_loop(&mut terminal, &mut app, &cfg, kbd);
     herdr::clear_pane_label();
     result
+}
+
+/// The terminal reviewr draws through: crossterm, with OSC 8 hyperlinks (`hyperlink.rs`).
+pub type Term = ratatui::Terminal<hyperlink::HyperlinkBackend<io::Stdout>>;
+
+/// Render `app` and flush the frame with the hyperlinks it painted.
+fn draw(terminal: &mut Term, app: &App) -> io::Result<()> {
+    let links = terminal.backend().links();
+    terminal.draw(|f| {
+        ui::render(f, app);
+        *links.borrow_mut() = app.painted_hyperlinks();
+    })?;
+    Ok(())
 }
 
 /// Claim the input modes the event loop reads, on a screen something else already owns.
@@ -220,7 +237,7 @@ fn drain_input(app: &mut App) -> Result<()> {
 /// and forgotten, so the pane never moves and the poll shows the writes like any other change
 /// to the worktree (Continuity). reviewr itself still writes nothing.
 fn run_editor(
-    terminal: &mut DefaultTerminal,
+    terminal: &mut Term,
     app: &mut App,
     configured: Option<&str>,
     kbd: bool,
@@ -328,7 +345,7 @@ fn run_editor(
 /// `Terminal::resize` rather than `Terminal::clear`: `clear` first round-trips a cursor-position
 /// query through stdin and blocks until the terminal answers, which swallows the reviewer's next
 /// keypress. `resize` clears the same region and resets the same buffer with no query.
-fn invalidate_screen(terminal: &mut DefaultTerminal) -> Result<()> {
+fn invalidate_screen(terminal: &mut Term) -> Result<()> {
     let area = terminal.size()?.into();
     terminal.resize(area)?;
     Ok(())
@@ -995,12 +1012,7 @@ fn world_wake(builds: bool) -> Duration {
 }
 
 /// Draw, then wait up to the poll deadline for input; refresh on each tick.
-fn event_loop(
-    terminal: &mut DefaultTerminal,
-    app: &mut App,
-    cfg: &Config,
-    kbd: bool,
-) -> Result<()> {
+fn event_loop(terminal: &mut Term, app: &mut App, cfg: &Config, kbd: bool) -> Result<()> {
     let poll = cfg.poll;
     let mut last_poll = Instant::now();
     // The exit signature's two halves: the last mouse event's arrival, and whether that
@@ -1156,7 +1168,7 @@ fn event_loop(
             app.bound_file_scroll(file_vp);
             let painted_frame = PaintedFrameSnapshot::capture(app);
             avatars.before_draw(app);
-            terminal.draw(|f| ui::render(f, app))?;
+            draw(terminal, app)?;
             avatars.after_draw(app);
 
             // A world completion reconciles into the view only while the view it described is
