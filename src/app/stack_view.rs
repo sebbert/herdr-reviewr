@@ -1,5 +1,5 @@
-//! PR stacks on the file tabs: the stack picker, the `stack` scope's range, the `All files`
-//! tab's stack PR tree, and the opt-in stack fetch's bookkeeping.
+//! PR stacks on the file tabs: the navigator's stack list, the `stack` scope's range, the
+//! `All files` tab's stack PR tree, and the opt-in stack fetch's bookkeeping.
 //!
 //! A range or a tree is place state: only the reader's pick, refresh, or way back moves it.
 //! Both are read-only, since neither is the checked-out work the comments belong to.
@@ -9,56 +9,28 @@ use std::fmt::Write as _;
 
 use anyhow::Result;
 
-use super::{App, Mode, Tab, step};
+use super::{App, Focus, Tab, step};
 use crate::forge;
 use crate::model::Scope;
-use crate::stack::{EndSpec, FetchJob, FetchOutcome, StackEnd, StackRange, TreeSource};
+use crate::stack::{EndSource, EndSpec, FetchJob, FetchOutcome, StackEnd, StackRange, TreeSource};
 
-/// What the open stack picker chooses.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum StackPickerPurpose {
-    /// A range for the `stack` scope: the compared PR first, then what it is compared against.
-    Range,
-    /// The `All files` tab's source: the worktree or one stack PR's tree.
-    Tree,
-}
-
-/// One stack picker row. `end` is `None` on the tree picker's worktree row.
+/// One stack list row: a stack PR (top of the stack first) or, last, the stack's base.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct StackRow {
-    pub end: Option<StackEnd>,
-    /// `#12`, the base's branch, or `worktree`.
+pub struct StackListRow {
+    pub end: StackEnd,
+    /// `#12`, or the base's branch.
     pub label: String,
     pub title: String,
-    /// The checked-out branch's PR (or the worktree row).
+    pub state: Option<(forge::PrState, bool)>,
+    /// The checked-out branch's PR: always the worktree.
     pub checked_out: bool,
-    /// How the end resolves right now, for the row's trail: the spelling, or `None` when
-    /// it is not fetched. Read once at open.
-    pub via: Option<String>,
-}
-
-/// The stack picker's state while it is open. The rows freeze at open; the highlight and the
-/// picked compared side are the reader's own place state.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct StackPicker {
-    pub purpose: StackPickerPurpose,
-    pub rows: Vec<StackRow>,
-    pub cursor: usize,
-    /// The range picker's second step: the row picked as the compared PR, waiting for the
-    /// other end.
-    pub to: Option<usize>,
-}
-
-impl StackPicker {
-    /// The picker's title: the step it waits on.
-    #[must_use]
-    pub fn title(&self) -> String {
-        match (self.purpose, self.to) {
-            (StackPickerPurpose::Tree, _) => "files · browse a stack PR".to_string(),
-            (StackPickerPurpose::Range, None) => "stack · compare which PR?".to_string(),
-            (StackPickerPurpose::Range, Some(i)) => format!("stack · {} vs …", self.rows[i].label),
-        }
-    }
+    /// The shown range's compared PR, or the tree the `All files` tab browses.
+    pub head: bool,
+    /// What the shown range compares against.
+    pub against: bool,
+    /// The same-named local branch where it differs from the PR head (never the checked-out
+    /// row), with whether the reader chose it for this row.
+    pub local: Option<(crate::stack::LocalBranch, bool)>,
 }
 
 /// The stack fetch's bookkeeping: the one job in flight, the head each PR was last asked for
@@ -105,15 +77,35 @@ impl App {
         match end {
             StackEnd::Base => {
                 let branch = self.stack_base_branch()?;
-                Some(EndSpec { end, label: branch.clone(), branch, head_oid: None })
+                Some(EndSpec {
+                    end,
+                    label: branch.clone(),
+                    branch,
+                    head_oid: None,
+                    source: EndSource::Pr,
+                })
             }
             StackEnd::Pr(n) => {
                 let entry = self.pr_stack().iter().find(|e| e.number == n)?;
+                // The checked-out PR is always the worktree; another PR is the PR as its
+                // reviewers see it, unless the reader chose its local branch on its row.
+                let source = if self.pr_checked_out_number() == Some(n) {
+                    EndSource::Worktree
+                } else if self.stack_local.contains(&n) {
+                    EndSource::Local
+                } else {
+                    EndSource::Pr
+                };
+                let label = match source {
+                    EndSource::Local => format!("#{n} (local)"),
+                    _ => format!("#{n}"),
+                };
                 Some(EndSpec {
                     end,
-                    label: format!("#{n}"),
+                    label,
                     branch: entry.head_ref.clone(),
                     head_oid: self.stack_head_oid(n),
+                    source,
                 })
             }
         }
@@ -170,6 +162,15 @@ impl App {
                 if !moved.is_empty() {
                     let _ = write!(tail, " · {} moved — {refresh} follows", moved.join(", "));
                 }
+                for (spec, at) in [(&range.to, &range.to_at), (&range.from, &range.from_at)] {
+                    if at.as_ref().is_some_and(|a| a.local_gone) {
+                        let _ = write!(
+                            tail,
+                            " · {}'s local branch is gone — PR head",
+                            spec.as_pr().label
+                        );
+                    }
+                }
                 Some((range.label(), tail))
             }
             Tab::AllFiles => {
@@ -179,6 +180,13 @@ impl App {
                 let mut tail = " · read-only".to_string();
                 if self.tree_moved || self.end_moved_on_forge(&tree.spec, tree.at.as_ref()) {
                     let _ = write!(tail, " · {} moved — {refresh} follows", tree.spec.label);
+                }
+                if tree.at.as_ref().is_some_and(|a| a.local_gone) {
+                    let _ = write!(
+                        tail,
+                        " · {}'s local branch is gone — PR head",
+                        tree.spec.as_pr().label
+                    );
                 }
                 Some((format!("{} tree{}", tree.spec.label, at.unwrap_or_default()), tail))
             }
@@ -190,6 +198,9 @@ impl App {
     /// stack cache read a push. A range never follows it on its own (Continuity).
     fn end_moved_on_forge(&self, spec: &EndSpec, at: Option<&crate::stack::Resolved>) -> bool {
         let StackEnd::Pr(n) = spec.end else { return false };
+        if spec.source != EndSource::Pr {
+            return false;
+        }
         let Some(live) = self.stack_head_oid(n) else { return false };
         at.is_some() && spec.head_oid.as_ref().is_some_and(|picked| *picked != live)
     }
@@ -251,149 +262,260 @@ impl App {
         }
     }
 
-    // --- the picker -----------------------------------------------------------------------
+    // --- the stack list -------------------------------------------------------------------
 
-    /// Open the stack picker: a range on `Changes`, a tree on `All files`. Inert under any
-    /// other overlay; without a known stack it says why.
-    pub fn open_stack_picker(&mut self) {
-        if !self.tab.is_file_tab() || self.mode != Mode::Normal {
+    /// Whether the navigator shows the stack list: a file tab with a known stack.
+    #[must_use]
+    pub fn stack_list_shown(&self) -> bool {
+        self.tab.is_file_tab() && self.stack_available()
+    }
+
+    /// The stack PRs whose local branches the next build badges: every one but the
+    /// checked-out PR, as the PR, while the list shows.
+    pub(super) fn stack_badge_specs(&self) -> Vec<EndSpec> {
+        if !self.stack_list_shown() {
+            return Vec::new();
+        }
+        let checked_out = self.pr_checked_out_number();
+        self.pr_stack()
+            .iter()
+            .filter(|e| Some(e.number) != checked_out)
+            .filter_map(|e| self.end_spec(StackEnd::Pr(e.number)))
+            .map(|s| s.as_pr())
+            .collect()
+    }
+
+    /// The stack list's rows: each stack PR top first, then the stack's base, with the roles
+    /// the shown range or tree gives them.
+    #[must_use]
+    pub fn stack_list_rows(&self) -> Vec<StackListRow> {
+        let checked_out = self.pr_checked_out_number();
+        let (head, against) = match self.tab {
+            Tab::Changes if self.scope == Scope::Stack => {
+                let r = self.stack_range.as_ref();
+                (r.map(|r| r.to.end), r.map(|r| r.from.end))
+            }
+            Tab::AllFiles => (self.files_source.as_ref().map(|t| t.spec.end), None),
+            _ => (None, None),
+        };
+        let mut rows: Vec<StackListRow> = self
+            .pr_stack()
+            .iter()
+            .rev()
+            .map(|e| {
+                let end = StackEnd::Pr(e.number);
+                let is_checked_out = checked_out == Some(e.number);
+                StackListRow {
+                    end,
+                    label: format!("#{}", e.number),
+                    title: e.title.clone(),
+                    state: Some((e.state, e.is_draft)),
+                    checked_out: is_checked_out,
+                    head: head == Some(end),
+                    against: against == Some(end),
+                    local: (!is_checked_out)
+                        .then(|| self.stack_locals.get(&e.number))
+                        .flatten()
+                        .map(|l| (l.clone(), self.stack_local.contains(&e.number))),
+                }
+            })
+            .collect();
+        if let Some(base) = self.stack_base_branch().filter(|b| !b.is_empty()) {
+            rows.push(StackListRow {
+                end: StackEnd::Base,
+                label: base,
+                title: "stack base".to_string(),
+                state: None,
+                checked_out: false,
+                head: head == Some(StackEnd::Base),
+                against: against == Some(StackEnd::Base),
+                local: None,
+            });
+        }
+        rows
+    }
+
+    /// The stack list's highlighted row index: its end by identity, else the nearest
+    /// surviving row, clamped — so a stack refresh never moves it by index.
+    #[must_use]
+    pub fn stack_list_cursor(&self) -> usize {
+        let rows = self.stack_list_rows();
+        self.stack_cursor
+            .0
+            .and_then(|end| rows.iter().position(|r| r.end == end))
+            .unwrap_or(self.stack_cursor.1)
+            .min(rows.len().saturating_sub(1))
+    }
+
+    fn set_stack_cursor(&mut self, i: usize) {
+        let rows = self.stack_list_rows();
+        let i = i.min(rows.len().saturating_sub(1));
+        self.stack_cursor = (rows.get(i).map(|r| r.end), i);
+        self.reveal_stack.set(true);
+    }
+
+    /// `stack-list`: move the keyboard into the stack list, opening on the shown range's PR
+    /// or tree, else the checked-out PR — or back to the file list from it.
+    pub fn focus_stack_list(&mut self) {
+        if self.focus == Focus::Stack {
+            self.focus = Focus::Files;
             return;
         }
-        if !self.stack_available() {
+        if !self.stack_list_shown() {
             self.status = "no PR stack here — stacks are read from GitHub".to_string();
             return;
         }
-        let checked_out = self.pr_checked_out_number();
-        let pr_row = |app: &App, e: &forge::StackEntry| StackRow {
-            end: Some(StackEnd::Pr(e.number)),
-            label: format!("#{}", e.number),
-            title: e.title.clone(),
-            checked_out: checked_out == Some(e.number),
-            via: app
-                .end_spec(StackEnd::Pr(e.number))
-                .and_then(|s| crate::stack::resolve(&app.repo, &s))
-                .map(|r| r.via),
+        if self.navigator_hidden_here() {
+            self.navigator_hidden = false;
+        }
+        if self.stack_cursor.0.is_none() {
+            let rows = self.stack_list_rows();
+            let at = rows
+                .iter()
+                .position(|r| r.head)
+                .or_else(|| rows.iter().position(|r| r.checked_out))
+                .unwrap_or(0);
+            self.set_stack_cursor(at);
+        }
+        self.focus = Focus::Stack;
+        self.reveal_stack.set(true);
+    }
+
+    pub fn stack_list_move(&mut self, delta: isize) {
+        let len = self.stack_list_rows().len();
+        if len > 0 {
+            self.set_stack_cursor(step(self.stack_list_cursor(), delta, len));
+        }
+    }
+
+    /// A click on row `i`: highlight and focus it, then activate it — or, with `against`
+    /// (a modifier-click), compare the shown PR against it.
+    pub fn stack_list_click(&mut self, i: usize, against: bool) -> Result<()> {
+        if i >= self.stack_list_rows().len() {
+            return Ok(());
+        }
+        self.focus = Focus::Stack;
+        self.set_stack_cursor(i);
+        if against { self.stack_list_against() } else { self.stack_list_activate() }
+    }
+
+    /// A click on row `i`'s local badge: highlight it and toggle its local branch.
+    pub fn stack_list_click_local(&mut self, i: usize) -> Result<()> {
+        self.focus = Focus::Stack;
+        self.set_stack_cursor(i);
+        self.stack_list_toggle_local()
+    }
+
+    /// `enter` on a row. `Changes`: a PR shows against its parent; the checked-out PR's row
+    /// goes back to the scope the range was entered from. `All files`: a row browses that
+    /// end's tree; the checked-out row goes back to the worktree.
+    pub fn stack_list_activate(&mut self) -> Result<()> {
+        let rows = self.stack_list_rows();
+        let Some(row) = rows.get(self.stack_list_cursor()).cloned() else { return Ok(()) };
+        match self.tab {
+            Tab::AllFiles => self.set_files_source((!row.checked_out).then_some(row.end)),
+            _ if row.checked_out => self.back_to_checked_out(),
+            _ => match row.end {
+                StackEnd::Pr(n) => self.pick_stack_range(row.end, self.stack_parent(n)),
+                StackEnd::Base => {
+                    let key = self.keymap().hint(crate::keymap::Action::StackAgainst).label();
+                    self.status = format!("the base is only compared against — {key} sets it");
+                    Ok(())
+                }
+            },
+        }
+    }
+
+    /// `stack-against` on a row: compare the shown range's PR — or, with none shown, the
+    /// checked-out PR — against this row.
+    pub fn stack_list_against(&mut self) -> Result<()> {
+        if self.tab != Tab::Changes {
+            self.status = "against sets a stack range's other end, on the Changes tab".into();
+            return Ok(());
+        }
+        let rows = self.stack_list_rows();
+        let Some(row) = rows.get(self.stack_list_cursor()).cloned() else { return Ok(()) };
+        let head = match (&self.stack_range, self.scope) {
+            (Some(r), Scope::Stack) => Some(r.to.end),
+            _ => self.pr_checked_out_number().map(StackEnd::Pr),
         };
-        let prs: Vec<StackRow> = self.pr_stack().iter().rev().map(|e| pr_row(self, e)).collect();
-        let (purpose, rows, cursor) = if self.tab == Tab::Changes {
-            let mut rows = prs;
-            if let Some(spec) = self.end_spec(StackEnd::Base) {
-                let via = crate::stack::resolve(&self.repo, &spec).map(|r| r.via);
-                rows.push(StackRow {
-                    end: Some(StackEnd::Base),
-                    label: spec.label,
-                    title: "stack base".to_string(),
-                    checked_out: false,
-                    via,
-                });
+        let Some(head) = head else { return Ok(()) };
+        if head == row.end {
+            self.status =
+                format!("{} is the PR shown — pick another row to compare against", row.label);
+            return Ok(());
+        }
+        self.pick_stack_range(head, row.end)
+    }
+
+    /// `stack-local` on a row: use the PR's same-named local branch instead of the PR head,
+    /// or back. Place state by PR number. A shown range or tree with that PR re-resolves at
+    /// once — it is the reader's own choice.
+    pub fn stack_list_toggle_local(&mut self) -> Result<()> {
+        let rows = self.stack_list_rows();
+        let Some(row) = rows.get(self.stack_list_cursor()).cloned() else { return Ok(()) };
+        let StackEnd::Pr(n) = row.end else { return Ok(()) };
+        if row.checked_out {
+            self.status = format!("{} is the worktree — it has no other local branch", row.label);
+            return Ok(());
+        }
+        if !self.stack_local.remove(&n) {
+            if row.local.is_none() {
+                self.status = format!("{} has no local branch that differs from the PR", row.label);
+                return Ok(());
             }
-            // On the shown range's compared PR, else the checked-out one.
-            let want = match (&self.stack_range, self.scope) {
-                (Some(r), Scope::Stack) => Some(r.to.end),
-                _ => checked_out.map(StackEnd::Pr),
-            };
-            let cursor = rows.iter().position(|r| r.end == want).unwrap_or(0);
-            (StackPickerPurpose::Range, rows, cursor)
-        } else {
-            let mut rows = vec![StackRow {
-                end: None,
-                label: "worktree".to_string(),
-                title: "the checked-out work".to_string(),
-                checked_out: true,
-                via: None,
-            }];
-            rows.extend(prs);
-            let want = self.files_source.as_ref().map(|t| t.spec.end);
-            let cursor = rows.iter().position(|r| r.end == want).unwrap_or(0);
-            (StackPickerPurpose::Tree, rows, cursor)
-        };
-        self.stack_picker = Some(StackPicker { purpose, rows, cursor, to: None });
-        self.mode = Mode::StackPick;
-    }
-
-    pub fn close_stack_picker(&mut self) {
-        if self.mode == Mode::StackPick {
-            self.mode = Mode::Normal;
+            self.stack_local.insert(n);
         }
-        self.stack_picker = None;
+        self.reresolve_end(row.end)
     }
 
-    /// `esc`: back from the second step to the first, else close.
-    pub fn stack_picker_escape(&mut self) {
-        match self.stack_picker.as_mut() {
-            Some(sp) if sp.to.is_some() => {
-                sp.cursor = sp.to.take().unwrap_or(0);
-            }
-            _ => self.close_stack_picker(),
-        }
-    }
-
-    pub fn stack_picker_move(&mut self, delta: isize) {
-        if let Some(sp) = self.stack_picker.as_mut() {
-            sp.cursor = step(sp.cursor, delta, sp.rows.len());
-        }
-    }
-
-    /// Move the highlight to `row`, for a click. A row past the end is inert.
-    pub fn stack_picker_goto(&mut self, row: usize) {
-        if let Some(sp) = self.stack_picker.as_mut()
-            && row < sp.rows.len()
+    /// Re-resolve the shown range's or tree's `end` from its live spec, after the reader
+    /// changed which commit it stands for.
+    fn reresolve_end(&mut self, end: StackEnd) -> Result<()> {
+        if let Some(range) = self.stack_range.clone()
+            && (range.to.end == end || range.from.end == end)
         {
-            sp.cursor = row;
+            let to = self.end_spec(range.to.end).unwrap_or(range.to);
+            let from = self.end_spec(range.from.end).unwrap_or(range.from);
+            self.stack_range = Some(StackRange::resolve(&self.repo, to, from));
+            self.stack_status = None;
+            self.cache = crate::diff::DiffCache::new();
+            if self.scope == Scope::Stack {
+                self.reload()?;
+            }
         }
+        if let Some(tree) = self.files_source.clone()
+            && tree.spec.end == end
+        {
+            let spec = self.end_spec(end).unwrap_or(tree.spec);
+            self.files_source = Some(TreeSource::resolve(&self.repo, spec));
+            self.tree_moved = false;
+            if self.tab == Tab::AllFiles {
+                self.reload()?;
+            }
+        }
+        Ok(())
     }
 
-    /// `enter`: on the tree picker, browse the highlight; on the range picker, take the
-    /// highlight as the compared PR, then as the end it is compared against.
-    pub fn stack_picker_pick(&mut self) -> Result<()> {
-        let Some(sp) = self.stack_picker.as_mut() else { return Ok(()) };
-        let Some(row) = sp.rows.get(sp.cursor).cloned() else { return Ok(()) };
-        match (sp.purpose, sp.to) {
-            (StackPickerPurpose::Tree, _) => {
-                self.close_stack_picker();
-                self.set_files_source(row.end)
-            }
-            (StackPickerPurpose::Range, None) => {
-                let Some(StackEnd::Pr(n)) = row.end else {
-                    self.status =
-                        "pick a PR to compare first; the base is only compared against".into();
-                    return Ok(());
-                };
-                sp.to = Some(sp.cursor);
-                // The second step opens on the PR's parent: `enter enter` is this PR vs its parent.
-                let parent = self.stack_parent(n);
-                if let Some(sp) = self.stack_picker.as_mut() {
-                    sp.cursor =
-                        sp.rows.iter().position(|r| r.end == Some(parent)).unwrap_or(sp.cursor);
-                }
-                Ok(())
-            }
-            (StackPickerPurpose::Range, Some(to)) => {
-                let to = sp.rows[to].end;
-                if row.end == to {
-                    self.status = "pick another end to compare against".into();
-                    return Ok(());
-                }
-                let (Some(to), Some(from)) = (to, row.end) else { return Ok(()) };
-                self.close_stack_picker();
-                self.pick_stack_range(to, from)
-            }
-        }
+    /// The stack list's top row as last painted, and the renderer's write-back.
+    #[must_use]
+    pub fn stack_list_scroll(&self) -> usize {
+        self.stack_scroll.get()
     }
 
-    /// The highlighted (or already picked) PR against its parent, or against the stack's base.
-    pub fn stack_picker_shortcut(&mut self, against_base: bool) -> Result<()> {
-        let Some(sp) = self.stack_picker.as_ref() else { return Ok(()) };
-        if sp.purpose != StackPickerPurpose::Range {
-            return Ok(());
-        }
-        let Some(StackEnd::Pr(n)) = sp.rows.get(sp.to.unwrap_or(sp.cursor)).and_then(|r| r.end)
-        else {
-            return Ok(());
-        };
-        let from = if against_base { StackEnd::Base } else { self.stack_parent(n) };
-        self.close_stack_picker();
-        self.pick_stack_range(StackEnd::Pr(n), from)
+    pub fn set_stack_list_scroll(&self, scroll: usize) {
+        self.stack_scroll.set(scroll);
+    }
+
+    /// Consume a pending reveal of the highlighted row.
+    pub fn take_stack_reveal(&self) -> bool {
+        self.reveal_stack.replace(false)
+    }
+
+    /// The wheel over the stack list: move the viewport alone.
+    pub fn scroll_stack_list(&mut self, delta: isize) {
+        let next = self.stack_scroll.get().saturating_add_signed(delta);
+        self.stack_scroll.set(next);
     }
 
     /// Show `to` against `from` in the `stack` scope: both ends resolve now and freeze, the

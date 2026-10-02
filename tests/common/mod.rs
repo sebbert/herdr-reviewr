@@ -58,6 +58,12 @@ impl Repo {
         String::from_utf8_lossy(&out.stdout).into_owned()
     }
 
+    /// Run `git -C <repo> <args>`, returning trimmed stdout, or `None` when it fails.
+    pub fn git_try(&self, args: &[&str]) -> Option<String> {
+        let out = Command::new("git").arg("-C").arg(self.path()).args(args).output().ok()?;
+        out.status.success().then(|| String::from_utf8_lossy(&out.stdout).trim().to_string())
+    }
+
     /// Run `git -C <repo> <args>`, asserting success, returning stdout.
     pub fn git(&self, args: &[&str]) -> String {
         self.git_env(args, &[])

@@ -5932,9 +5932,15 @@ fn osc8_links_open_and_close_on_their_runs_without_moving_a_cell() {
     }
 }
 
-// --- PR stacks on the file tabs -----------------------------------------------------
+// --- PR stacks on the file tabs: the navigator's stack list -----------------------
 
-/// `main` ← `head-10` ← `head-11` (checked out) ← `head-12`, the stack known.
+fn with_config(app: &mut App, toml: &str) {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("config.toml"), toml).unwrap();
+    app.set_plugin_config(herdr_reviewr::config::plugin_config_in(dir.path()).unwrap());
+}
+
+/// `main` ← `head-10` ← `head-11` (checked out) ← `head-12`, the stack known and read.
 fn stack_render_app(fetched_twelve: bool) -> (Repo, App) {
     use herdr_reviewr::forge::{PrSnapshot, PrState, PrView, StackEntry};
     let r = Repo::init();
@@ -5946,8 +5952,12 @@ fn stack_render_app(fetched_twelve: bool) -> (Repo, App) {
         r.commit_all(&format!("pr {n}"));
     }
     r.git(&["checkout", "-q", "head-11"]);
+    let tip = |n: u64| r.git(&["rev-parse", &format!("head-{n}")]).trim().to_string();
+    let heads: Vec<(u64, String)> = vec![(10, tip(10)), (11, tip(11)), (12, tip(12))];
     if !fetched_twelve {
         r.git(&["branch", "-q", "-D", "head-12"]);
+        r.git(&["reflog", "expire", "--expire=now", "--all"]);
+        r.git(&["gc", "-q", "--prune=now"]);
     }
     let entry = |number, base: &str, level| StackEntry {
         number,
@@ -5959,63 +5969,135 @@ fn stack_render_app(fetched_twelve: bool) -> (Repo, App) {
         level,
         url: None,
     };
-    let mut app = app_on(&r);
-    app.apply_pr(PrView::Pr(Box::new(PrSnapshot {
-        number: 11,
-        head_ref: "head-11".into(),
-        base_ref: "head-10".into(),
+    let snapshot = |number: u64, base: &str| PrSnapshot {
+        number,
+        head_ref: format!("head-{number}"),
+        head_oid: heads.iter().find(|(n, _)| *n == number).unwrap().1.clone(),
+        base_ref: base.into(),
         stack: vec![entry(10, "main", -1), entry(11, "head-10", 0), entry(12, "head-11", 1)],
         repo: herdr_reviewr::git::RepoTarget::new("github.com", "o", "r"),
         ..common::pr_snapshot()
-    })));
+    };
+    let mut app = app_on(&r);
+    app.apply_pr(PrView::Pr(Box::new(snapshot(11, "head-10"))));
+    let batch = app.take_stack_batch(std::time::Instant::now(), None).unwrap();
+    let results = batch
+        .numbers
+        .iter()
+        .map(|&n| (n, PrView::Pr(Box::new(snapshot(n, &format!("head-{}", n - 1))))))
+        .collect();
+    app.land_stack_batch(batch.tag, results, std::time::Instant::now());
+    common::land_world(&mut app);
     (r, app)
 }
 
+fn stack_line<'a>(out: &'a str, needle: &str) -> Option<(usize, &'a str)> {
+    out.lines().enumerate().find(|(_, l)| l.contains(needle))
+}
+
 #[test]
-fn the_header_names_the_range_and_says_read_only() {
+fn the_stack_list_sits_above_the_file_list_by_default_and_below_on_request() {
     let (_r, mut app) = stack_render_app(true);
-    let keymap = Keymap::default();
-    let area = Rect::new(0, 0, 140, 40);
-    for code in [KeyCode::Char('P'), KeyCode::Char('k'), KeyCode::Char('p')] {
-        handle_key(&mut app, KeyEvent::from(code), area, &keymap).unwrap();
-    }
     let out = render(&app);
+    let (stack_y, _) = stack_line(&out, "Stack · 3").expect("the stack list's title");
+    let (files_y, _) = stack_line(&out, "┌ Files").expect("the file list's title");
+    let (twelve_y, twelve) = stack_line(&out, "#12 open").expect("#12's row");
+    let (base_y, _) = stack_line(&out, "└ main").expect("the base row");
+    assert!(stack_y < twelve_y && twelve_y < base_y && base_y < files_y, "{out}");
+    assert!(twelve.contains("pr 12 title"), "{twelve}");
+    let (_, eleven) = stack_line(&out, "#11 open").unwrap();
+    assert!(eleven.contains('●'), "the checked-out PR is marked: {eleven}");
+
+    with_config(&mut app, "stack_list_position = \"bottom\"\n");
+    let out = render(&app);
+    let (stack_y, _) = stack_line(&out, "Stack · 3").unwrap();
+    let (files_y, _) = stack_line(&out, "┌ Files").unwrap();
+    assert!(files_y < stack_y, "below the file list:\n{out}");
+}
+
+#[test]
+fn the_stack_list_parts_from_the_file_list_with_and_without_outer_borders() {
+    let (_r, mut app) = stack_render_app(true);
+    let out = render(&app);
+    // Framed: two boxes, their borders meeting.
+    let (base_y, _) = stack_line(&out, "└ main").unwrap();
+    let below = out.lines().nth(base_y + 1).unwrap();
+    assert!(below.contains('╰') || below.contains('└'), "the stack box closes: {below}");
+
+    with_config(&mut app, "pane_outer_borders = false\n");
+    let out = render(&app);
+    let (base_y, base) = stack_line(&out, "└ main").unwrap();
+    let col = base.chars().position(|c| c == '└').unwrap();
+    let divider: Vec<char> = out.lines().nth(base_y + 1).unwrap().chars().collect();
+    assert_eq!(divider[col], '─', "a one-row divider under the list:\n{out}");
+    assert!(out.lines().nth(base_y + 2).unwrap().contains("Files"), "{out}");
+}
+
+#[test]
+fn the_rows_wear_their_roles_and_the_header_names_the_range() {
+    let (_r, mut app) = stack_render_app(true);
+    app.pick_stack_range(
+        herdr_reviewr::stack::StackEnd::Pr(12),
+        herdr_reviewr::stack::StackEnd::Base,
+    )
+    .unwrap();
+    let buf = render_buffer(&app);
+    let out = dump(&buf);
     let header = out.lines().next().unwrap();
-    assert!(header.contains("[stack] #12 vs #11 · read-only"), "{header}");
-    // The footer keeps the way back from the file list, and from the diff offers another
-    // pick too — never the comment key.
-    let footer = out.lines().rev().find(|l| !l.trim().is_empty()).unwrap();
-    assert!(footer.contains("0 checked out"), "{footer}");
+    assert!(header.contains("[stack] #12 vs main · read-only"), "{header}");
+    let (y12, twelve) = stack_line(&out, "#12 open").unwrap();
+    assert!(twelve.contains("head"), "{twelve}");
+    let (_, base) = stack_line(&out, "└ main").unwrap();
+    assert!(base.contains("against"), "{base}");
+    // The head row wears the PR tab's viewed-row fill.
+    let x = twelve.chars().position(|c| c == '#').unwrap() as u16;
+    assert_eq!(buf[(x, y12 as u16)].bg, app.palette().view_bg);
+    // A click on the range's name puts the keys on the stack list.
+    let keymap = Keymap::default();
+    let col = header.find("#12 vs").unwrap() as u16;
+    let area = Rect::new(0, 0, 140, 40);
+    assert_eq!(ui::hit_header(area, &app, &keymap, col, 0), Some(HeaderHit::Stack));
+    // The footer from the diff: the list leads, never the comment key.
     app.focus = Focus::Diff;
     let out = render(&app);
     let footer = out.lines().rev().find(|l| !l.trim().is_empty()).unwrap();
     assert!(footer.contains("P stack") && footer.contains("0 checked out"), "{footer}");
     assert!(!footer.contains("c comment"), "{footer}");
-    // A click on the range's name opens the picker.
-    let col = header.find("#12 vs").unwrap() as u16;
-    assert_eq!(ui::hit_header(area, &app, &keymap, col, 0), Some(HeaderHit::Stack));
 }
 
 #[test]
-fn the_stack_picker_lists_the_stack_with_its_fetch_state() {
-    let (_r, mut app) = stack_render_app(false);
-    app.open_stack_picker();
+fn a_local_branch_that_moved_on_shows_its_badge_and_the_choice_names_it() {
+    let (r, mut app) = stack_render_app(true);
+    // `head-12` gains a commit locally that the PR does not have.
+    let other = tempfile::tempdir().unwrap();
+    let wt = other.path().join("wt");
+    let wt_s = wt.to_str().unwrap().to_string();
+    r.git(&["worktree", "add", "-q", &wt_s, "head-12"]);
+    std::fs::write(wt.join("l.rs"), "l\n").unwrap();
+    r.git(&["-C", &wt_s, "add", "-A"]);
+    r.git(&["-C", &wt_s, "commit", "-q", "-m", "local"]);
+    common::land_world(&mut app);
     let out = render(&app);
-    assert!(out.contains("stack · compare which PR?"), "{out}");
-    let row = |label: &str| out.lines().find(|l| l.contains(label)).unwrap_or_default().to_string();
-    assert!(row("#12").contains("not fetched"), "{out}");
-    assert!(row("#11").contains("checked out · head-11"), "{out}");
-    assert!(row("main").contains("stack base"), "{out}");
-    let footer = out.lines().rev().find(|l| !l.trim().is_empty()).unwrap();
-    assert!(footer.contains("enter compare") && footer.contains("p vs parent"), "{footer}");
+    let (_, twelve) = stack_line(&out, "#12 open").unwrap();
+    assert!(twelve.contains("local +1 -0"), "{twelve}");
 
-    // The second step names the compared PR in the title.
-    app.stack_picker_pick().unwrap();
-    assert!(render(&app).contains("stack · #11 vs …"));
+    app.stack_local.insert(12);
+    app.pick_stack_range(
+        herdr_reviewr::stack::StackEnd::Pr(12),
+        herdr_reviewr::stack::StackEnd::Pr(11),
+    )
+    .unwrap();
+    let out = render(&app);
+    assert!(
+        out.lines().next().unwrap().contains("[stack] #12 (local) vs #11 · read-only"),
+        "{out}"
+    );
+    let (_, twelve) = stack_line(&out, "#12 open").unwrap();
+    assert!(twelve.contains("[local +1 -0]"), "the chosen badge reads as on: {twelve}");
 }
 
 #[test]
-fn a_not_fetched_end_paints_how_to_fetch_it_in_both_panes() {
+fn a_not_fetched_end_paints_how_to_fetch_it() {
     let (_r, mut app) = stack_render_app(false);
     app.pick_stack_range(
         herdr_reviewr::stack::StackEnd::Pr(12),
@@ -6023,17 +6105,48 @@ fn a_not_fetched_end_paints_how_to_fetch_it_in_both_panes() {
     )
     .unwrap();
     let out = render(&app);
-    let hint = "#12's branch isn't fetched — `git fetch origin head-12`";
-    assert!(out.matches(hint).count() >= 1, "{out}");
+    assert!(out.contains("#12's branch isn't fetched — `git fetch origin head-12`"), "{out}");
 }
 
 #[test]
-fn all_files_names_the_browsed_tree() {
+fn without_a_stack_there_is_no_stack_box() {
+    let r = Repo::init();
+    r.write("a.rs", "a\n");
+    r.commit_all("init");
+    let app = app_on(&r);
+    let out = render(&app);
+    assert!(!out.contains("Stack ·"), "{out}");
+}
+
+#[test]
+fn a_narrow_or_short_navigator_keeps_the_roles_and_the_file_list() {
+    let (_r, mut app) = stack_render_app(true);
+    app.pick_stack_range(
+        herdr_reviewr::stack::StackEnd::Pr(12),
+        herdr_reviewr::stack::StackEnd::Pr(11),
+    )
+    .unwrap();
+    let out = dump(&render_size(&app, 60, 30));
+    let (_, twelve) = stack_line(&out, "#12 ").unwrap();
+    assert!(twelve.contains("head"), "the role outlasts the title: {twelve}");
+    // Short: the list shrinks to what fits and scrolls, the file list keeps its rows.
+    let out = dump(&render_size(&app, 120, 9));
+    assert!(out.contains("Stack · 3") && out.contains("A f12.rs"), "{out}");
+    assert_eq!(out.matches(" open ").count(), 1, "one stack row shows:\n{out}");
+    // Too short for both: the file list keeps the navigator.
+    let out = dump(&render_size(&app, 120, 7));
+    assert!(!out.contains("Stack ·") && out.contains("Files"), "{out}");
+}
+
+#[test]
+fn all_files_names_the_browsed_tree_and_marks_its_row() {
     let (_r, mut app) = stack_render_app(true);
     enter_tab(&mut app, Tab::AllFiles);
     app.set_files_source(Some(herdr_reviewr::stack::StackEnd::Pr(10))).unwrap();
     let out = render(&app);
     let header = out.lines().next().unwrap();
     assert!(header.contains("#10 tree ") && header.contains("· read-only"), "{header}");
+    let (_, ten) = stack_line(&out, "#10 open").unwrap();
+    assert!(ten.contains("tree"), "{ten}");
     assert!(out.contains("f10.rs") && !out.contains("f12.rs"), "{out}");
 }

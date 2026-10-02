@@ -1620,6 +1620,21 @@ pub fn blob_size(repo: &Path, rev: &str, path: &str) -> Option<usize> {
     git_line(repo, &["cat-file", "-s", &format!("{rev}:{path}")])?.parse().ok()
 }
 
+/// Every local branch's tip by short name, in one `for-each-ref`.
+pub fn local_branch_tips(repo: &Path) -> HashMap<String, String> {
+    git_lenient(repo, &["for-each-ref", "--format=%(refname:short) %(objectname)", "refs/heads/"])
+        .lines()
+        .filter_map(|l| l.rsplit_once(' ').map(|(n, o)| (n.to_string(), o.to_string())))
+        .collect()
+}
+
+/// How many commits `a` has that `b` lacks, and `b` has that `a` lacks.
+pub fn ahead_behind(repo: &Path, a: &str, b: &str) -> Option<(u32, u32)> {
+    let out = git_line(repo, &["rev-list", "--left-right", "--count", &format!("{a}...{b}")])?;
+    let mut it = out.split_whitespace().map(str::parse::<u32>);
+    Some((it.next()?.ok()?, it.next()?.ok()?))
+}
+
 /// The private ref one stack PR's head is fetched into (`stack_fetch`). The only refs a
 /// fetch writes, under the worktree's own `refs/worktree/reviewr/` namespace.
 pub const STACK_REF_PREFIX: &str = "refs/worktree/reviewr/stack/";
