@@ -24,6 +24,7 @@ pub enum Action {
     ScopeCommits,
     BasePick,
     CommitPick,
+    StackPick,
     TabChanges,
     TabAllFiles,
     TabPr,
@@ -158,7 +159,7 @@ impl Key {
 
 /// Every action with its config name and default keys — the single source the default keymap,
 /// the name lookup, and the config error message are built from.
-const ACTIONS: [(Action, &str, &[Key]); 44] = [
+const ACTIONS: [(Action, &str, &[Key]); 45] = [
     (Action::Down, "down", &[Key::plain('j'), Key::named(KeyCode::Down)]),
     (Action::Up, "up", &[Key::plain('k'), Key::named(KeyCode::Up)]),
     (Action::NextHunk, "next-hunk", &[Key::plain(']')]),
@@ -177,6 +178,7 @@ const ACTIONS: [(Action, &str, &[Key]); 44] = [
     (Action::ScopeCommits, "scope-commits", &[Key::plain('g')]),
     (Action::BasePick, "base-pick", &[Key::plain('B')]),
     (Action::CommitPick, "commit-pick", &[Key::plain('G')]),
+    (Action::StackPick, "stack-pick", &[Key::plain('P')]),
     (Action::TabChanges, "tab-changes", &[Key::plain('1')]),
     (Action::TabAllFiles, "tab-all-files", &[Key::plain('2')]),
     (Action::TabPr, "tab-pr", &[Key::plain('3')]),
@@ -337,6 +339,7 @@ mod tests {
         assert_eq!(keymap.action_for(Key::plain('a')), Some(Action::ToggleThread));
         assert_eq!(keymap.action_for(Key::plain('g')), Some(Action::ScopeCommits));
         assert_eq!(keymap.action_for(Key::plain('G')), Some(Action::CommitPick));
+        assert_eq!(keymap.action_for(Key::plain('P')), Some(Action::StackPick));
         assert_eq!(keymap.action_for(Key::plain('?')), Some(Action::Keys));
         assert_eq!(keymap.hint(Action::Send), Key::plain('s'));
         assert_eq!(keymap.hint(Action::TabPr), Key::plain('3'));

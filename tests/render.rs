@@ -5931,3 +5931,109 @@ fn osc8_links_open_and_close_on_their_runs_without_moving_a_cell() {
         frame(&app, "back to PR");
     }
 }
+
+// --- PR stacks on the file tabs -----------------------------------------------------
+
+/// `main` ← `head-10` ← `head-11` (checked out) ← `head-12`, the stack known.
+fn stack_render_app(fetched_twelve: bool) -> (Repo, App) {
+    use herdr_reviewr::forge::{PrSnapshot, PrState, PrView, StackEntry};
+    let r = Repo::init();
+    r.write("base.rs", "base\n");
+    r.commit_all("init");
+    for n in [10, 11, 12] {
+        r.git(&["checkout", "-q", "-b", &format!("head-{n}")]);
+        r.write(&format!("f{n}.rs"), &format!("pr {n}\n"));
+        r.commit_all(&format!("pr {n}"));
+    }
+    r.git(&["checkout", "-q", "head-11"]);
+    if !fetched_twelve {
+        r.git(&["branch", "-q", "-D", "head-12"]);
+    }
+    let entry = |number, base: &str, level| StackEntry {
+        number,
+        title: format!("pr {number} title"),
+        state: PrState::Open,
+        is_draft: false,
+        head_ref: format!("head-{number}"),
+        base_ref: base.to_string(),
+        level,
+        url: None,
+    };
+    let mut app = app_on(&r);
+    app.apply_pr(PrView::Pr(Box::new(PrSnapshot {
+        number: 11,
+        head_ref: "head-11".into(),
+        base_ref: "head-10".into(),
+        stack: vec![entry(10, "main", -1), entry(11, "head-10", 0), entry(12, "head-11", 1)],
+        repo: herdr_reviewr::git::RepoTarget::new("github.com", "o", "r"),
+        ..common::pr_snapshot()
+    })));
+    (r, app)
+}
+
+#[test]
+fn the_header_names_the_range_and_says_read_only() {
+    let (_r, mut app) = stack_render_app(true);
+    let keymap = Keymap::default();
+    let area = Rect::new(0, 0, 140, 40);
+    for code in [KeyCode::Char('P'), KeyCode::Char('k'), KeyCode::Char('p')] {
+        handle_key(&mut app, KeyEvent::from(code), area, &keymap).unwrap();
+    }
+    let out = render(&app);
+    let header = out.lines().next().unwrap();
+    assert!(header.contains("[stack] #12 vs #11 · read-only"), "{header}");
+    // The footer keeps the way back from the file list, and from the diff offers another
+    // pick too — never the comment key.
+    let footer = out.lines().rev().find(|l| !l.trim().is_empty()).unwrap();
+    assert!(footer.contains("0 checked out"), "{footer}");
+    app.focus = Focus::Diff;
+    let out = render(&app);
+    let footer = out.lines().rev().find(|l| !l.trim().is_empty()).unwrap();
+    assert!(footer.contains("P stack") && footer.contains("0 checked out"), "{footer}");
+    assert!(!footer.contains("c comment"), "{footer}");
+    // A click on the range's name opens the picker.
+    let col = header.find("#12 vs").unwrap() as u16;
+    assert_eq!(ui::hit_header(area, &app, &keymap, col, 0), Some(HeaderHit::Stack));
+}
+
+#[test]
+fn the_stack_picker_lists_the_stack_with_its_fetch_state() {
+    let (_r, mut app) = stack_render_app(false);
+    app.open_stack_picker();
+    let out = render(&app);
+    assert!(out.contains("stack · compare which PR?"), "{out}");
+    let row = |label: &str| out.lines().find(|l| l.contains(label)).unwrap_or_default().to_string();
+    assert!(row("#12").contains("not fetched"), "{out}");
+    assert!(row("#11").contains("checked out · head-11"), "{out}");
+    assert!(row("main").contains("stack base"), "{out}");
+    let footer = out.lines().rev().find(|l| !l.trim().is_empty()).unwrap();
+    assert!(footer.contains("enter compare") && footer.contains("p vs parent"), "{footer}");
+
+    // The second step names the compared PR in the title.
+    app.stack_picker_pick().unwrap();
+    assert!(render(&app).contains("stack · #11 vs …"));
+}
+
+#[test]
+fn a_not_fetched_end_paints_how_to_fetch_it_in_both_panes() {
+    let (_r, mut app) = stack_render_app(false);
+    app.pick_stack_range(
+        herdr_reviewr::stack::StackEnd::Pr(12),
+        herdr_reviewr::stack::StackEnd::Pr(11),
+    )
+    .unwrap();
+    let out = render(&app);
+    let hint = "#12's branch isn't fetched — `git fetch origin head-12`";
+    assert!(out.matches(hint).count() >= 1, "{out}");
+}
+
+#[test]
+fn all_files_names_the_browsed_tree() {
+    let (_r, mut app) = stack_render_app(true);
+    enter_tab(&mut app, Tab::AllFiles);
+    app.set_files_source(Some(herdr_reviewr::stack::StackEnd::Pr(10))).unwrap();
+    let out = render(&app);
+    let header = out.lines().next().unwrap();
+    assert!(header.contains("#10 tree ") && header.contains("· read-only"), "{header}");
+    assert!(out.contains("f10.rs") && !out.contains("f12.rs"), "{out}");
+}

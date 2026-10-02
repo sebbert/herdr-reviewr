@@ -1,7 +1,8 @@
 //! Git access: scopes, changed files, and diffs.
 //!
-//! The only writes are private refs under `refs/worktree/reviewr/`. Nothing here
-//! commits, stages, or mutates the worktree, the index, or any branch.
+//! The only writes are private refs under `refs/worktree/reviewr/` (and, with the opt-in
+//! `stack_fetch`, the objects `crate::stack`'s fetch adds). Nothing here commits, stages, or
+//! mutates the worktree, the index, or any branch.
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -1565,8 +1566,8 @@ pub fn changed_files(
             ),
             None => return Ok(Vec::new()),
         },
-        // `last-turn` and `commits` diff through their own entry points.
-        Scope::LastTurn | Scope::Commits => return Ok(Vec::new()),
+        // `last-turn`, `commits`, and `stack` diff through their own entry points.
+        Scope::LastTurn | Scope::Commits | Scope::Stack => return Ok(Vec::new()),
     };
     // Branch diffs against the worktree, so like uncommitted it carries untracked files
     // that `git diff` never reports.
@@ -1593,6 +1594,58 @@ pub fn changed_between(repo: &Path, old: &str, new: &str) -> Result<Vec<ChangedF
     let numstat = git(repo, &["diff", old, new, "--numstat", "-z"])?;
     let name_status = git(repo, &["diff", old, new, "--name-status", "-z"])?;
     assemble(repo, &numstat, &name_status, false)
+}
+
+/// The merge-base of two commits, for a stack range's old side: what `to` added since it
+/// left `from`. `None` for unrelated histories or a missing commit.
+pub fn merge_base_of(repo: &Path, a: &str, b: &str) -> Option<String> {
+    git_line(repo, &["merge-base", a, b])
+}
+
+/// Every file path in commit `rev`'s tree, for the `All files` tab browsing a stack PR: read
+/// from the object store with `ls-tree`, nothing checked out. A submodule lists as its path.
+pub fn tree_files(repo: &Path, rev: &str) -> Result<Vec<WorktreeEntry>> {
+    let listed = git(repo, &["ls-tree", "-r", "-z", "--name-only", "--full-tree", rev])?;
+    let mut out: Vec<WorktreeEntry> = listed
+        .split('\0')
+        .filter(|s| !s.is_empty())
+        .map(|path| WorktreeEntry { path: path.to_string(), ignored: false, is_dir: false })
+        .collect();
+    out.sort_by(|a, b| a.path.cmp(&b.path));
+    Ok(out)
+}
+
+/// The size in bytes of `path`'s blob at `rev`, `None` when it is not a blob there.
+pub fn blob_size(repo: &Path, rev: &str, path: &str) -> Option<usize> {
+    git_line(repo, &["cat-file", "-s", &format!("{rev}:{path}")])?.parse().ok()
+}
+
+/// The private ref one stack PR's head is fetched into (`stack_fetch`). The only refs a
+/// fetch writes, under the worktree's own `refs/worktree/reviewr/` namespace.
+pub const STACK_REF_PREFIX: &str = "refs/worktree/reviewr/stack/";
+
+#[must_use]
+pub fn stack_ref(number: u64) -> String {
+    format!("{STACK_REF_PREFIX}{number}")
+}
+
+/// The stack PR numbers that hold a private stack ref in this worktree.
+pub fn stack_ref_numbers(repo: &Path) -> Result<Vec<u64>, GitFail> {
+    let out = git_strict(repo, &["for-each-ref", "--format=%(refname)", STACK_REF_PREFIX])?;
+    Ok(out.lines().filter_map(|l| l.strip_prefix(STACK_REF_PREFIX)?.parse().ok()).collect())
+}
+
+/// Delete the private stack ref of each PR that left the stack. Only refs under
+/// [`STACK_REF_PREFIX`] are ever touched.
+pub fn prune_stack_refs(repo: &Path, keep: &[u64]) -> Result<Vec<u64>, GitFail> {
+    let mut pruned = Vec::new();
+    for number in stack_ref_numbers(repo)? {
+        if !keep.contains(&number) {
+            git_strict(repo, &["update-ref", "-d", &stack_ref(number)])?;
+            pruned.push(number);
+        }
+    }
+    Ok(pruned)
 }
 
 /// `sha`'s first parent, or the empty tree when `sha` is a root commit: the old side of a

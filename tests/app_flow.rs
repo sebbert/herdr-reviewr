@@ -8542,3 +8542,372 @@ fn copying_linked_text_copies_the_text_and_never_the_link() {
     assert!(copied.contains("See docs"), "{copied:?}");
     assert!(!copied.contains('\x1b') && !copied.contains("https://github.com"), "{copied:?}");
 }
+
+// --- PR stacks on the file tabs: ranges and trees -------------------------------------
+
+/// `main` ← `head-10` ← `head-11` ← `head-12`, each adding its own file, checked out on
+/// `head-11` with an uncommitted edit — the stack `stack_snapshot` describes.
+fn stack_range_repo() -> Repo {
+    let r = Repo::init();
+    r.write("base.rs", "base\n");
+    r.commit_all("init");
+    for n in [10, 11, 12] {
+        r.git(&["checkout", "-q", "-b", &format!("head-{n}")]);
+        r.write(&format!("f{n}.rs"), &format!("pr {n}\n"));
+        r.commit_all(&format!("pr {n}"));
+    }
+    r.git(&["checkout", "-q", "head-11"]);
+    r.write("f11.rs", "pr 11\nlocal edit\n");
+    r
+}
+
+/// The app on the stack's checked-out #11, its stack known.
+fn stack_app(r: &Repo) -> App {
+    let mut app = app_on(r);
+    app.apply_pr(herdr_reviewr::forge::PrView::Pr(Box::new(stack_snapshot(
+        11, "head-10", "eleven",
+    ))));
+    app
+}
+
+fn listed(app: &App) -> Vec<String> {
+    app.entries.iter().map(|e| e.path.clone()).collect()
+}
+
+fn picker_labels(app: &App) -> Vec<String> {
+    app.stack_picker
+        .as_ref()
+        .map(|sp| sp.rows.iter().map(|r| r.label.clone()).collect())
+        .unwrap_or_default()
+}
+
+#[test]
+fn the_stack_picker_compares_a_pr_against_its_parent_with_enter_enter() {
+    let r = stack_range_repo();
+    let mut app = stack_app(&r);
+    let keymap = Keymap::default();
+    assert!(offers(&app, FooterAction::StackPick), "the key shows where a stack is known");
+
+    press(&mut app, &keymap, KeyCode::Char('P'));
+    assert_eq!(app.mode, Mode::StackPick);
+    assert_eq!(
+        picker_labels(&app),
+        ["#12", "#11", "#10", "main"],
+        "top of the stack first, then the base"
+    );
+    let sp = app.stack_picker.as_ref().unwrap();
+    assert_eq!(sp.cursor, 1, "the highlight opens on the checked-out PR");
+    assert!(sp.rows[1].checked_out);
+
+    press(&mut app, &keymap, KeyCode::Enter);
+    let sp = app.stack_picker.as_ref().unwrap();
+    assert_eq!((sp.to, sp.cursor), (Some(1), 2), "the second step opens on the parent");
+    press(&mut app, &keymap, KeyCode::Enter);
+    assert_eq!(app.mode, Mode::Normal);
+    assert_eq!(app.scope, Scope::Stack);
+    assert_eq!(app.stack_header().unwrap().0, "#11 vs #10");
+    // The PR's committed work alone: not the parent's file, not the uncommitted edit.
+    assert_eq!(listed(&app), ["f11.rs"]);
+    app.focus = Focus::Diff;
+    assert!(app.visible.iter().any(|row| row.text() == "pr 11"));
+    assert!(!app.visible.iter().any(|row| row.text().contains("local edit")));
+}
+
+#[test]
+fn the_shortcuts_pick_this_pr_against_its_parent_or_the_stack_base() {
+    let r = stack_range_repo();
+    let mut app = stack_app(&r);
+    let keymap = Keymap::default();
+    press(&mut app, &keymap, KeyCode::Char('P'));
+    press(&mut app, &keymap, KeyCode::Char('b'));
+    assert_eq!(app.stack_header().unwrap().0, "#11 vs main");
+    assert_eq!(listed(&app), ["f10.rs", "f11.rs"]);
+
+    press(&mut app, &keymap, KeyCode::Char('P'));
+    assert_eq!(app.stack_picker.as_ref().unwrap().cursor, 1, "reopens on the shown range's PR");
+    press(&mut app, &keymap, KeyCode::Char('k'));
+    press(&mut app, &keymap, KeyCode::Char('p'));
+    assert_eq!(app.stack_header().unwrap().0, "#12 vs #11");
+    assert_eq!(listed(&app), ["f12.rs"]);
+
+    // `esc` steps back from the second step, then closes; the base is never the compared side.
+    press(&mut app, &keymap, KeyCode::Char('P'));
+    press(&mut app, &keymap, KeyCode::Enter);
+    press(&mut app, &keymap, KeyCode::Esc);
+    assert_eq!(app.stack_picker.as_ref().unwrap().to, None);
+    for _ in 0..3 {
+        press(&mut app, &keymap, KeyCode::Char('j'));
+    }
+    press(&mut app, &keymap, KeyCode::Enter);
+    assert_eq!(app.stack_picker.as_ref().unwrap().to, None, "the base row is not a compared PR");
+    press(&mut app, &keymap, KeyCode::Esc);
+    assert_eq!(app.mode, Mode::Normal);
+    assert_eq!(app.stack_header().unwrap().0, "#12 vs #11", "a cancel leaves the range alone");
+}
+
+#[test]
+fn a_range_is_read_only_and_the_checked_out_comments_wait_for_the_way_back() {
+    let r = stack_range_repo();
+    let mut app = stack_app(&r);
+    let keymap = Keymap::default();
+    comment_on(&mut app, '+', "on the worktree");
+    assert_eq!(app.store.len(), 1);
+    let worktree_lines = app.commented_lines();
+    assert!(!worktree_lines.is_empty());
+
+    press(&mut app, &keymap, KeyCode::Char('P'));
+    press(&mut app, &keymap, KeyCode::Char('p'));
+    assert!(app.read_only_view());
+    // The same file is open, yet the worktree comment renders nowhere on the range.
+    assert_eq!(app.diff_path.as_deref(), Some("f11.rs"));
+    assert!(app.commented_lines().is_empty());
+    app.focus = Focus::Diff;
+    press(&mut app, &keymap, KeyCode::Char('c'));
+    assert_eq!(app.mode, Mode::Normal, "no composing on a range");
+    assert!(app.status.contains("read-only: #11 vs #10"), "{}", app.status);
+    assert!(!offers(&app, FooterAction::Comment));
+    assert!(offers(&app, FooterAction::StackBack));
+    press(&mut app, &keymap, KeyCode::Char('e'));
+    assert_eq!(app.editor_request, None, "the editor's lines are not the range's");
+    assert_eq!(app.store.len(), 1);
+
+    // `0` goes back to the scope the range was entered from, the comment where it was.
+    press(&mut app, &keymap, KeyCode::Char('0'));
+    assert_eq!(app.scope, Scope::Uncommitted);
+    assert!(!app.read_only_view());
+    assert_eq!(app.commented_lines(), worktree_lines);
+}
+
+#[test]
+fn a_moved_head_never_yanks_the_range_and_refresh_follows_it_by_number() {
+    let r = stack_range_repo();
+    let mut app = stack_app(&r);
+    let keymap = Keymap::default();
+    press(&mut app, &keymap, KeyCode::Char('P'));
+    press(&mut app, &keymap, KeyCode::Char('k'));
+    press(&mut app, &keymap, KeyCode::Char('p'));
+    assert_eq!(listed(&app), ["f12.rs"]);
+
+    // The stack cache reads a push to #12: the range stays, the header says so.
+    let mut pushed = stack_snapshot(12, "head-11", "twelve");
+    pushed.head_oid = "1".repeat(40);
+    let batch = app.take_stack_batch(Instant::now(), None).expect("the stack is read ahead");
+    let results = batch
+        .numbers
+        .iter()
+        .map(|&n| {
+            let view = if n == 12 {
+                herdr_reviewr::forge::PrView::Pr(Box::new(pushed.clone()))
+            } else {
+                stack_view(n, "read")
+            };
+            (n, view)
+        })
+        .collect();
+    app.land_stack_batch(batch.tag, results, Instant::now());
+    assert_eq!(listed(&app), ["f12.rs"]);
+    assert!(app.stack_moved().is_empty(), "the pick had no forge head to move from");
+
+    // The local branch moves under the open range: a poll notices, never follows.
+    let other = tempfile::tempdir().unwrap();
+    let wt = other.path().join("wt");
+    r.git(&["worktree", "add", "-q", wt.to_str().unwrap(), "head-12"]);
+    std::fs::write(wt.join("g12.rs"), "more\n").unwrap();
+    let in_wt = |args: &[&str]| {
+        let mut full = vec!["-C", wt.to_str().unwrap()];
+        full.extend_from_slice(args);
+        r.git(&full);
+    };
+    in_wt(&["add", "-A"]);
+    in_wt(&["commit", "-q", "-m", "more 12"]);
+    common::land_world(&mut app);
+    assert_eq!(listed(&app), ["f12.rs"], "the frozen tip still shows");
+    let (_, tail) = app.stack_header().unwrap();
+    assert!(tail.contains("#12 moved — r follows"), "{tail}");
+
+    // The reader's refresh follows by PR number, and the cursor stays on its file.
+    press(&mut app, &keymap, KeyCode::Char('r'));
+    assert_eq!(listed(&app), ["f12.rs", "g12.rs"]);
+    assert_eq!(app.diff_path.as_deref(), Some("f12.rs"));
+    common::land_world(&mut app);
+    assert!(app.stack_moved().is_empty());
+}
+
+#[test]
+fn a_pr_whose_branch_is_not_fetched_says_how_to_fetch_it() {
+    let r = stack_range_repo();
+    r.git(&["branch", "-q", "-D", "head-12"]);
+    let mut app = stack_app(&r);
+    let keymap = Keymap::default();
+    press(&mut app, &keymap, KeyCode::Char('P'));
+    let sp = app.stack_picker.as_ref().unwrap();
+    assert_eq!(sp.rows[0].via, None, "#12's row says it is not fetched");
+    assert_eq!(sp.rows[1].via.as_deref(), Some("head-11"));
+    press(&mut app, &keymap, KeyCode::Char('k'));
+    press(&mut app, &keymap, KeyCode::Char('p'));
+    assert_eq!(app.scope, Scope::Stack);
+    assert!(app.entries.is_empty(), "never an empty diff pretending to be real");
+    assert_eq!(
+        app.stack_message().as_deref(),
+        Some("#12's branch isn't fetched — `git fetch origin head-12`")
+    );
+    assert!(offers(&app, FooterAction::StackPick));
+    assert!(offers(&app, FooterAction::StackBack));
+}
+
+#[test]
+fn all_files_browses_a_stack_prs_tree_and_one_key_goes_back() {
+    let r = stack_range_repo();
+    r.write("untracked.rs", "here only\n");
+    let mut app = stack_app(&r);
+    let keymap = Keymap::default();
+    enter_tab(&mut app, herdr_reviewr::app::Tab::AllFiles);
+    let worktree = listed(&app);
+    assert!(worktree.contains(&"untracked.rs".to_string()));
+
+    press(&mut app, &keymap, KeyCode::Char('P'));
+    assert_eq!(picker_labels(&app), ["worktree", "#12", "#11", "#10"]);
+    press(&mut app, &keymap, KeyCode::Char('j'));
+    press(&mut app, &keymap, KeyCode::Enter);
+    assert_eq!(
+        listed(&app),
+        ["base.rs", "f10.rs", "f11.rs", "f12.rs"],
+        "#12's tree, from the store"
+    );
+    assert!(app.stack_header().unwrap().0.starts_with("#12 tree "));
+    let at = app.entries.iter().position(|e| e.path == "f11.rs").unwrap();
+    app.file_cursor = app.file_rows.iter().position(|row| row.file_index() == Some(at)).unwrap();
+    app.move_cursor(0).unwrap();
+    common::land_world(&mut app);
+    assert_eq!(app.diff_path.as_deref(), Some("f11.rs"));
+    // The tree's content, not the worktree's uncommitted edit.
+    assert!(!app.visible.iter().any(|row| row.text().contains("local edit")));
+    app.focus = Focus::Diff;
+    press(&mut app, &keymap, KeyCode::Char('c'));
+    assert_eq!(app.mode, Mode::Normal, "no comments on a stack PR's tree");
+    assert!(app.status.contains("#12's tree"), "{}", app.status);
+
+    // One key back to the worktree, on the same file.
+    press(&mut app, &keymap, KeyCode::Char('0'));
+    assert!(app.files_source.is_none());
+    assert_eq!(listed(&app), worktree);
+    assert_eq!(app.diff_path.as_deref(), Some("f11.rs"));
+    assert!(app.visible.iter().any(|row| row.text().contains("local edit")));
+}
+
+#[test]
+fn without_a_stack_the_feature_is_not_offered() {
+    let r = stack_range_repo();
+    let mut app = app_on(&r);
+    let keymap = Keymap::default();
+    assert!(!offers(&app, FooterAction::StackPick));
+    press(&mut app, &keymap, KeyCode::Char('P'));
+    assert_eq!(app.mode, Mode::Normal);
+    assert!(app.status.contains("no PR stack"), "{}", app.status);
+    app.set_scope(Scope::Stack).unwrap();
+    assert_eq!(app.scope, Scope::Uncommitted, "the scope is entered only by a pick");
+}
+
+#[test]
+fn stack_fetch_asks_once_per_head_and_a_failure_lands_in_the_hint() {
+    let r = stack_range_repo();
+    r.git(&["branch", "-q", "-D", "head-12"]);
+    let mut app = stack_app(&r);
+    // Off by default: nothing is ever fetched.
+    assert_eq!(app.take_stack_fetch(), None);
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("config.toml"), "stack_fetch = true\n").unwrap();
+    app.set_plugin_config(herdr_reviewr::config::plugin_config_in(dir.path()).unwrap());
+
+    // A head is asked for only once the forge reports it.
+    let job = app.take_stack_fetch().expect("the first job prunes to the stack");
+    assert_eq!(job.keep, [10, 11, 12]);
+    assert!(job.wanted.is_empty());
+    app.land_stack_fetch(&herdr_reviewr::stack::FetchOutcome {
+        tag: job.tag,
+        fetched: vec![],
+        error: None,
+    });
+    assert_eq!(app.take_stack_fetch(), None, "nothing new to ask");
+
+    let mut twelve = stack_snapshot(12, "head-11", "twelve");
+    twelve.head_oid = "2".repeat(40);
+    let batch = app.take_stack_batch(Instant::now(), None).unwrap();
+    let results = batch
+        .numbers
+        .iter()
+        .map(|&n| {
+            let v = if n == 12 {
+                herdr_reviewr::forge::PrView::Pr(Box::new(twelve.clone()))
+            } else {
+                stack_view(n, "r")
+            };
+            (n, v)
+        })
+        .collect();
+    app.land_stack_batch(batch.tag, results, Instant::now());
+    let job = app.take_stack_fetch().expect("#12's head is known now");
+    assert_eq!(job.wanted, [(12, "2".repeat(40))]);
+    assert_eq!(app.take_stack_fetch(), None, "one job in flight");
+
+    let keymap = Keymap::default();
+    press(&mut app, &keymap, KeyCode::Char('P'));
+    press(&mut app, &keymap, KeyCode::Char('k'));
+    press(&mut app, &keymap, KeyCode::Char('p'));
+    assert_eq!(app.stack_message().as_deref(), Some("#12's branch isn't fetched yet — fetching…"));
+    app.land_stack_fetch(&herdr_reviewr::stack::FetchOutcome {
+        tag: job.tag,
+        fetched: vec![12],
+        error: Some("could not read from remote".into()),
+    });
+    assert_eq!(
+        app.stack_message().as_deref(),
+        Some("#12's branch isn't fetched — fetch failed: could not read from remote")
+    );
+    assert_eq!(app.take_stack_fetch(), None, "a failed head is not asked again on its own");
+    // The reader's refresh asks again.
+    press(&mut app, &keymap, KeyCode::Char('r'));
+    assert!(app.take_stack_fetch().is_some_and(|j| j.wanted == [(12, "2".repeat(40))]));
+}
+
+/// Land a stack batch where #12 reads with `head` and every other PR plainly.
+fn land_twelve_at(app: &mut App, head: &str, refresh: Option<Duration>) {
+    let mut twelve = stack_snapshot(12, "head-11", "twelve");
+    twelve.head_oid = head.to_string();
+    let batch = app.take_stack_batch(Instant::now(), refresh).expect("a batch is due");
+    let results = batch
+        .numbers
+        .iter()
+        .map(|&n| {
+            let v = if n == 12 {
+                herdr_reviewr::forge::PrView::Pr(Box::new(twelve.clone()))
+            } else {
+                stack_view(n, "r")
+            };
+            (n, v)
+        })
+        .collect();
+    app.land_stack_batch(batch.tag, results, Instant::now());
+}
+
+#[test]
+fn a_push_the_stack_cache_reads_marks_the_range_stale_without_moving_it() {
+    let r = stack_range_repo();
+    let mut app = stack_app(&r);
+    let keymap = Keymap::default();
+    land_twelve_at(&mut app, &"1".repeat(40), None);
+    press(&mut app, &keymap, KeyCode::Char('P'));
+    press(&mut app, &keymap, KeyCode::Char('k'));
+    press(&mut app, &keymap, KeyCode::Char('p'));
+    let world = app.world_input();
+    assert!(app.stack_moved().is_empty());
+
+    land_twelve_at(&mut app, &"3".repeat(40), Some(Duration::ZERO));
+    assert_eq!(app.stack_moved(), ["#12"]);
+    assert_eq!(app.world_input(), world, "the range itself never moved");
+    assert_eq!(listed(&app), ["f12.rs"]);
+    // The reader's refresh takes the new head as the pick's; the local branch still names it.
+    press(&mut app, &keymap, KeyCode::Char('r'));
+    assert!(app.stack_moved().is_empty());
+    assert_eq!(listed(&app), ["f12.rs"]);
+}

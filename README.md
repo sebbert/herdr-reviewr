@@ -17,7 +17,8 @@ the terminal.
 One persistent pane, pointed at a git worktree:
 
 - **Diff review** — the agent's changed files, syntax-highlighted.
-- **Four diff scopes** — uncommitted, branch, last turn, commits.
+- **Four diff scopes** — uncommitted, branch, last turn, commits — plus any stacked PR against
+  another or the stack's base.
 - **Last-turn diff** — what the worktree's latest turn changed, on its own.
 - **Line comments** — comment on a line or a range. Then send it to the agent.
 - **Text selection** — drag over any text to copy it, like an editor.
@@ -110,6 +111,8 @@ The keys below are defaults. You can rebind every action, even to several keys a
 | `u` `b` `t` `g` | Switch scope — uncommitted / branch / last turn / commits |
 | `B` | Pick the base branch |
 | `G` | Pick the commits to review |
+| `P` | Compare stack PRs (Changes) or browse a stack PR's tree (All files) ([Stacked PRs](#stacked-prs)) |
+| `0` | Back from a stack range or tree to the checked-out work |
 | `j` `k` · `↑` `↓` | Move cursor |
 | `]` `[` | Jump to next / previous hunk |
 | `f` `F` | Jump to next / previous file |
@@ -174,7 +177,8 @@ and click a stack row to view that PR.
 
 - **Changes** — the active scope's changed files with `+/-` stats and totals in the header.
 - **All files** — any file's current content from the whole worktree, comments too. A collapsed
-  folder with a changed file under it shows a dot. Ignored paths show dimmed.
+  folder with a changed file under it shows a dot. Ignored paths show dimmed. `P` switches it
+  to a stack PR's tree, read-only, and `0` back ([Stacked PRs](#stacked-prs)).
 - **PR** — a read-only mirror of the branch's pull request (GitHub, Azure DevOps) or merge
   request (GitLab): state, checks, description, and comments, rendered as markdown. A GitHub
   PR that is part of a stack lists the stack too ([Stacked PRs](#stacked-prs)). The read
@@ -199,6 +203,9 @@ and click a stack row to view that PR.
   ([Limitations](#limitations)).
 - **commits** — one commit, or several in a row, picked with `G`. Read what the agent
   committed one step at a time, without its unsaved edits mixed in.
+- **stack** — one PR of the branch's stack against another, or against the stack's base,
+  picked with `P` (GitHub). Read-only: it is not your checked-out work
+  ([Stacked PRs](#stacked-prs)).
 
 reviewr starts in **uncommitted**. `default_scope` changes that. Switching with `u`/`b`/`t`/`g`
 wins for the rest of the session. `g` without a pick opens the picker.
@@ -240,6 +247,7 @@ auto_open = false
 pane_outer_borders = false
 pr_nav_separators = true
 hyperlinks = false
+stack_fetch = true
 avatars = true
 github_host = "github.example.com"
 editor = "code -g {file}:{line}"
@@ -386,6 +394,61 @@ query per refresh, plus one per further level. The stack's PRs are read in batch
 per GitHub query, one batch at a time. GitLab and Azure DevOps show no stack, but their
 MR or PR target still sets the [base](#base-branch).
 
+**Compare stack PRs.** On the Changes tab, `P` (`stack-pick`) opens the stack: its PRs top
+first, then the stack's base (the trunk the bottom PR targets). Press `Enter` on the PR to
+read, then `Enter` on what to compare it against. The second step opens on the PR's parent, so
+`P Enter Enter` is the checked-out PR against its parent. `p` picks the highlighted PR against
+its parent at once, `b` against the stack's base. `esc` steps back. The **stack** scope then
+shows the range, and the header names it:
+
+```text
+[stack] #12 vs #11 · read-only
+```
+
+The diff runs from the two tips' merge-base to the PR's tip: what the PR adds over the other
+end, the way GitHub shows a PR over its base. A parent that moved on after the PR branched off
+it never reads as the PR's own change. A PR compared against one stacked on top of it adds
+nothing, and the panes say so.
+
+Each end is read from refs already in your repository: the PR's local branch, then its
+`origin/` branch, then reviewr's own fetched ref (below), then the PR's head commit if it is
+in the object store. The base prefers `origin/<base>`. An end nothing local names shows how to
+fetch it: `#12's branch isn't fetched — git fetch origin feature-b`. The picker marks such a
+row `not fetched`.
+
+A range is read-only. Nothing is checked out, the comment key says why it does nothing, the
+editor key does nothing, and your comments, which belong to the checked-out work, don't show
+on it. They are all there again when you go back. `0` (`checked-out-pr`) returns to the scope
+you came from. `u`/`b`/`t`/`g` work too. To review your own work against the parent, use the
+**branch** scope, which already diffs against the stacked PR's parent.
+
+The range stays on the commits it was picked at. When a branch moves, or the PR tab's stack
+read sees a push, the header adds `#12 moved — r follows`. `r` re-reads both ends by PR
+number, and the open file stays open.
+
+**Browse a stack PR's tree.** On the All files tab, `P` lists the worktree and the stack's PRs.
+Pick a PR to browse its tree from the object store: the same tree, preview, and find,
+nothing checked out. The header reads `#12 tree 1a2b3c4 · read-only`. Comments are off there.
+`0` goes back to the worktree, on the same file. A PR whose branch is not fetched says so, the
+same way.
+
+**Fetch stack PRs automatically.** `stack_fetch = true` (off by default) lets reviewr fetch
+every stack PR whose head is not in your repository yet, once the stack read names the head.
+Each PR's head goes into reviewr's private ref `refs/worktree/reviewr/stack/<N>`, read from
+GitHub's `refs/pull/<N>/head`, so a fork PR fetches too:
+
+```text
+git fetch --no-tags --no-write-fetch-head --refmap= origin +refs/pull/<N>/head:refs/worktree/reviewr/stack/<N>
+```
+
+Nothing else moves: no branch, no `refs/remotes/` ref, no `origin/HEAD`, not the index or the
+worktree, so the **branch** scope's base never shifts because of it. The empty `--refmap`
+keeps a configured `refs/pull/*` fetch refspec from writing its own `refs/remotes/` copy. All the PRs go in one
+`git fetch`, one at a time, off the UI thread, with no credential prompt and a one-minute
+limit. A PR is fetched again only when the stack read reports a new head. A failed fetch shows
+its error in the not-fetched message; `r` tries again. When a PR leaves the stack, its private
+ref is deleted.
+
 ### Hyperlinks
 
 The PR tab's text that names something on the forge is a terminal hyperlink (OSC 8). How you
@@ -476,6 +539,7 @@ The action names and their defaults:
 | `next-file` / `prev-file` | `f` / `F` |
 | `scope-uncommitted` / `scope-branch` / `scope-last-turn` / `scope-commits` | `u` / `b` / `t` / `g` |
 | `base-pick` / `commit-pick` | `B` / `G` |
+| `stack-pick` | `P` |
 | `tab-changes` / `tab-all-files` / `tab-pr` | `1` / `2` / `3` |
 | `wrap` | `w` |
 | `preview` | `m` |
@@ -494,7 +558,7 @@ The action names and their defaults:
 | `copy` | `y`, `Y` |
 | `open-pr` | `o` |
 | `toggle-thread` | `a` |
-| `checked-out-pr` | `0` |
+| `checked-out-pr` | `0` (also leaves a stack range or tree) |
 | `refresh` | `r` |
 | `quit` | `q` |
 
