@@ -66,7 +66,7 @@ impl Config {
     }
 }
 
-const PLUGIN_CONFIG_KEYS: [&str; 19] = [
+const PLUGIN_CONFIG_KEYS: [&str; 20] = [
     "theme",
     "default_scope",
     "navigator_position",
@@ -77,6 +77,7 @@ const PLUGIN_CONFIG_KEYS: [&str; 19] = [
     "pane_outer_borders",
     "pr_nav_separators",
     "hyperlinks",
+    "stack_fetch",
     "avatars",
     "avatar_width",
     "avatar_fit",
@@ -212,6 +213,9 @@ pub struct PluginConfig {
     /// The PR tab's authors, timestamps, checks, PR numbers, and markdown links carry OSC 8
     /// hyperlinks to the forge; `false` paints them as plain text.
     hyperlinks: bool,
+    /// Opt-in: fetch each stack PR's head into reviewr's private `refs/worktree/reviewr/stack/`
+    /// refs, so a stack range or tree can read a PR whose branch was never fetched.
+    stack_fetch: bool,
     /// Opt-in: paint each PR conversation turn's dot as the author's avatar where the
     /// terminal speaks the Kitty graphics protocol.
     avatars: bool,
@@ -240,6 +244,7 @@ impl Default for PluginConfig {
             pane_outer_borders: true,
             pr_nav_separators: false,
             hyperlinks: true,
+            stack_fetch: false,
             avatars: false,
             avatar_width: 1,
             avatar_fit: crate::avatar::Fit::Height,
@@ -294,6 +299,10 @@ impl PluginConfig {
 
     pub fn hyperlinks(&self) -> bool {
         self.hyperlinks
+    }
+
+    pub fn stack_fetch(&self) -> bool {
+        self.stack_fetch
     }
 
     pub fn avatars(&self) -> bool {
@@ -365,6 +374,7 @@ impl PluginConfig {
             "pane_outer_borders": self.pane_outer_borders,
             "pr_nav_separators": self.pr_nav_separators,
             "hyperlinks": self.hyperlinks,
+            "stack_fetch": self.stack_fetch,
             "avatars": self.avatars,
             "avatar_width": self.avatar_width,
             "avatar_fit": self.avatar_fit.as_str(),
@@ -551,6 +561,10 @@ fn parse_plugin_config(path: &Path) -> Result<PluginConfig, PluginConfigError> {
     if let Some(value) = table.get("hyperlinks") {
         config.hyperlinks =
             value.as_bool().ok_or_else(|| value_error(path, "hyperlinks", "a boolean"))?;
+    }
+    if let Some(value) = table.get("stack_fetch") {
+        config.stack_fetch =
+            value.as_bool().ok_or_else(|| value_error(path, "stack_fetch", "a boolean"))?;
     }
     if let Some(value) = table.get("avatars") {
         config.avatars =
@@ -896,6 +910,7 @@ mod tests {
         assert!(!config.pr_nav_separators(), "separators are opt-in");
         assert!(!config.avatars(), "avatars are opt-in");
         assert!(config.hyperlinks(), "hyperlinks are on by default");
+        assert!(!config.stack_fetch(), "stack fetching is opt-in");
         assert_eq!(config.avatar_width(), 1);
         assert_eq!(config.avatar_fit(), crate::avatar::Fit::Height);
         assert_eq!(config.github_host(), None);
@@ -918,6 +933,7 @@ mod tests {
                 "pane_outer_borders = false\n",
                 "pr_nav_separators = true\n",
                 "hyperlinks = false\n",
+                "stack_fetch = true\n",
                 "avatars = true\n",
                 "avatar_width = 2\n",
                 "avatar_fit = \"width\"\n",
@@ -939,6 +955,8 @@ mod tests {
         assert_eq!(config.to_json()["pr_nav_separators"], true);
         assert!(!config.hyperlinks());
         assert_eq!(config.to_json()["hyperlinks"], false);
+        assert!(config.stack_fetch());
+        assert_eq!(config.to_json()["stack_fetch"], true);
         assert!(config.avatars());
         assert_eq!(config.avatar_width(), 2);
         assert_eq!(config.to_json()["avatars"], true);
@@ -1025,6 +1043,8 @@ mod tests {
             ("default_scope = \"last turn\"\n", "`default_scope`"),
             // `commits` is never a start scope: the pane holds no pick yet.
             ("default_scope = \"commits\"\n", "`default_scope`"),
+            // Nor is `stack`: a range is picked, never configured.
+            ("default_scope = \"stack\"\n", "`default_scope`"),
             ("navigator_position = \"center\"\n", "`navigator_position`"),
             ("toggle_placement = \"left\"\n", "`toggle_placement`"),
             ("toggle_direction = \"left\"\n", "`toggle_direction`"),
@@ -1041,6 +1061,7 @@ mod tests {
             ("pane_outer_borders = 0\n", "`pane_outer_borders`"),
             ("pr_nav_separators = \"yes\"\n", "`pr_nav_separators`"),
             ("hyperlinks = \"yes\"\n", "`hyperlinks`"),
+            ("stack_fetch = \"yes\"\n", "`stack_fetch`"),
             ("avatars = \"yes\"\n", "`avatars`"),
             ("avatar_width = 0\n", "`avatar_width`"),
             ("avatar_width = 3\n", "`avatar_width`"),
@@ -1338,6 +1359,7 @@ mod tests {
         assert_eq!(object["split_ratio"], 0.4);
         assert_eq!(object["auto_open"], true);
         assert_eq!(object["pr_nav_separators"], false);
+        assert_eq!(object["stack_fetch"], false);
         assert!(object["github_host"].is_null());
         let keybindings = object["keybindings"].as_object().unwrap();
         assert_eq!(

@@ -41,6 +41,11 @@ pub struct WorldInput {
     /// The `commits` scope's pick. Part of the identity, so a build for a replaced pick
     /// fails the landing gate instead of painting the old run.
     pub commit_pick: Option<CommitPick>,
+    /// The `stack` scope's range, frozen at the pick. Part of the identity, so a build for a
+    /// replaced range fails the landing gate.
+    pub stack_range: Option<crate::stack::StackRange>,
+    /// The `All files` tab's stack PR tree, when it browses one instead of the worktree.
+    pub files_tree: Option<crate::stack::TreeSource>,
     /// Expanded ignored directories whose children the `All files` tree loads.
     pub toggled_dirs: HashSet<String>,
 }
@@ -56,6 +61,11 @@ pub struct WorldSnapshot {
     /// The `commits` scope's pick verdict, from the same build as the changeset it heads
     /// `None` on every other scope.
     pub pick_status: Option<PickStatus>,
+    /// The `stack` scope's merge-base and moved ends, from the same build as the changeset.
+    /// `None` on every other scope.
+    pub stack_status: Option<crate::stack::StackStatus>,
+    /// Whether the browsed stack PR tree's refs moved past the commit it shows.
+    pub tree_moved: bool,
     /// The commit `HEAD` named when the build ran, the commit picker's universe key
     /// `None` in an unborn repository.
     pub head: Option<String>,
@@ -87,6 +97,7 @@ pub struct PickStatus {
 pub struct ScopeBuild {
     pub branch_base: git::BaseStatus,
     pub pick_status: Option<PickStatus>,
+    pub stack_status: Option<crate::stack::StackStatus>,
     pub changed: Vec<ChangedFile>,
 }
 
@@ -103,19 +114,48 @@ pub fn build(input: &WorldInput) -> Result<WorldSnapshot> {
             entries: Vec::new(),
             branch_base: git::BaseStatus::default(),
             pick_status: None,
+            stack_status: None,
+            tree_moved: false,
             head: None,
         });
     }
-    let ScopeBuild { branch_base, pick_status, changed } = build_changed(input)?;
+    let ScopeBuild { branch_base, pick_status, stack_status, changed } = build_changed(input)?;
     let head = git::head_oid(&input.repo);
     let changed_map = annotate(&changed);
-    let entries = match input.tab {
+    let mut tree_moved = false;
+    let entries = match (input.tab, &input.files_tree) {
+        // A stack PR's tree, read from the object store: no annotations, since the
+        // changeset describes the scope, not this tree. Not fetched lists nothing.
+        (Tab::AllFiles, Some(tree)) => {
+            tree_moved = tree.moved(&input.repo);
+            match &tree.at {
+                Some(at) => git::tree_files(&input.repo, &at.oid)?
+                    .into_iter()
+                    .map(|w| Entry {
+                        path: w.path,
+                        previous_path: None,
+                        annotation: None,
+                        ignored: false,
+                        is_dir: false,
+                    })
+                    .collect(),
+                None => Vec::new(),
+            }
+        }
         // The whole worktree (ignored included), with expanded ignored dirs loaded lazily.
-        Tab::AllFiles => all_files_entries(input, &changed_map)?,
+        (Tab::AllFiles, None) => all_files_entries(input, &changed_map)?,
         // `Changes` (the `PR` tab never builds a snapshot).
         _ => changed.iter().map(Entry::from_changed).collect(),
     };
-    Ok(WorldSnapshot { changed: changed_map, entries, branch_base, pick_status, head })
+    Ok(WorldSnapshot {
+        changed: changed_map,
+        entries,
+        branch_base,
+        pick_status,
+        stack_status,
+        tree_moved,
+        head,
+    })
 }
 
 /// The active scope's changed files and, on the `branch` scope, the base they diff against —
@@ -125,6 +165,7 @@ pub fn build_changed(input: &WorldInput) -> Result<ScopeBuild> {
     let plain = |changed| ScopeBuild {
         branch_base: git::BaseStatus::default(),
         pick_status: None,
+        stack_status: None,
         changed,
     };
     if !git::is_repo(&input.repo) {
@@ -149,7 +190,12 @@ pub fn build_changed(input: &WorldInput) -> Result<ScopeBuild> {
             .map_err(|e| anyhow::anyhow!("{}", e.0))?;
             let base_oid = resolution.status.winner.as_ref().map(|w| w.oid().to_string());
             let changed = git::changed_files(&input.repo, input.scope, base_oid.as_deref())?;
-            Ok(ScopeBuild { branch_base: resolution.status, pick_status: None, changed })
+            Ok(ScopeBuild {
+                branch_base: resolution.status,
+                pick_status: None,
+                stack_status: None,
+                changed,
+            })
         }
         Scope::Commits => {
             // The scope is never entered without a pick; a tag without one
@@ -159,10 +205,39 @@ pub fn build_changed(input: &WorldInput) -> Result<ScopeBuild> {
             Ok(ScopeBuild {
                 branch_base: git::BaseStatus::default(),
                 pick_status: Some(status),
+                stack_status: None,
+                changed,
+            })
+        }
+        Scope::Stack => {
+            let Some(range) = &input.stack_range else { return Ok(plain(Vec::new())) };
+            let (status, changed) = build_stack(&input.repo, range)?;
+            Ok(ScopeBuild {
+                branch_base: git::BaseStatus::default(),
+                pick_status: None,
+                stack_status: Some(status),
                 changed,
             })
         }
     }
+}
+
+/// A stack range's changeset: from the two tips' merge-base to the compared PR's tip — what
+/// the PR adds over the other end, as GitHub's PR view shows a PR over its base. Two-dot
+/// would also show the other end's own later commits reversed, so a rebased parent would
+/// read as changes to the child. Unrelated histories fall back to the other tip itself. An
+/// end that is not fetched lists nothing; the panes say why.
+fn build_stack(
+    repo: &Path,
+    range: &crate::stack::StackRange,
+) -> Result<(crate::stack::StackStatus, Vec<ChangedFile>)> {
+    let moved = range.moved(repo);
+    let (Some(to), Some(from)) = (&range.to_at, &range.from_at) else {
+        return Ok((crate::stack::StackStatus { merge_base: None, moved }, Vec::new()));
+    };
+    let old = git::merge_base_of(repo, &from.oid, &to.oid).unwrap_or_else(|| from.oid.clone());
+    let changed = git::changed_between(repo, &old, &to.oid)?;
+    Ok((crate::stack::StackStatus { merge_base: Some(old), moved }, changed))
 }
 
 /// The pick's changeset and verdict in one pass: `gone`

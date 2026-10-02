@@ -1396,3 +1396,242 @@ fn the_commit_scope_writes_nothing() {
     );
     assert_eq!(before, after, "no ref, index, worktree, or HEAD change");
 }
+
+// --- PR stacks: range resolution, merge-base semantics, the opt-in fetch ----------------
+
+mod stack {
+    use super::common::Repo;
+    use herdr_reviewr::stack::{
+        EndSpec, FetchJob, StackEnd, StackRange, fetch_stack_heads, resolve,
+    };
+    use std::time::Duration;
+
+    fn pr(n: u64, branch: &str, head_oid: Option<String>) -> EndSpec {
+        EndSpec { end: StackEnd::Pr(n), label: format!("#{n}"), branch: branch.into(), head_oid }
+    }
+
+    fn base(branch: &str) -> EndSpec {
+        EndSpec { end: StackEnd::Base, label: branch.into(), branch: branch.into(), head_oid: None }
+    }
+
+    fn oid(r: &Repo, rev: &str) -> String {
+        r.git(&["rev-parse", rev]).trim().to_string()
+    }
+
+    /// `main` ← `feature-a` (#11) ← `feature-b` (#12), checked out on `feature-b`.
+    fn stack_repo() -> Repo {
+        let r = Repo::init();
+        r.write("base.rs", "base\n");
+        r.commit_all("init");
+        r.git(&["checkout", "-q", "-b", "feature-a"]);
+        r.write("a.rs", "a\n");
+        r.commit_all("a work");
+        r.git(&["checkout", "-q", "-b", "feature-b"]);
+        r.write("b.rs", "b\n");
+        r.commit_all("b work");
+        r
+    }
+
+    fn changed(r: &Repo, range: &StackRange) -> Vec<String> {
+        let input = herdr_reviewr::world::WorldInput {
+            repo: r.path_buf(),
+            tab: herdr_reviewr::app::Tab::Changes,
+            scope: herdr_reviewr::model::Scope::Stack,
+            base: None,
+            base_epoch: 0,
+            pr_base: None,
+            turn_baseline: None,
+            commit_pick: None,
+            stack_range: Some(range.clone()),
+            files_tree: None,
+            toggled_dirs: std::collections::HashSet::default(),
+        };
+        let build = herdr_reviewr::world::build_changed(&input).unwrap();
+        build.changed.into_iter().map(|f| f.path).collect()
+    }
+
+    #[test]
+    fn a_pr_end_resolves_from_its_branch_then_origin_then_the_private_ref_then_its_oid() {
+        let r = stack_repo();
+        let b = oid(&r, "feature-b");
+        let a = oid(&r, "feature-a");
+        let got = resolve(r.path(), &pr(12, "feature-b", None)).unwrap();
+        assert_eq!((got.oid.as_str(), got.via.as_str()), (b.as_str(), "feature-b"));
+
+        // No local branch: the tracking branch.
+        r.git(&["update-ref", "refs/remotes/origin/feature-x", &a]);
+        let got = resolve(r.path(), &pr(13, "feature-x", None)).unwrap();
+        assert_eq!((got.oid.as_str(), got.via.as_str()), (a.as_str(), "origin/feature-x"));
+
+        // Neither: reviewr's fetched ref.
+        r.git(&["update-ref", "refs/worktree/reviewr/stack/14", &b]);
+        let got = resolve(r.path(), &pr(14, "feature-y", None)).unwrap();
+        assert_eq!((got.oid.as_str(), got.via.as_str()), (b.as_str(), "#14 fetched"));
+
+        // No ref at all, but the forge's head is in the store.
+        let got = resolve(r.path(), &pr(15, "feature-z", Some(a.clone()))).unwrap();
+        assert_eq!(got.oid, a);
+
+        // The base prefers `origin/`: a stale local trunk would pull trunk commits in.
+        r.git(&["update-ref", "refs/remotes/origin/main", &a]);
+        assert_eq!(resolve(r.path(), &base("main")).unwrap().via, "origin/main");
+    }
+
+    #[test]
+    fn an_end_nothing_local_names_is_not_fetched() {
+        let r = stack_repo();
+        let absent = "0123456789abcdef0123456789abcdef01234567".to_string();
+        assert_eq!(resolve(r.path(), &pr(20, "never-fetched", Some(absent))), None);
+        let range =
+            StackRange::resolve(r.path(), pr(20, "never-fetched", None), pr(11, "feature-a", None));
+        assert_eq!(range.missing().map(|s| s.label.as_str()), Some("#20"));
+        assert!(changed(&r, &range).is_empty(), "a missing end lists nothing, never a fake diff");
+    }
+
+    #[test]
+    fn a_range_diffs_from_the_merge_base_so_a_moved_parent_never_reads_as_the_childs_change() {
+        let r = stack_repo();
+        // The parent moves on after the child branched off it.
+        r.git(&["checkout", "-q", "feature-a"]);
+        r.write("a2.rs", "later\n");
+        r.commit_all("a moves on");
+        r.git(&["checkout", "-q", "feature-b"]);
+
+        let range =
+            StackRange::resolve(r.path(), pr(12, "feature-b", None), pr(11, "feature-a", None));
+        assert_eq!(range.label(), "#12 vs #11");
+        // Only the child's own work: two-dot would also list `a2.rs` as deleted.
+        assert_eq!(changed(&r, &range), ["b.rs"]);
+        // Against the base: the whole stack below it.
+        let range = StackRange::resolve(r.path(), pr(12, "feature-b", None), base("main"));
+        assert_eq!(changed(&r, &range), ["a.rs", "b.rs"]);
+        // A ref that moves after the pick is noticed, never followed.
+        r.write("b2.rs", "more\n");
+        r.commit_all("b moves on");
+        assert_eq!(range.moved(r.path()), ["#12"]);
+        assert_eq!(changed(&r, &range), ["a.rs", "b.rs"], "the frozen tip still shows");
+    }
+
+    #[test]
+    fn a_stack_prs_tree_lists_and_reads_from_the_object_store() {
+        let r = stack_repo();
+        r.write("untracked.rs", "not in any tree\n");
+        let a = oid(&r, "feature-a");
+        let files: Vec<String> = herdr_reviewr::git::tree_files(r.path(), &a)
+            .unwrap()
+            .into_iter()
+            .map(|e| e.path)
+            .collect();
+        assert_eq!(files, ["a.rs", "base.rs"]);
+        assert_eq!(herdr_reviewr::git::file_content(r.path(), &a, "a.rs"), "a\n");
+        assert_eq!(herdr_reviewr::git::blob_size(r.path(), &a, "a.rs"), Some(2));
+        assert_eq!(herdr_reviewr::git::blob_size(r.path(), &a, "b.rs"), None);
+    }
+
+    /// A clone of a bare `origin` holding `refs/pull/7/head` at a commit the clone lacks.
+    fn fetch_repo() -> (Repo, tempfile::TempDir, String) {
+        let r = stack_repo();
+        let origin = tempfile::TempDir::new().unwrap();
+        let o = origin.path().to_str().unwrap().to_string();
+        r.git(&["init", "-q", "--bare", &o]);
+        r.git(&["remote", "add", "origin", &o]);
+        r.git(&["push", "-q", "origin", "main", "feature-a"]);
+        r.git(&["fetch", "-q", "origin"]);
+        // A PR head only the forge has: committed on a throwaway branch, pushed, dropped.
+        r.git(&["checkout", "-q", "-b", "pr7", "main"]);
+        r.write("p7.rs", "seven\n");
+        r.commit_all("pr 7");
+        let head = oid(&r, "HEAD");
+        r.git(&["push", "-q", "origin", "pr7:refs/pull/7/head"]);
+        r.git(&["checkout", "-q", "feature-b"]);
+        r.git(&["branch", "-q", "-D", "pr7"]);
+        r.git(&["reflog", "expire", "--expire=now", "--all"]);
+        r.git(&["gc", "-q", "--prune=now"]);
+        assert!(!herdr_reviewr::git::commit_exists(r.path(), &head), "the clone lacks the head");
+        // The fixture's own fetch wrote one; the test asserts reviewr's writes none.
+        let _ = std::fs::remove_file(r.path().join(".git/FETCH_HEAD"));
+        (r, origin, head)
+    }
+
+    fn public_refs(r: &Repo) -> String {
+        r.git(&["for-each-ref", "--format=%(refname) %(objectname) %(symref)"])
+            .lines()
+            .filter(|l| !l.starts_with("refs/worktree/"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn the_fetch_writes_only_the_private_ref_and_the_objects() {
+        let (r, _origin, head) = fetch_repo();
+        let before = public_refs(&r);
+        let status = r.git(&["status", "--porcelain"]);
+        let job = FetchJob { tag: 1, keep: vec![7, 11], wanted: vec![(7, head.clone())] };
+        let outcome = fetch_stack_heads(r.path(), &job, Duration::from_secs(30));
+        assert_eq!(outcome.error, None);
+        assert_eq!(outcome.fetched, [7]);
+        assert_eq!(oid(&r, "refs/worktree/reviewr/stack/7"), head);
+        // Branches, tracking refs, `origin/HEAD`, the index, and the worktree are untouched,
+        // and no `FETCH_HEAD` is written.
+        assert_eq!(public_refs(&r), before);
+        assert_eq!(r.git(&["status", "--porcelain"]), status);
+        assert!(!r.path().join(".git/FETCH_HEAD").exists());
+        // The fetched end resolves through it.
+        let got = resolve(r.path(), &pr(7, "pr7-gone", None)).unwrap();
+        assert_eq!((got.oid, got.via), (head.clone(), "#7 fetched".to_string()));
+
+        // A head already in the store is not fetched again.
+        let again =
+            fetch_stack_heads(r.path(), &FetchJob { tag: 2, ..job }, Duration::from_secs(30));
+        assert!(again.fetched.is_empty());
+    }
+
+    #[test]
+    fn a_configured_pull_refspec_never_writes_a_tracking_ref() {
+        // A common setup maps every PR head to a tracking ref. git's opportunistic update
+        // would write `refs/remotes/origin/pr/7` beside the private ref unless the fetch
+        // passes an empty `--refmap`.
+        let (r, _origin, head) = fetch_repo();
+        r.git(&[
+            "config",
+            "--add",
+            "remote.origin.fetch",
+            "+refs/pull/*/head:refs/remotes/origin/pr/*",
+        ]);
+        let before = public_refs(&r);
+        let job = FetchJob { tag: 1, keep: vec![7], wanted: vec![(7, head.clone())] };
+        let outcome = fetch_stack_heads(r.path(), &job, Duration::from_secs(30));
+        assert_eq!(outcome.error, None);
+        assert_eq!(oid(&r, "refs/worktree/reviewr/stack/7"), head);
+        assert_eq!(public_refs(&r), before, "refs/remotes stays untouched");
+    }
+
+    #[test]
+    fn a_pr_that_left_the_stack_loses_its_private_ref() {
+        let (r, _origin, head) = fetch_repo();
+        let a = oid(&r, "feature-a");
+        r.git(&["update-ref", "refs/worktree/reviewr/stack/9", &a]);
+        r.git(&["update-ref", "refs/worktree/reviewr/stack/11", &a]);
+        let job = FetchJob { tag: 1, keep: vec![11], wanted: vec![(11, head)] };
+        fetch_stack_heads(r.path(), &job, Duration::from_secs(30));
+        assert_eq!(herdr_reviewr::git::stack_ref_numbers(r.path()).unwrap(), [11]);
+        // Nothing outside the stack namespace is ever pruned.
+        r.git(&["rev-parse", "--verify", "-q", "feature-a"]);
+    }
+
+    #[test]
+    fn a_failed_or_timed_out_fetch_reports_and_writes_nothing() {
+        let (r, _origin, head) = fetch_repo();
+        let before = public_refs(&r);
+        let job = FetchJob { tag: 3, keep: vec![99], wanted: vec![(99, head.clone())] };
+        let outcome = fetch_stack_heads(r.path(), &job, Duration::from_secs(30));
+        assert!(outcome.error.as_deref().is_some_and(|e| !e.is_empty()), "{outcome:?}");
+        assert!(herdr_reviewr::git::stack_ref_numbers(r.path()).unwrap().is_empty());
+        assert_eq!(public_refs(&r), before);
+        assert_eq!(resolve(r.path(), &pr(99, "gone", Some(head.clone()))), None);
+
+        let job = FetchJob { tag: 4, keep: vec![7], wanted: vec![(7, head)] };
+        let outcome = fetch_stack_heads(r.path(), &job, Duration::ZERO);
+        assert!(outcome.error.as_deref().is_some_and(|e| e.contains("timed out")), "{outcome:?}");
+    }
+}

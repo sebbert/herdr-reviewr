@@ -138,6 +138,7 @@ fn render_frame(frame: &mut Frame, app: &App) {
         Mode::Picker => Some(render_agent_picker),
         Mode::BasePick => Some(render_base_picker),
         Mode::CommitPick => Some(render_commit_picker),
+        Mode::StackPick => Some(render_stack_picker),
         Mode::Normal | Mode::Composing { .. } | Mode::Search | Mode::Find => None,
     };
     if let Some(render_popup) = popup {
@@ -742,7 +743,8 @@ pub fn read_point_clamped(
 /// to its logical row.
 #[must_use]
 pub fn gutter_row_at(area: Rect, app: &App, col: u16, row: u16) -> Option<usize> {
-    if app.tab == Tab::Pr {
+    // A stack range or tree takes no comment, so its gutter offers none.
+    if app.tab == Tab::Pr || app.read_only_view() {
         return None;
     }
     let pane = read_pane(area, app);
@@ -1448,6 +1450,8 @@ pub enum HeaderHit {
     Base,
     /// The `commits` scope's pick name; the click opens the commit picker.
     Pick,
+    /// A stack range's or tree's name; the click opens the stack picker.
+    Stack,
 }
 
 /// Which header control a click at `(col, row)` lands on, if any. `keymap` must be the keymap
@@ -1474,7 +1478,9 @@ pub fn hit_header(area: Rect, app: &App, keymap: &Keymap, col: u16, row: u16) ->
         let base_start = scope_end + BASE_GAP.len() as u16;
         let base_end = base_start + (lead.width() + name.width() + tail.width()) as u16;
         if (base_start..base_end).contains(&col) {
-            return Some(if app.scope == crate::model::Scope::Commits {
+            return Some(if app.stack_header().is_some() {
+                HeaderHit::Stack
+            } else if app.scope == crate::model::Scope::Commits {
                 HeaderHit::Pick
             } else {
                 HeaderHit::Base
@@ -1539,6 +1545,10 @@ fn scope_chip(app: &App) -> String {
 /// The `branch` scope's base label as `(lead, shown, marker, tail)`.
 /// `shown` is the spelling or a SHA-once abbrev. `marker` is ` (sha)` for a named rev.
 fn base_label(app: &App) -> Option<(String, String, String, String)> {
+    // A stack range or tree names what the pane compares, so its source is never in doubt.
+    if let Some((name, tail)) = app.stack_header() {
+        return Some((String::new(), name, String::new(), tail));
+    }
     if app.scope == crate::model::Scope::Commits {
         return pick_label(app);
     }
@@ -1610,7 +1620,7 @@ fn base_parts(app: &App, keymap: &Keymap, width: u16) -> Option<(String, String,
         + 1;
     let budget = (width as usize).saturating_sub(fixed);
     let marker_w = marker.width();
-    let name = if app.scope == crate::model::Scope::Commits {
+    let name = if app.scope == crate::model::Scope::Commits || app.stack_header().is_some() {
         // The sha is the identity and the subject is the marker, so the subject clips
         // first and the sha stays whole. The verdict tail is reserved before the subject,
         // so `· gone` can never be the part that falls off.
@@ -1694,7 +1704,9 @@ fn render_tab_bar(frame: &mut Frame, app: &App, area: Rect) {
         // An empty lead is the `no base` state, worn as a warning, except in `commits`,
         // whose pick label always leaves the lead empty and is never a warning. A resolved
         // name wears the clickable accent, and the skipped tail warns beside it
-        let warn = lead.is_empty() && app.scope != crate::model::Scope::Commits;
+        let warn = lead.is_empty()
+            && app.scope != crate::model::Scope::Commits
+            && app.stack_header().is_none();
         spans.push(Span::styled(BASE_GAP, bar));
         spans.push(Span::styled(lead, bar.fg(p.dim2)));
         spans.push(Span::styled(name, bar.fg(if warn { p.orange } else { p.blue })));
@@ -1729,7 +1741,9 @@ fn render_file_list(frame: &mut Frame, app: &App, pane: Pane) {
 
     if app.file_rows.is_empty() {
         let gone = app.commits_gone_message();
+        let stack = app.stack_message().unwrap_or_default();
         let msg = match app.tab {
+            _ if !stack.is_empty() => stack.as_str(),
             Tab::AllFiles => "no files",
             Tab::Changes if app.awaiting_turn() => app.turn_wait_message(),
             Tab::Changes if app.commits_gone() => gone.as_str(),
@@ -2030,7 +2044,9 @@ fn render_diff_view(frame: &mut Frame, app: &App, pane: Pane) {
         // `All files` is a content browser, not a diff, so its empty/notice copy avoids diff
         // vocabulary and never shows the last-turn "waiting" state.
         let gone = app.commits_gone_message();
+        let stack = app.stack_message().filter(|_| app.file_rows.is_empty()).unwrap_or_default();
         let msg = match app.tab {
+            _ if !stack.is_empty() => stack.as_str(),
             Tab::AllFiles => match app.diff.state {
                 FileState::Binary => "binary — no line comments",
                 FileState::TooLarge => "file too large",
@@ -2821,7 +2837,9 @@ fn action_key_label(app: &App, action: FooterAction) -> (String, String) {
             let n = app.commit_picker.as_ref().map_or(0, crate::app::CommitPicker::run_len);
             return ("enter".into(), if n > 1 { format!("open {n}") } else { "open".into() });
         }
-        A::MoveCommitRow => (format!("{} {}", hint(K::Down), hint(K::Up)), "move"),
+        A::MoveCommitRow | A::MoveStackRow => {
+            (format!("{} {}", hint(K::Down), hint(K::Up)), "move")
+        }
         A::CloseCommitPicker => {
             let anchored = app.commit_picker.as_ref().is_some_and(|cp| cp.anchor.is_some());
             ("esc".into(), if anchored { "clear" } else { "cancel" })
@@ -2855,8 +2873,23 @@ fn action_key_label(app: &App, action: FooterAction) -> (String, String) {
         // `enter` opens the highlight in every list: a search result, a base, a commit run.
         A::OpenResult | A::PickBaseRow => ("enter".into(), "open"),
         A::OpenPr => (hint(K::OpenPr), "open ↗"),
+        A::StackPick => {
+            (hint(K::StackPick), if app.tab == Tab::AllFiles { "tree" } else { "stack" })
+        }
+        A::PickStackRow => {
+            let first = app.stack_picker.as_ref().is_some_and(|sp| {
+                sp.purpose == crate::app::StackPickerPurpose::Range && sp.to.is_none()
+            });
+            ("enter".into(), if first { "compare" } else { "open" })
+        }
+        A::StackParent => ("p".into(), "vs parent"),
+        A::StackBase => ("b".into(), "vs base"),
+        A::CloseStackPicker => {
+            let second = app.stack_picker.as_ref().is_some_and(|sp| sp.to.is_some());
+            ("esc".into(), if second { "back" } else { "cancel" })
+        }
         A::ViewStackPr => ("enter".into(), "view"),
-        A::CheckedOutPr => (hint(K::CheckedOutPr), "checked out"),
+        A::CheckedOutPr | A::StackBack => (hint(K::CheckedOutPr), "checked out"),
         A::ToggleThread => {
             let folded = app.pr_selected_comment().is_some_and(|cm| app.pr_card_collapsed(cm));
             (hint(K::ToggleThread), if folded { "expand" } else { "collapse" })
@@ -3728,6 +3761,93 @@ pub fn hit_commit_picker_row(area: Rect, app: &App, col: u16, row: u16) -> Optio
     // The `… more` line is not a row: a click on it is inert.
     let shown = cp.len().min(first + commit_picker_rows(cp, inner.height as usize));
     menu_hit(inner, 0, first, shown, col, row)
+}
+
+// --- Stack picker -------------------------------------------
+
+/// One stack picker row's parts: the `▸` on the compared PR (the range picker's second
+/// step), the label, the title, and the dim trail — `checked out`, and how the end resolves
+/// or that it is not fetched.
+fn stack_row_parts(row: &crate::app::StackRow, picked: bool) -> (String, String, String, String) {
+    let mark = if picked { "▸ " } else { "  " }.to_string();
+    let mut trail: Vec<String> = Vec::new();
+    if row.checked_out && row.end.is_some() {
+        trail.push("checked out".into());
+    }
+    if row.end.is_some() {
+        trail.push(row.via.clone().unwrap_or_else(|| "not fetched".into()));
+    }
+    (mark, row.label.clone(), row.title.clone(), trail.join(" · "))
+}
+
+fn stack_picker_popup(area: Rect, app: &App) -> Rect {
+    let Some(sp) = &app.stack_picker else { return Rect::default() };
+    let widest = sp
+        .rows
+        .iter()
+        .map(|r| {
+            let (mark, label, title, trail) = stack_row_parts(r, false);
+            mark.width() + label.width() + 2 + title.width() + 2 + trail.width() + 1
+        })
+        .max()
+        .unwrap_or(0);
+    menu_popup(area, app, widest, &sp.title(), sp.rows.len().max(1) + 2)
+}
+
+fn render_stack_picker(frame: &mut Frame, app: &App, area: Rect) {
+    let Some(sp) = &app.stack_picker else { return };
+    let p = app.palette();
+    let popup = stack_picker_popup(area, app);
+    frame.render_widget(Clear, popup);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(p.purple))
+        .title(framed_title(&sp.title()));
+    let inner = picker_inner(popup);
+    frame.render_widget(block, popup);
+    if inner.height == 0 {
+        return;
+    }
+    let width = inner.width as usize;
+    let first = menu_scroll(sp.cursor, sp.rows.len(), inner.height as usize);
+    let items: Vec<ListItem> = sp
+        .rows
+        .iter()
+        .enumerate()
+        .skip(first)
+        .take(inner.height as usize)
+        .map(|(i, row)| {
+            let (mark, label, title, trail) = stack_row_parts(row, sp.to == Some(i));
+            // The trail right-aligns; the title clips first, so the label and the fetch
+            // state always show.
+            let fixed = mark.width() + label.width() + 2;
+            let trail_w = if trail.is_empty() { 0 } else { trail.width() + 2 };
+            let title = truncate_width(&title, width.saturating_sub(fixed + trail_w));
+            let trail = truncate_width(&trail, width.saturating_sub(fixed + title.width() + 2));
+            let pad = width.saturating_sub(fixed + title.width() + trail.width());
+            let missing = row.end.is_some() && row.via.is_none();
+            let spans = vec![
+                Span::styled(mark, Style::default().fg(p.yellow)),
+                Span::styled(label, Style::default().fg(p.blue)),
+                Span::styled("  ", text_style(p)),
+                Span::styled(title, text_style(p)),
+                Span::styled(
+                    format!("{}{trail}", " ".repeat(pad)),
+                    Style::default().fg(if missing { p.orange } else { p.dim2 }),
+                ),
+            ];
+            selectable_row(p, spans, width, (i == sp.cursor).then_some(p.surface2))
+        })
+        .collect();
+    frame.render_widget(List::new(items), inner);
+}
+
+/// The stack-picker row under the pointer.
+pub fn hit_stack_picker_row(area: Rect, app: &App, col: u16, row: u16) -> Option<usize> {
+    let sp = app.stack_picker.as_ref()?;
+    let inner = picker_inner(stack_picker_popup(area, app));
+    let first = menu_scroll(sp.cursor, sp.rows.len(), inner.height as usize);
+    menu_hit(inner, 0, first, sp.rows.len(), col, row)
 }
 
 // --- Search screen -------------------------------------------------------

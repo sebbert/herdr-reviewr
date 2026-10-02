@@ -11,6 +11,9 @@ pub enum Scope {
     LastTurn,
     /// A picked run of commits, diffed `A^` against `B`.
     Commits,
+    /// A picked pair of stack PRs (or a PR and the stack's base), diffed from their
+    /// merge-base to the compared PR's tip. Read-only: it is not the checked-out work.
+    Stack,
 }
 
 impl Scope {
@@ -20,6 +23,7 @@ impl Scope {
             Scope::Branch => "branch",
             Scope::LastTurn => "last turn",
             Scope::Commits => "commits",
+            Scope::Stack => "stack",
         }
     }
 
@@ -31,18 +35,20 @@ impl Scope {
             Scope::Branch => "branch",
             Scope::LastTurn => "last-turn",
             Scope::Commits => "commits",
+            Scope::Stack => "stack",
         }
     }
 
     /// Cycle to the next scope, for the header chip click: uncommitted → branch → last turn →
-    /// commits.
+    /// commits. `stack` is never a stop — it is entered by its picker — and leaves to the
+    /// start of the cycle.
     #[must_use]
     pub fn cycle(self) -> Self {
         match self {
             Scope::Uncommitted => Scope::Branch,
             Scope::Branch => Scope::LastTurn,
             Scope::LastTurn => Scope::Commits,
-            Scope::Commits => Scope::Uncommitted,
+            Scope::Commits | Scope::Stack => Scope::Uncommitted,
         }
     }
 }
@@ -233,6 +239,8 @@ mod tests {
         assert_eq!(Scope::LastTurn.label(), "last turn");
         assert_eq!(Scope::Commits.label(), "commits");
         assert_eq!(Scope::Commits.name(), "commits");
+        assert_eq!(Scope::Stack.cycle(), Scope::Uncommitted, "stack is never a chip stop");
+        assert_eq!(Scope::Stack.label(), "stack");
     }
 
     #[test]

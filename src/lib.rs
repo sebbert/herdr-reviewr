@@ -32,6 +32,7 @@ pub mod proc;
 pub mod search;
 pub mod selection;
 pub mod snippet;
+pub mod stack;
 pub mod theme;
 pub mod turn;
 pub mod ui;
@@ -1031,6 +1032,9 @@ fn event_loop(terminal: &mut Term, app: &mut App, cfg: &Config, kbd: bool) -> Re
     // A browsed stack PR's reads: `(tag, number, view)`, one in flight, latest-wins by tag.
     let (browse_tx, browse_rx) = mpsc::channel::<(u64, Vec<(u64, crate::forge::PrView)>)>();
     let mut browse = BrowseFetch::default();
+    // The opt-in stack fetch (`stack_fetch`): one batched `git fetch` in flight, tagged.
+    let (stack_fetch_tx, stack_fetch_rx) = mpsc::channel::<crate::stack::FetchOutcome>();
+    let mut stack_fetching = false;
     let mut pr = PrCoordinator::new(app.plugin_config().is_some());
     // The world worker owns every refresh build and the turn tracker; the loop sends
     // input-tagged jobs and reconciles the completions.
@@ -1322,6 +1326,27 @@ fn event_loop(terminal: &mut Term, app: &mut App, cfg: &Config, kbd: bool) -> Re
                     let _ = tx.send((batch.tag, results));
                 });
             }
+            // A stack fetch lands under its tag; a landing that filled an end repaints.
+            if let Ok(outcome) = stack_fetch_rx.try_recv() {
+                stack_fetching = false;
+                if app.land_stack_fetch(&outcome) {
+                    continue;
+                }
+            }
+            // With `stack_fetch` on, each stack PR's head the store lacks is fetched into
+            // reviewr's private refs, off the frame loop, one batch at a time.
+            if !stack_fetching
+                && app.plugin_config().is_some()
+                && let Some(job) = app.take_stack_fetch()
+            {
+                stack_fetching = true;
+                let (tx, repo) = (stack_fetch_tx.clone(), app.repo.clone());
+                thread::spawn(move || {
+                    let outcome =
+                        crate::stack::fetch_stack_heads(&repo, &job, crate::stack::FETCH_TIMEOUT);
+                    let _ = tx.send(outcome);
+                });
+            }
             // The loading signal is the viewed PR's own: a background batch never lights it.
             if let Some((tag, _, started)) = &browse.active
                 && !browse.indicated
@@ -1456,6 +1481,7 @@ fn event_loop(terminal: &mut Term, app: &mut App, cfg: &Config, kbd: bool) -> Re
             if pr.active_fetch.is_some()
                 || pr.active_probe_epoch.is_some()
                 || browse.active.is_some()
+                || stack_fetching
             {
                 timeout = timeout.min(Duration::from_millis(100));
             }
@@ -2010,6 +2036,23 @@ pub fn handle_key(app: &mut App, key: KeyEvent, area: Rect, keymap: &Keymap) -> 
         return Ok(());
     }
 
+    // The stack picker: the movement bindings move the highlight, `enter` picks (the compared
+    // PR, then what it is compared against), the literal `p` and `b` pick this PR against its
+    // parent or the stack's base, and `esc` steps back. Every other key is inert.
+    if app.mode == Mode::StackPick {
+        let bare = key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT;
+        match (action, key.code) {
+            (_, Esc) => app.stack_picker_escape(),
+            (_, Enter) => app.stack_picker_pick()?,
+            (_, Char('p')) if bare => app.stack_picker_shortcut(false)?,
+            (_, Char('b')) if bare => app.stack_picker_shortcut(true)?,
+            (Some(K::Down), _) => app.stack_picker_move(1),
+            (Some(K::Up), _) => app.stack_picker_move(-1),
+            _ => {}
+        }
+        return Ok(());
+    }
+
     // The read-only PR tab: navigate the snapshot and open links; authoring actions are inert.
     if app.tab == crate::app::Tab::Pr {
         match (action, key.code) {
@@ -2066,6 +2109,8 @@ pub fn handle_key(app: &mut App, key: KeyEvent, area: Rect, keymap: &Keymap) -> 
         match action {
             K::Quit => app.should_quit = true,
             K::Refresh => {
+                // A stack range or tree follows its ends by identity on the reader's refresh.
+                app.follow_stack()?;
                 app.request_world_refresh(false, false);
                 app.refresh_commanded = true;
             }
@@ -2106,6 +2151,7 @@ pub fn handle_key(app: &mut App, key: KeyEvent, area: Rect, keymap: &Keymap) -> 
             K::ScopeCommits => app.set_scope(Scope::Commits)?,
             K::BasePick => app.open_base_picker(),
             K::CommitPick => app.open_commit_picker(),
+            K::StackPick => app.open_stack_picker(),
             K::Select => app.toggle_select(),
             K::Comment => app.start_comment(),
             // `edit`/`delete` act on the comment under the diff cursor, so they only fire with
@@ -2125,9 +2171,11 @@ pub fn handle_key(app: &mut App, key: KeyEvent, area: Rect, keymap: &Keymap) -> 
             K::Search => app.open_search(),
             K::Find => app.open_find(),
             K::Keys => app.toggle_keys(),
-            // `delete` off the diff, and `open-pr`, `toggle-thread`, and `checked-out-pr` off
-            // the `PR` tab, are inert. `edit` is not: it reaches the navigator's file rows too.
-            K::Delete | K::OpenPr | K::ToggleThread | K::CheckedOutPr => {}
+            // `checked-out-pr` on a file tab leaves a stack range or tree for the checked-out work.
+            K::CheckedOutPr => app.back_to_checked_out()?,
+            // `delete` off the diff, and `open-pr` and `toggle-thread` off the `PR` tab, are
+            // inert. `edit` is not: it reaches the navigator's file rows too.
+            K::Delete | K::OpenPr | K::ToggleThread => {}
         }
         return Ok(());
     }
@@ -2680,6 +2728,15 @@ pub fn handle_mouse(
                     None => {}
                 }
             }
+            MouseEventKind::Down(MouseButton::Left) if app.mode == Mode::StackPick => {
+                match ui::hit_stack_picker_row(area, app, m.column, m.row) {
+                    Some(i) if app.stack_picker.as_ref().is_some_and(|sp| sp.cursor == i) => {
+                        app.stack_picker_pick()?;
+                    }
+                    Some(i) => app.stack_picker_goto(i),
+                    None => {}
+                }
+            }
             // And in the commit picker, the run included.
             MouseEventKind::Down(MouseButton::Left) if app.mode == Mode::CommitPick => {
                 match ui::hit_commit_picker_row(area, app, m.column, m.row) {
@@ -2795,6 +2852,7 @@ pub fn handle_mouse(
                     // label names the base without offering a choice.
                     ui::HeaderHit::Base => app.open_base_picker(),
                     ui::HeaderHit::Pick => app.open_commit_picker(),
+                    ui::HeaderHit::Stack => app.open_stack_picker(),
                 }
             } else if let Some(row) = ui::gutter_row_at(area, app, m.column, m.row) {
                 // The gutter owns mouse commenting: click a line or drag a range, and the
