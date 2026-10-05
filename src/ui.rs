@@ -3813,8 +3813,15 @@ fn stack_activate_label(app: &App) -> &'static str {
         (Tab::AllFiles, true, _) => "worktree",
         (Tab::AllFiles, false, _) => "tree",
         (_, true, _) => "checked out",
-        (_, false, crate::stack::StackEnd::Base) => "open",
-        (_, false, crate::stack::StackEnd::Pr(_)) => "vs parent",
+        (_, false, crate::stack::StackEnd::Base | crate::stack::StackEnd::Unread { .. }) => "open",
+        // A cut stack's bottom PR has no parent read: nothing to compare against.
+        (_, false, crate::stack::StackEnd::Pr(n)) => {
+            if matches!(app.stack_parent(n), crate::stack::StackEnd::Unread { .. }) {
+                "why"
+            } else {
+                "vs parent"
+            }
+        }
     }
 }
 
@@ -3836,6 +3843,8 @@ fn stack_list_line(
     };
     let badge =
         row.local.as_ref().map(|(l, on)| if *on { format!("[{}]", l.badge()) } else { l.badge() });
+    // A PR merely on top of GitHub's own stack says so, the first trail to give way.
+    let outside = row.outside.map(|n| format!("not in #{n}"));
     let (lead, lead_color) = if row.checked_out { (" ● ", p.green) } else { ("   ", p.dim2) };
     let mut spans =
         vec![Span::styled(lead, Style::default().fg(lead_color).add_modifier(Modifier::BOLD))];
@@ -3862,6 +3871,10 @@ fn stack_list_line(
             used += state.width();
             spans.push(Span::styled(state, Style::default().fg(color)));
         }
+    } else if matches!(row.end, crate::stack::StackEnd::Unread { .. }) {
+        let more = format!("{} ", row.label);
+        used += more.width();
+        spans.push(Span::styled(more, Style::default().fg(p.dim2)));
     } else {
         let base = format!("└ {} ", row.label);
         used += base.width();
@@ -3870,10 +3883,13 @@ fn stack_list_line(
     let trail_w = |b: &Option<String>| {
         b.as_ref().map_or(0, |b| 2 + b.width()) + if role.is_empty() { 0 } else { 2 + role.width() }
     };
-    // A narrow pane sheds the badge before the role, and the title before both.
+    // A narrow pane sheds the outside mark, then the badge before the role, and the title
+    // before all of them.
+    let outside_w = outside.as_ref().map_or(0, |o| 2 + o.width());
     let fits = width >= used + trail_w(&badge) + 4;
     let badge = badge.filter(|_| fits);
-    let trail = trail_w(&badge);
+    let outside = outside.filter(|_| width >= used + trail_w(&badge) + outside_w + 4);
+    let trail = trail_w(&badge) + outside.as_ref().map_or(0, |o| 2 + o.width());
     let marked = row.checked_out || row.head;
     let title_style = if marked {
         text_style(p).add_modifier(Modifier::BOLD)
@@ -3889,6 +3905,10 @@ fn stack_list_line(
     spans.push(Span::raw(" ".repeat(pad)));
     used += pad;
     let mut target = None;
+    if let Some(outside) = outside {
+        spans.push(Span::styled(format!("  {outside}"), Style::default().fg(p.dim2)));
+        used += 2 + outside.width();
+    }
     if let Some(badge) = badge {
         spans.push(Span::raw("  "));
         let start = used + 2;
@@ -4880,13 +4900,28 @@ fn pr_nav_rows(app: &App, width: usize, now: std::time::SystemTime) -> Vec<PrNav
 fn push_stack_rows(rows: &mut Vec<PrNavRow>, app: &App, stack: &[forge::StackEntry], width: usize) {
     let p = app.palette();
     let dim = Style::default().fg(p.dim2);
-    rows.push(PrNavRow::text(vec![Span::styled(format!("stack · {}", stack.len()), dim)]));
+    let home = app.pr_checked_out_snapshot();
+    let shape = home.map(|s| s.stack_shape.clone()).unwrap_or_default();
+    let member = |n: u64| home.is_none_or(|s| s.stack_member(n));
+    // GitHub's own stack names itself and counts its members; a PR merely on top of one is
+    // listed and marked, never counted.
+    let header = match &shape.native {
+        Some(native) => format!("stack #{} · {}", native.number, native.members.len()),
+        None => format!("stack · {}", stack.len()),
+    };
+    rows.push(PrNavRow::text(vec![Span::styled(header, dim)]));
+    if shape.more_above {
+        rows.push(PrNavRow::text(vec![Span::styled("   … more above — not read", dim)]));
+    }
     let checked_out = app.pr_checked_out_number();
     let shown = app.pr_shown_number();
+    let outside = shape.native.as_ref().map(|s| format!("not in stack #{}", s.number));
     for (i, entry) in stack.iter().rev().enumerate() {
         let (word, color) = stack_state(p, entry);
         let (mark, mark_color, tag) = if checked_out == Some(entry.number) {
             ("●", p.green, "checked out")
+        } else if !member(entry.number) {
+            (" ", p.dim2, outside.as_deref().unwrap_or_default())
         } else {
             (" ", p.dim2, "")
         };
@@ -4925,8 +4960,12 @@ fn push_stack_rows(rows: &mut Vec<PrNavRow>, app: &App, stack: &[forge::StackEnt
         }
         rows.push(PrNavRow { spans, stack: Some(i), viewed, ..PrNavRow::default() });
     }
-    if let Some(bottom) = stack.first().filter(|e| !e.base_ref.is_empty()) {
-        rows.push(PrNavRow::text(vec![Span::styled(format!("   └ {}", bottom.base_ref), dim)]));
+    // The base only when the read reached it: a cut stack's bottom PR targets another PR's
+    // branch, which must never read as the base.
+    if shape.more_below {
+        rows.push(PrNavRow::text(vec![Span::styled("   … more below — not read", dim)]));
+    } else if let Some(base) = home.and_then(forge::PrSnapshot::stack_base) {
+        rows.push(PrNavRow::text(vec![Span::styled(format!("   └ {base}"), dim)]));
     }
 }
 

@@ -361,11 +361,14 @@ disables the picker.
 
 ### Stacked PRs
 
-On GitHub, the PR tab's navigator lists the stack a PR sits in: the PRs below it, down to the
-one that targets the default branch, and the open PRs stacked on top of it — the chains
-`gh stack` builds, or any PR whose base is another PR's
-branch. Each row shows the number, state, and title, top of the stack first, with the trunk
-last. The checked-out branch's PR wears a filled `●` and a `checked out` tag:
+On GitHub, the PR tab's navigator lists the stack a PR sits in. When the PR is in one of
+GitHub's own stacks (the ones `gh stack` builds), that is the stack: exactly its members, in
+GitHub's order, on the base it shows, headed `stack #1153 · 7`. A PR that targets a member's
+branch without being in the stack is listed above it and tagged `not in stack #1153`. Without a
+native stack, reviewr walks the bases instead: the PRs below this one, down to the one that
+targets the default branch (or a branch with no PR), and the open PRs stacked on top of it.
+Each row shows the number, state, and title, top of the stack first, with the trunk last. The
+checked-out branch's PR wears a filled `●` and a `checked out` tag:
 
 ```text
 stack · 3
@@ -393,8 +396,15 @@ PR you are viewing. The checked-out PR keeps its own refresh, which never takes 
 viewed PR stays on screen until you leave it, even if it drops out of the stack. Each PR you
 open from the stack starts at its top.
 
+The walk reads up to 12 levels each way and lists up to 25 PRs. A stack it could not read to
+the end says so, `… more below — not read` (or `above`), in place of the base. The bottom PR's
+target is then another PR's branch, so reviewr shows no base and won't compare that PR
+against its parent (`Enter` there says why). It never treats a PR's branch as the stack base.
+
 A PR that stacks on nothing shows no stack section. Reading the stack costs one extra GitHub
-query per refresh, plus one per further level. The stack's PRs are read in batches of up to 5
+query per refresh, which also asks for GitHub's own stack. A native stack adds one query per
+level of PRs on top of it, usually one. Without a native stack, the walk costs one query per
+level, up to 12. The stack's PRs are read in batches of up to 5
 per GitHub query, one batch at a time. GitLab and Azure DevOps show no stack, but their
 MR or PR target still sets the [base](#base-branch).
 

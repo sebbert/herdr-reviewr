@@ -487,6 +487,7 @@ fn build_snapshot(
         comments_truncated,
         checks_truncated,
         stack: Vec::new(),
+        stack_shape: crate::forge::StackShape::default(),
         repo: None,
     }
 }

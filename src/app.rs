@@ -3003,6 +3003,15 @@ impl App {
         self.pr_browse.as_ref().map_or(&self.pr, |b| &b.home.pr)
     }
 
+    /// The checked-out branch's PR snapshot, once resolved.
+    #[must_use]
+    pub fn pr_checked_out_snapshot(&self) -> Option<&forge::PrSnapshot> {
+        match self.pr_checked_out_view() {
+            forge::PrView::Pr(s) => Some(s),
+            _ => None,
+        }
+    }
+
     /// The checked-out branch's PR number, once resolved.
     #[must_use]
     pub fn pr_checked_out_number(&self) -> Option<u64> {

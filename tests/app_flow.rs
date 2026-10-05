@@ -8987,3 +8987,82 @@ fn stack_fetch_asks_once_per_head_and_a_failure_lands_in_the_hint() {
     press(&mut app, &keymap, KeyCode::Char('r'));
     assert!(app.take_stack_fetch().is_some_and(|j| j.wanted.contains(&(12, "2".repeat(40)))));
 }
+
+/// The checked-out #11's snapshot with its stack read cut below #10, whose base is then
+/// another PR's branch (`head-9`).
+fn cut_stack(r: &Repo) -> herdr_reviewr::forge::PrSnapshot {
+    let mut snap = stack_snapshot(11, "head-10", "eleven");
+    snap.head_oid = tip(r, "head-11");
+    snap.stack[0].base_ref = "head-9".to_string();
+    snap.stack_shape.more_below = true;
+    snap
+}
+
+#[test]
+fn a_cut_stack_lists_no_base_and_refuses_vs_parent_on_its_bottom_pr() {
+    use herdr_reviewr::forge::PrView;
+    let r = stack_range_repo();
+    let mut app = stack_app(&r);
+    let keymap = Keymap::default();
+    assert_eq!(stack_labels(&app).last().map(String::as_str), Some("main"), "whole: the base");
+
+    app.apply_pr(PrView::Pr(Box::new(cut_stack(&r))));
+    assert_eq!(app.pr_checked_out_snapshot().unwrap().stack_base(), None);
+    assert_eq!(stack_labels(&app), ["#12", "#11", "#10", "…"], "the cut, never a fake base");
+    let last = app.stack_list_rows().pop().unwrap();
+    assert_eq!(last.end, herdr_reviewr::stack::StackEnd::Unread { below: true });
+    assert_eq!(last.title, "more below — not read");
+
+    // `enter` on the bottom PR would compare it against a PR branch posing as the base.
+    press(&mut app, &keymap, KeyCode::Char('P'));
+    press(&mut app, &keymap, KeyCode::Char('j'));
+    assert_eq!(highlighted(&app), "#10");
+    let scope = app.scope;
+    press(&mut app, &keymap, KeyCode::Enter);
+    assert_eq!(app.scope, scope, "no range is shown");
+    assert!(app.stack_range.is_none());
+    assert!(
+        app.status.contains("#10's parent is below the part of the stack read")
+            && app.status.contains("head-9 is another PR's branch, not the stack base"),
+        "{}",
+        app.status
+    );
+    // The unread row itself does nothing, and says why; `against` on it too.
+    press(&mut app, &keymap, KeyCode::Char('j'));
+    assert_eq!(highlighted(&app), "…");
+    press(&mut app, &keymap, KeyCode::Enter);
+    assert!(app.status.contains("the stack goes on below"), "{}", app.status);
+    press(&mut app, &keymap, KeyCode::Char('A'));
+    assert!(app.stack_range.is_none(), "against the unread part does nothing");
+
+    // A PR with a listed parent still compares as ever.
+    press(&mut app, &keymap, KeyCode::Char('k'));
+    press(&mut app, &keymap, KeyCode::Char('k'));
+    assert_eq!(highlighted(&app), "#11");
+    app.stack_list_against().unwrap();
+    assert!(app.stack_range.is_none(), "the checked-out PR is the shown head");
+}
+
+#[test]
+fn githubs_own_stack_marks_a_pr_merely_on_top_in_the_stack_list() {
+    use herdr_reviewr::forge::{NativeStack, PrView};
+    let r = stack_range_repo();
+    let mut app = stack_app(&r);
+    let mut snap = stack_snapshot(11, "head-10", "eleven");
+    snap.head_oid = tip(&r, "head-11");
+    snap.stack_shape.native =
+        Some(NativeStack { number: 1153, members: vec![10, 11], base_ref: "main".into() });
+    app.apply_pr(PrView::Pr(Box::new(snap)));
+    let rows = app.stack_list_rows();
+    let outside: Vec<(String, Option<u64>)> =
+        rows.iter().map(|r| (r.label.clone(), r.outside)).collect();
+    assert_eq!(
+        outside,
+        [
+            ("#12".into(), Some(1153)),
+            ("#11".into(), None),
+            ("#10".into(), None),
+            ("main".into(), None)
+        ]
+    );
+}

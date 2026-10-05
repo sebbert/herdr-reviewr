@@ -148,9 +148,52 @@ pub struct PrSnapshot {
     /// empty when it stacks on nothing and nothing stacks on it. GitHub only: the other
     /// providers leave it empty.
     pub stack: Vec<StackEntry>,
+    /// What the stack read proved about the stack's extent ([`StackShape`]).
+    pub stack_shape: StackShape,
     /// The repository the PR was read from, so a stack PR can be read by number from the
     /// same place. `None` from the providers without stacks.
     pub repo: Option<crate::git::RepoTarget>,
+}
+
+/// What a stack read proved about the stack beside its entries: whether it reached the
+/// stack's base, whether PRs above went unread, and GitHub's own stack when the PR is in one.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct StackShape {
+    /// The read stopped before the stack's base: the bottom entry's base is a PR's branch,
+    /// or one not looked up — never the stack's base.
+    pub more_below: bool,
+    /// Stacked PRs above went unread.
+    pub more_above: bool,
+    /// GitHub's own stack, when the PR is in one.
+    pub native: Option<NativeStack>,
+}
+
+/// GitHub's own stack (`PullRequest.stack`): its number, its members trunk side first, and
+/// the branch it targets.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NativeStack {
+    pub number: u64,
+    pub members: Vec<u64>,
+    pub base_ref: String,
+}
+
+impl PrSnapshot {
+    /// The stack's base: the trunk the bottom PR targets — only when the read reached it.
+    /// A cut stack has none: the bottom PR's base is a PR branch then, never the base.
+    #[must_use]
+    pub fn stack_base(&self) -> Option<&str> {
+        if self.stack_shape.more_below {
+            return None;
+        }
+        self.stack.first().map(|e| e.base_ref.as_str()).filter(|b| !b.is_empty())
+    }
+
+    /// Whether stack entry `number` is a member of GitHub's own stack — always, without
+    /// one: the walk's every PR is the stack.
+    #[must_use]
+    pub fn stack_member(&self, number: u64) -> bool {
+        self.stack_shape.native.as_ref().is_none_or(|s| s.members.contains(&number))
+    }
 }
 
 /// One pull request of a stack: the chain whose bases are each other's heads, as
@@ -893,7 +936,9 @@ fn read_pr(
     snapshot.repo = Some(detail_repo.clone());
     if with_stack {
         let cancelled = || target.cancelled.load(Ordering::Acquire);
-        snapshot.stack = stack_outcome(read_stack(&target, node), cancelled)?;
+        let read = stack_outcome(read_stack(&target, node), cancelled)?;
+        snapshot.stack = read.entries;
+        snapshot.stack_shape = read.shape;
     }
     Ok(Some(PrView::Pr(Box::new(snapshot))))
 }
@@ -1237,32 +1282,59 @@ const PR_DETAIL_FIELDS: &str = "number title url body isDraft state mergeable me
 /// the coordinator superseded the whole read. `cancelled` reads the fetch's own flag — the
 /// one proof, as cancellation reaches here as a plain `Other` failure.
 fn stack_outcome(
-    read: Result<Vec<StackEntry>, GhError>,
+    read: Result<StackRead, GhError>,
     cancelled: impl FnOnce() -> bool,
-) -> Result<Vec<StackEntry>, GhError> {
+) -> Result<StackRead, GhError> {
     match read {
         Ok(stack) => Ok(stack),
         Err(error) if cancelled() => Err(error),
         Err(error) => {
             crate::logln!("pr stack read failed, listing no stack: {error:?}");
-            Ok(Vec::new())
+            Ok(StackRead::default())
         }
     }
 }
 
-/// Round trips one stack walk may spend: each reads one level in both directions, so a
-/// stack of five on either side of this PR resolves whole.
-const STACK_ROUNDS: usize = 5;
-/// PRs one stack lists at most, the current one included.
-const STACK_CAP: usize = 12;
+/// A stack read's result: the entries, trunk side first, and what the read proved about
+/// the stack's extent.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct StackRead {
+    pub(crate) entries: Vec<StackEntry>,
+    pub(crate) shape: StackShape,
+}
 
-/// The stack around `node`: walk down through the PR whose head is this one's base until
-/// the base is the default branch, and up through the open PRs whose base is this one's
-/// head. Each round batches every pending name into one aliased query, so a stack costs
-/// one round trip per level, and a PR that stacks on nothing costs one. A fork head
-/// stacks on nothing: its name lives in another repository than the bases it would match.
-fn read_stack(target: &FetchTarget<'_>, node: &Value) -> Result<Vec<StackEntry>, GhError> {
-    let Some(mut walk) = StackWalk::new(node) else { return Ok(Vec::new()) };
+/// Round trips one stack walk may spend: each reads one level in both directions, so a
+/// stack of twelve on either side of this PR resolves whole.
+const STACK_ROUNDS: usize = 12;
+/// PRs one stack lists at most, the current one included.
+const STACK_CAP: usize = 25;
+/// The most members of GitHub's own stack one read lists.
+const NATIVE_STACK_PAGE: usize = 50;
+
+/// The stack around `node`. GitHub's own stack (`PullRequest.stack`, what `gh stack`
+/// builds) is asked for in the first round: when the PR is in one, its members in order and
+/// its base are exactly what GitHub shows, and the walk only adds the open PRs based on a
+/// member's head that are not in it. Otherwise — or on a host whose schema lacks the field —
+/// the walk is the whole story: down through the PR whose head is this one's base until the
+/// base is the default branch or a branch no PR has, and up through the open PRs whose base
+/// is this one's head. Each round batches every pending name into one aliased query, so a
+/// stack costs one round trip per level, and a PR that stacks on nothing costs one. A fork
+/// head stacks on nothing: its name lives in another repository than the bases it would
+/// match.
+fn read_stack(target: &FetchTarget<'_>, node: &Value) -> Result<StackRead, GhError> {
+    match walk_stack(target, node, true) {
+        Err(error) if !target.cancelled.load(Ordering::Acquire) => {
+            // An older GitHub Enterprise has no `stack` field and rejects the whole round:
+            // walk again without asking for it.
+            crate::logln!("native stack read failed, walking bases: {error:?}");
+            walk_stack(target, node, false)
+        }
+        read => read,
+    }
+}
+
+fn walk_stack(target: &FetchTarget<'_>, node: &Value, native: bool) -> Result<StackRead, GhError> {
+    let Some(mut walk) = StackWalk::new(node, native) else { return Ok(StackRead::default()) };
     while let Some((query, names)) = walk.next_query() {
         let mut vars = vec![
             ("o".to_string(), target.owner.to_string()),
@@ -1288,10 +1360,16 @@ pub(crate) struct StackWalk {
     up: Vec<(String, i32)>,
     default: Option<String>,
     rounds: usize,
+    /// Ask for GitHub's own stack in the first round.
+    ask_native: bool,
+    native: Option<NativeStack>,
+    /// A PR the cap kept out, below or above.
+    capped_below: bool,
+    capped_above: bool,
 }
 
 impl StackWalk {
-    pub(crate) fn new(node: &Value) -> Option<Self> {
+    pub(crate) fn new(node: &Value, ask_native: bool) -> Option<Self> {
         if node["isCrossRepository"].as_bool() == Some(true) {
             return None;
         }
@@ -1306,6 +1384,10 @@ impl StackWalk {
             above: Vec::new(),
             default: None,
             rounds: 0,
+            ask_native,
+            native: None,
+            capped_below: false,
+            capped_above: false,
         })
     }
 
@@ -1318,7 +1400,8 @@ impl StackWalk {
             || self.below.iter().chain(&self.above).any(|e| e.number == number)
     }
 
-    /// The next round's query and its variables, or `None` when the walk is done.
+    /// The next round's query and its variables, or `None` when the walk is done — whole, or
+    /// at its bound, which [`Self::finish`] reports.
     pub(crate) fn next_query(&mut self) -> Option<(String, Vec<(String, String)>)> {
         use std::fmt::Write;
         if self.rounds >= STACK_ROUNDS || self.len() >= STACK_CAP {
@@ -1332,9 +1415,20 @@ impl StackWalk {
         let mut decl = String::from("query($o:String!,$n:String!");
         let mut body = String::new();
         let mut vars = Vec::new();
-        // The first round learns the default branch, where the downward walk stops.
+        // The first round learns the default branch, where the downward walk stops, and
+        // GitHub's own stack, which makes the walk down unneeded.
         if self.rounds == 0 {
             body.push_str("defaultBranchRef{name} ");
+            if self.ask_native {
+                let _ = write!(
+                    body,
+                    "self:pullRequest(number:{}){{stack{{number size baseRefName \
+                     entries(first:{NATIVE_STACK_PAGE}){{totalCount nodes{{position \
+                     pullRequest{{number title url state isDraft headRefName baseRefName \
+                     isCrossRepository}}}}}}}}}} ",
+                    self.current.number
+                );
+            }
         }
         if let Some(down) = &self.down {
             decl.push_str(",$d:String!");
@@ -1366,6 +1460,10 @@ impl StackWalk {
             self.default = Some(name.to_string());
         }
         let nodes = |key: &str| repo[key]["nodes"].as_array().cloned().unwrap_or_default();
+        if self.native.is_none() && self.absorb_native(&repo["self"]["stack"]) {
+            // GitHub's stack is the membership: the base walk's answer is not needed.
+            self.down = None;
+        }
         if let Some(down) = self.down.take()
             && self.default.as_deref() != Some(down.as_str())
         {
@@ -1381,12 +1479,16 @@ impl StackWalk {
                 .iter()
                 .position(|e| e.state == PrState::Open)
                 .or((!candidates.is_empty()).then_some(0));
-            if let Some(entry) = pick.map(|i| candidates[i].clone())
-                && self.len() < STACK_CAP
-            {
-                self.down = Some(entry.base_ref.clone())
-                    .filter(|b| !b.is_empty() && self.default.as_deref() != Some(b.as_str()));
-                self.below.push(entry);
+            // A branch that has a PR is a stack member, never the base: with no room left
+            // for it, the stack is cut, not ended.
+            if let Some(entry) = pick.map(|i| candidates[i].clone()) {
+                if self.len() < STACK_CAP {
+                    self.down = Some(entry.base_ref.clone())
+                        .filter(|b| !b.is_empty() && self.default.as_deref() != Some(b.as_str()));
+                    self.below.push(entry);
+                } else {
+                    self.capped_below = true;
+                }
             }
         }
         let up = std::mem::take(&mut self.up);
@@ -1396,7 +1498,11 @@ impl StackWalk {
                     continue;
                 }
                 let Some(entry) = stack_entry(&n, level + 1) else { continue };
-                if entry.base_ref != *head || self.seen(entry.number) || self.len() >= STACK_CAP {
+                if entry.base_ref != *head || self.seen(entry.number) {
+                    continue;
+                }
+                if self.len() >= STACK_CAP {
+                    self.capped_above = true;
                     continue;
                 }
                 if !entry.head_ref.is_empty() {
@@ -1407,15 +1513,80 @@ impl StackWalk {
         }
     }
 
-    /// The stack trunk side first, or empty when nothing stacks either way.
-    pub(crate) fn finish(self) -> Vec<StackEntry> {
+    /// Take GitHub's own stack from the first round, when the PR is in one: its members by
+    /// position, with this PR's own read as the current one. The walk up then starts again
+    /// from every member above this one, for the open PRs on a member that are not in it.
+    fn absorb_native(&mut self, stack: &Value) -> bool {
+        let (Some(number), Some(nodes)) =
+            (stack["number"].as_u64(), stack["entries"]["nodes"].as_array())
+        else {
+            return false;
+        };
+        let mut members: Vec<(i64, &Value)> = nodes
+            .iter()
+            .filter_map(|n| Some((n["position"].as_i64()?, &n["pullRequest"])))
+            .filter(|(_, pr)| pr["number"].as_u64().is_some())
+            .collect();
+        members.sort_by_key(|(position, _)| *position);
+        let Some(at) =
+            members.iter().position(|(_, pr)| pr["number"].as_u64() == Some(self.current.number))
+        else {
+            return false;
+        };
+        let level =
+            |i: usize| i32::try_from(i).unwrap_or(i32::MAX) - i32::try_from(at).unwrap_or(i32::MAX);
+        let entries: Vec<(usize, StackEntry)> = members
+            .iter()
+            .enumerate()
+            .filter_map(|(i, (_, pr))| Some((i, stack_entry(pr, level(i))?)))
+            .collect();
+        self.below =
+            entries.iter().filter(|(i, _)| *i < at).rev().map(|(_, e)| e.clone()).collect();
+        self.above = entries.iter().filter(|(i, _)| *i > at).map(|(_, e)| e.clone()).collect();
+        // This round's `u0` reads the current PR's children; every member above it still
+        // needs its own.
+        self.up.extend(
+            self.above
+                .iter()
+                .filter(|e| !e.head_ref.is_empty())
+                .map(|e| (e.head_ref.clone(), e.level)),
+        );
+        let total = stack["entries"]["totalCount"].as_u64().unwrap_or(0);
+        self.capped_above |= total > u64::try_from(members.len()).unwrap_or(u64::MAX);
+        self.native = Some(NativeStack {
+            number,
+            members: members.iter().filter_map(|(_, pr)| pr["number"].as_u64()).collect(),
+            base_ref: stack["baseRefName"].as_str().unwrap_or_default().to_string(),
+        });
+        true
+    }
+
+    /// The stack trunk side first, or empty when nothing stacks either way, and what the
+    /// walk proved: a walk that stopped with a base still to look up, or a PR the cap kept
+    /// out, never reached the stack's base.
+    pub(crate) fn finish(self) -> StackRead {
+        let shape = StackShape {
+            more_below: self.capped_below || self.down.is_some(),
+            more_above: self.capped_above || !self.up.is_empty(),
+            native: self.native,
+        };
         if self.below.is_empty() && self.above.is_empty() {
-            return Vec::new();
+            return StackRead {
+                entries: Vec::new(),
+                shape: StackShape { native: shape.native, ..StackShape::default() },
+            };
         }
         let mut above = self.above;
         // A stable sort: one level's PRs keep their creation order.
         above.sort_by_key(|e| e.level);
-        self.below.into_iter().rev().chain(std::iter::once(self.current)).chain(above).collect()
+        let entries = self
+            .below
+            .into_iter()
+            .rev()
+            .chain(std::iter::once(self.current))
+            .chain(above)
+            .collect();
+        StackRead { entries, shape }
     }
 }
 
@@ -1566,6 +1737,7 @@ fn build_snapshot(node: &Value, sync: Sync) -> PrSnapshot {
         comments_truncated,
         checks_truncated,
         stack: Vec::new(),
+        stack_shape: StackShape::default(),
         repo: None,
     }
 }
@@ -2090,6 +2262,7 @@ mod tests {
             comments_truncated: false,
             checks_truncated: false,
             stack: Vec::new(),
+            stack_shape: StackShape::default(),
             repo: None,
         };
         assert_eq!(snap(&[]).checks_rollup(), None);
@@ -2187,23 +2360,30 @@ mod tests {
     #[test]
     fn a_failed_stack_read_lists_no_stack_unless_the_fetch_was_cancelled() {
         let failed = || Err(GhError::Other("rate limited".into()));
-        assert_eq!(stack_outcome(failed(), || false), Ok(Vec::new()), "the snapshot survives");
+        assert_eq!(
+            stack_outcome(failed(), || false),
+            Ok(StackRead::default()),
+            "the snapshot survives"
+        );
         assert_eq!(
             stack_outcome(Err(GhError::NotAuthed("github.com".into())), || false),
-            Ok(Vec::new())
+            Ok(StackRead::default())
         );
         assert_eq!(
             stack_outcome(failed(), || true),
             Err(GhError::Other("rate limited".into())),
             "a superseded fetch still aborts whole"
         );
-        let stack = vec![stack_entry(&stack_node(1, "a", "main", "OPEN"), 0).unwrap()];
+        let stack = StackRead {
+            entries: vec![stack_entry(&stack_node(1, "a", "main", "OPEN"), 0).unwrap()],
+            shape: StackShape::default(),
+        };
         assert_eq!(stack_outcome(Ok(stack.clone()), || true), Ok(stack));
     }
 
     #[test]
     fn a_pr_that_stacks_on_nothing_costs_one_round_and_lists_no_stack() {
-        let mut walk = StackWalk::new(&stack_node(7, "feature", "main", "OPEN")).unwrap();
+        let mut walk = StackWalk::new(&stack_node(7, "feature", "main", "OPEN"), false).unwrap();
         let (query, vars) = walk.next_query().unwrap();
         assert!(query.contains("defaultBranchRef{name}"), "the first round learns the trunk");
         assert!(query.contains("d:pullRequests(headRefName:$d"));
@@ -2216,13 +2396,13 @@ mod tests {
             "u0": {"nodes": []},
         }}}));
         assert!(walk.next_query().is_none());
-        assert!(walk.finish().is_empty());
+        assert!(walk.finish().entries.is_empty());
     }
 
     #[test]
     fn the_stack_walks_down_to_the_trunk_and_up_through_its_children() {
         // main <- #1 a <- #2 b (current) <- #3 c, #4 d (both on b) <- #5 e (on c)
-        let mut walk = StackWalk::new(&stack_node(2, "b", "a", "OPEN")).unwrap();
+        let mut walk = StackWalk::new(&stack_node(2, "b", "a", "OPEN"), false).unwrap();
         let (_, vars) = walk.next_query().unwrap();
         assert_eq!(vars, [("d".into(), "a".into()), ("u0".into(), "b".into())]);
         walk.absorb(&serde_json::json!({"data": {"repository": {
@@ -2250,15 +2430,172 @@ mod tests {
         assert_eq!(vars, [("u0".into(), "e".into())]);
         walk.absorb(&serde_json::json!({"data": {"repository": {"u0": {"nodes": []}}}}));
         assert!(walk.next_query().is_none());
-        let stack = walk.finish();
+        let stack = walk.finish().entries;
         let order: Vec<(u64, i32)> = stack.iter().map(|e| (e.number, e.level)).collect();
         assert_eq!(order, [(1, -1), (2, 0), (3, 1), (4, 1), (5, 2)], "trunk side first");
         assert_eq!(stack[0].base_ref, "main");
     }
 
+    /// Answer one walk round from a linear chain: PR `n`'s head is `h{n}`, its base `h{n-1}`,
+    /// and `h0` is `main`. Children are looked up by base, parents by head.
+    fn chain_round(vars: &[(String, String)], top: u64, first: bool) -> Value {
+        let number_of = |head: &str| head.strip_prefix('h').and_then(|n| n.parse::<u64>().ok());
+        let node = |n: u64| {
+            let base = if n == 1 { "main".to_string() } else { format!("h{}", n - 1) };
+            stack_node(n, &format!("h{n}"), &base, "OPEN")
+        };
+        let mut repo = serde_json::Map::new();
+        if first {
+            repo.insert("defaultBranchRef".into(), serde_json::json!({"name": "main"}));
+        }
+        for (key, value) in vars {
+            let nodes: Vec<Value> = if key == "d" {
+                number_of(value).filter(|&n| n >= 1).map(node).into_iter().collect()
+            } else {
+                number_of(value)
+                    .map(|n| n + 1)
+                    .filter(|&n| n <= top)
+                    .map(node)
+                    .into_iter()
+                    .collect()
+            };
+            repo.insert(key.clone(), serde_json::json!({ "nodes": nodes }));
+        }
+        serde_json::json!({"data": {"repository": repo}})
+    }
+
+    fn walk_chain(current: u64, top: u64) -> (StackRead, usize) {
+        let base = format!("h{}", current - 1);
+        let mut walk =
+            StackWalk::new(&stack_node(current, &format!("h{current}"), &base, "OPEN"), false)
+                .unwrap();
+        let mut rounds = 0;
+        while let Some((_, vars)) = walk.next_query() {
+            walk.absorb(&chain_round(&vars, top, rounds == 0));
+            rounds += 1;
+        }
+        (walk.finish(), rounds)
+    }
+
+    #[test]
+    fn a_seven_deep_stack_resolves_whole_down_to_main() {
+        // main <- #1 <- … <- #7 (checked out) <- #8: the report's real shape, 6 below.
+        let (read, rounds) = walk_chain(7, 8);
+        let numbers: Vec<u64> = read.entries.iter().map(|e| e.number).collect();
+        assert_eq!(numbers, [1, 2, 3, 4, 5, 6, 7, 8]);
+        assert_eq!(rounds, 6, "one round per level below, the level above riding along");
+        assert_eq!(read.shape, StackShape::default(), "nothing left unread either way");
+        let snapshot = PrSnapshot {
+            stack: read.entries,
+            stack_shape: read.shape,
+            ..build_snapshot(&stack_node(7, "h7", "h6", "OPEN"), Sync::InSync)
+        };
+        assert_eq!(snapshot.stack_base(), Some("main"));
+    }
+
+    #[test]
+    fn a_stack_past_the_bound_reports_the_cut_and_no_base() {
+        // Twenty below the checked-out PR: the walk spends its rounds and stops.
+        let (read, rounds) = walk_chain(21, 21);
+        assert_eq!(rounds, STACK_ROUNDS);
+        assert!(read.shape.more_below && !read.shape.more_above);
+        let bottom = read.entries.first().unwrap();
+        assert_ne!(bottom.base_ref, "main", "the bottom PR targets another PR's branch");
+        let snapshot = PrSnapshot {
+            stack: read.entries,
+            stack_shape: read.shape,
+            ..build_snapshot(&stack_node(21, "h21", "h20", "OPEN"), Sync::InSync)
+        };
+        assert_eq!(snapshot.stack_base(), None, "a PR's branch is never the stack base");
+    }
+
+    #[test]
+    fn the_cap_cuts_a_wide_stack_and_says_so() {
+        let mut walk = StackWalk::new(&stack_node(1, "h1", "main", "OPEN"), false).unwrap();
+        walk.next_query().unwrap();
+        let children: Vec<Value> =
+            (100..140).map(|n| stack_node(n, &format!("c{n}"), "h1", "OPEN")).collect();
+        walk.absorb(&serde_json::json!({"data": {"repository": {
+            "defaultBranchRef": {"name": "main"},
+            "u0": {"nodes": children},
+        }}}));
+        let read = walk.finish();
+        assert_eq!(read.entries.len(), STACK_CAP);
+        assert!(read.shape.more_above && !read.shape.more_below);
+    }
+
+    #[test]
+    fn githubs_own_stack_lists_its_members_and_marks_a_pr_merely_on_top() {
+        // Stack #1153 of the report: #1147..#1152 and #1211 on `main`; #1212 targets #1211's
+        // head but is not a member.
+        let numbers = [1147_u64, 1148, 1149, 1150, 1151, 1152, 1211];
+        let head = |n: u64| format!("h{n}");
+        let member = |i: usize| {
+            let base = if i == 0 { "main".to_string() } else { head(numbers[i - 1]) };
+            serde_json::json!({"position": i + 1, "pullRequest": stack_node(numbers[i], &head(numbers[i]), &base, "OPEN")})
+        };
+        let mut walk = StackWalk::new(&stack_node(1211, "h1211", "h1152", "OPEN"), true).unwrap();
+        let (query, _) = walk.next_query().unwrap();
+        assert!(query.contains("self:pullRequest(number:1211){stack{number size baseRefName"));
+        // Positions arrive out of order; the walk orders them.
+        let mut entries: Vec<Value> = (0..numbers.len()).map(member).collect();
+        entries.reverse();
+        walk.absorb(&serde_json::json!({"data": {"repository": {
+            "defaultBranchRef": {"name": "main"},
+            "self": {"stack": {"number": 1153, "size": 7, "baseRefName": "main",
+                "entries": {"totalCount": 7, "nodes": entries}}},
+            "d": {"nodes": [stack_node(1152, "h1152", "h1151", "OPEN")]},
+            "u0": {"nodes": [stack_node(1212, "h1212", "h1211", "OPEN")]},
+        }}}));
+        // No walk down: GitHub's stack is the membership. #1212's own children follow.
+        let (query, vars) = walk.next_query().unwrap();
+        assert!(!query.contains("$d"));
+        assert_eq!(vars, [("u0".to_string(), "h1212".to_string())]);
+        walk.absorb(&serde_json::json!({"data": {"repository": {"u0": {"nodes": []}}}}));
+        assert!(walk.next_query().is_none());
+        let read = walk.finish();
+        let order: Vec<u64> = read.entries.iter().map(|e| e.number).collect();
+        assert_eq!(order, [1147, 1148, 1149, 1150, 1151, 1152, 1211, 1212]);
+        let native = read.shape.native.clone().unwrap();
+        assert_eq!((native.number, native.base_ref.as_str()), (1153, "main"));
+        assert_eq!(native.members, numbers);
+        assert!(!read.shape.more_below && !read.shape.more_above);
+        let snapshot = PrSnapshot {
+            stack: read.entries,
+            stack_shape: read.shape,
+            ..build_snapshot(&stack_node(1211, "h1211", "h1152", "OPEN"), Sync::InSync)
+        };
+        assert_eq!(snapshot.stack_base(), Some("main"));
+        assert!(snapshot.stack_member(1147) && !snapshot.stack_member(1212));
+    }
+
+    #[test]
+    fn without_githubs_stack_the_walk_is_the_whole_story() {
+        // A PR in no native stack (`stack: null`), or a host that never answered the field.
+        let mut walk = StackWalk::new(&stack_node(2, "h2", "h1", "OPEN"), true).unwrap();
+        walk.next_query().unwrap();
+        walk.absorb(&serde_json::json!({"data": {"repository": {
+            "defaultBranchRef": {"name": "main"},
+            "self": {"stack": null},
+            "d": {"nodes": [stack_node(1, "h1", "main", "OPEN")]},
+            "u0": {"nodes": []},
+        }}}));
+        assert!(walk.next_query().is_none());
+        let read = walk.finish();
+        assert_eq!(read.entries.len(), 2);
+        assert_eq!(read.shape, StackShape::default());
+        assert!(
+            StackWalk::new(&stack_node(2, "h2", "h1", "OPEN"), false)
+                .unwrap()
+                .next_query()
+                .is_some_and(|(q, _)| !q.contains("self:")),
+            "the retry asks no native field"
+        );
+    }
+
     #[test]
     fn a_merged_parent_whose_branch_stands_is_still_the_stacks_bottom() {
-        let mut walk = StackWalk::new(&stack_node(2, "b", "a", "OPEN")).unwrap();
+        let mut walk = StackWalk::new(&stack_node(2, "b", "a", "OPEN"), false).unwrap();
         walk.next_query().unwrap();
         walk.absorb(&serde_json::json!({"data": {"repository": {
             "defaultBranchRef": {"name": "main"},
@@ -2266,7 +2603,7 @@ mod tests {
             "u0": {"nodes": []},
         }}}));
         assert!(walk.next_query().is_none());
-        let stack = walk.finish();
+        let stack = walk.finish().entries;
         assert_eq!(stack[0].state, PrState::Merged);
         assert_eq!(stack.len(), 2);
     }
@@ -2275,10 +2612,10 @@ mod tests {
     fn a_fork_head_stacks_on_nothing_and_the_walk_is_bounded() {
         let mut fork = stack_node(2, "b", "a", "OPEN");
         fork["isCrossRepository"] = Value::Bool(true);
-        assert!(StackWalk::new(&fork).is_none(), "a fork's head names another repository");
+        assert!(StackWalk::new(&fork, false).is_none(), "a fork's head names another repository");
 
         // An endless chain stops at the round budget, never spinning on the forge.
-        let mut walk = StackWalk::new(&stack_node(100, "h0", "b0", "OPEN")).unwrap();
+        let mut walk = StackWalk::new(&stack_node(100, "h0", "b0", "OPEN"), false).unwrap();
         let mut rounds: usize = 0;
         while let Some((_, vars)) = walk.next_query() {
             rounds += 1;
@@ -2290,7 +2627,7 @@ mod tests {
             }}}));
         }
         assert_eq!(rounds, STACK_ROUNDS);
-        assert_eq!(walk.finish().len(), STACK_ROUNDS + 1);
+        assert_eq!(walk.finish().entries.len(), STACK_ROUNDS + 1);
     }
 
     fn input(head: &str, names: &[&str]) -> PrFetchInput {

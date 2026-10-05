@@ -177,6 +177,18 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   reply count on threads.
 
 ### Fixed
+- **Deep stacks resolve whole, and a cut stack never shows a fake base.** The stack walk
+  stopped five levels down, so a PR six above `main` listed its stack's lowest PR's
+  branch as the base, and `vs parent` on the lowest PR compared against that PR branch. The walk
+  now reads 12 levels each way and up to 25 PRs, still one batched query per level. A stack
+  it can't read to the end shows `… more below — not read` (or `above`) in place of the base,
+  in the PR tab and in the stack list. `vs parent` on the cut PR does nothing and says why. A
+  branch with a PR is always a stack member, never the base.
+- **GitHub's own stacks list exactly their members.** When a PR is in a native stack
+  (`gh stack`), reviewr reads it from GitHub (`PullRequest.stack`): its members in order and
+  its base, headed `stack #1153 · 7`. A PR that targets a member's branch without being in the
+  stack is listed but tagged `not in stack #1153`. Without a native stack, or on a GitHub
+  Enterprise without the field, the base walk stays.
 - **Emoji no longer break borders, the divider, or scrollbars.** A VS16 emoji (`🗄️`, `⚠️`,
   `ℹ️`, `✔️`) is two cells in reviewr's layout but one in a terminal that measures by
   codepoint. Each redraw then put the rest of its row one column off. Box borders vanished,

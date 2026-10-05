@@ -25,6 +25,11 @@ pub const FETCH_TIMEOUT: Duration = Duration::from_mins(1);
 pub enum StackEnd {
     Base,
     Pr(u64),
+    /// The part of the stack the read never reached, below its lowest PR or above its
+    /// highest. A row that says so, never an end a range can take.
+    Unread {
+        below: bool,
+    },
 }
 
 /// Which commit a PR end stands for.
@@ -69,6 +74,7 @@ impl EndSpec {
             (StackEnd::Pr(n), EndSource::Pr) => {
                 vec![format!("refs/remotes/origin/{b}"), git::stack_ref(n)]
             }
+            (StackEnd::Unread { .. }, _) => Vec::new(),
             (StackEnd::Base, _) => {
                 vec![format!("refs/remotes/origin/{b}"), format!("refs/heads/{b}")]
             }

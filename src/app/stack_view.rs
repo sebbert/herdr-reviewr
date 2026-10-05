@@ -31,6 +31,8 @@ pub struct StackListRow {
     /// The same-named local branch where it differs from the PR head (never the checked-out
     /// row), with whether the reader chose it for this row.
     pub local: Option<(crate::stack::LocalBranch, bool)>,
+    /// A PR merely based on a member of GitHub's own stack, not in it: that stack's number.
+    pub outside: Option<u64>,
 }
 
 /// The stack fetch's bookkeeping: the one job in flight, the head each PR was last asked for
@@ -45,6 +47,14 @@ pub(crate) struct StackFetch {
     kept: Option<Vec<u64>>,
 }
 
+/// Why an unread row does nothing.
+fn unread_status(row: &StackListRow) -> String {
+    format!(
+        "the stack goes on {} — reviewr read no further",
+        if matches!(row.end, StackEnd::Unread { below: true }) { "below" } else { "above" }
+    )
+}
+
 impl App {
     /// Whether a PR stack is known for the checked-out branch: GitHub reads one, the other
     /// forges list none, so the stack features are simply not offered there.
@@ -53,9 +63,30 @@ impl App {
         !self.pr_stack().is_empty()
     }
 
-    /// The stack's base: the trunk the bottom PR targets.
+    /// The stack's base: the trunk the bottom PR targets — only when the read reached it. A
+    /// cut stack's bottom PR targets another PR's branch, which is never the base.
     fn stack_base_branch(&self) -> Option<String> {
-        self.pr_stack().first().map(|e| e.base_ref.clone())
+        self.pr_checked_out_snapshot()?.stack_base().map(str::to_string)
+    }
+
+    /// What the stack read proved about the stack's extent.
+    fn stack_shape(&self) -> forge::StackShape {
+        self.pr_checked_out_snapshot().map(|s| s.stack_shape.clone()).unwrap_or_default()
+    }
+
+    /// Why `vs parent` on PR `number` does nothing: its parent is below the part of the
+    /// stack read, and its base is a PR's branch, not the stack's base.
+    fn unread_parent_reason(&self, number: u64) -> String {
+        let base = self
+            .pr_stack()
+            .iter()
+            .find(|e| e.number == number)
+            .map(|e| e.base_ref.clone())
+            .unwrap_or_default();
+        format!(
+            "#{number}'s parent is below the part of the stack read — {base} is another PR's \
+             branch, not the stack base"
+        )
     }
 
     /// The forge's latest head commit for stack PR `number`: the checked-out PR's own read, or
@@ -85,6 +116,7 @@ impl App {
                     source: EndSource::Pr,
                 })
             }
+            StackEnd::Unread { .. } => None,
             StackEnd::Pr(n) => {
                 let entry = self.pr_stack().iter().find(|e| e.number == n)?;
                 // The checked-out PR is always the worktree; another PR is the PR as its
@@ -111,16 +143,20 @@ impl App {
         }
     }
 
-    /// The PR `number` stacks on: the stack PR whose head is its base, else the stack's base.
-    fn stack_parent(&self, number: u64) -> StackEnd {
+    /// The PR `number` stacks on: the stack PR whose head is its base, else the stack's base
+    /// — or, in a stack the read cut, the unread part below: a base no listed PR has is then
+    /// another PR's branch, never the base.
+    pub(crate) fn stack_parent(&self, number: u64) -> StackEnd {
         let stack = self.pr_stack();
         let Some(base) = stack.iter().find(|e| e.number == number).map(|e| &e.base_ref) else {
             return StackEnd::Base;
         };
-        stack
-            .iter()
-            .find(|e| &e.head_ref == base)
-            .map_or(StackEnd::Base, |e| StackEnd::Pr(e.number))
+        let beyond = if self.stack_shape().more_below {
+            StackEnd::Unread { below: true }
+        } else {
+            StackEnd::Base
+        };
+        stack.iter().find(|e| &e.head_ref == base).map_or(beyond, |e| StackEnd::Pr(e.number))
     }
 
     /// Whether the read pane shows something that is not the checked-out work: a stack range
@@ -235,6 +271,7 @@ impl App {
         let what = match spec.end {
             StackEnd::Pr(_) => format!("{}'s branch", spec.label),
             StackEnd::Base => format!("the stack base {}", spec.label),
+            StackEnd::Unread { .. } => "the unread part of the stack".to_string(),
         };
         format!("{what} isn't fetched — `{}`", spec.fetch_hint())
     }
@@ -298,29 +335,47 @@ impl App {
             Tab::AllFiles => (self.files_source.as_ref().map(|t| t.spec.end), None),
             _ => (None, None),
         };
-        let mut rows: Vec<StackListRow> = self
-            .pr_stack()
-            .iter()
-            .rev()
-            .map(|e| {
-                let end = StackEnd::Pr(e.number);
-                let is_checked_out = checked_out == Some(e.number);
-                StackListRow {
-                    end,
-                    label: format!("#{}", e.number),
-                    title: e.title.clone(),
-                    state: Some((e.state, e.is_draft)),
-                    checked_out: is_checked_out,
-                    head: head == Some(end),
-                    against: against == Some(end),
-                    local: (!is_checked_out)
-                        .then(|| self.stack_locals.get(&e.number))
-                        .flatten()
-                        .map(|l| (l.clone(), self.stack_local.contains(&e.number))),
-                }
-            })
-            .collect();
-        if let Some(base) = self.stack_base_branch().filter(|b| !b.is_empty()) {
+        let shape = self.stack_shape();
+        let unread = |below: bool| StackListRow {
+            end: StackEnd::Unread { below },
+            label: "…".to_string(),
+            title: if below { "more below — not read" } else { "more above — not read" }
+                .to_string(),
+            state: None,
+            checked_out: false,
+            head: false,
+            against: false,
+            local: None,
+            outside: None,
+        };
+        let mut rows: Vec<StackListRow> =
+            shape.more_above.then(|| unread(false)).into_iter().collect();
+        rows.extend(self.pr_stack().iter().rev().map(|e| {
+            let end = StackEnd::Pr(e.number);
+            let is_checked_out = checked_out == Some(e.number);
+            StackListRow {
+                end,
+                label: format!("#{}", e.number),
+                title: e.title.clone(),
+                state: Some((e.state, e.is_draft)),
+                checked_out: is_checked_out,
+                head: head == Some(end),
+                against: against == Some(end),
+                local: (!is_checked_out)
+                    .then(|| self.stack_locals.get(&e.number))
+                    .flatten()
+                    .map(|l| (l.clone(), self.stack_local.contains(&e.number))),
+                outside: shape
+                    .native
+                    .as_ref()
+                    .filter(|s| !s.members.contains(&e.number))
+                    .map(|s| s.number),
+            }
+        }));
+        // A cut stack ends on what was not read, never on a PR's branch posing as the base.
+        if shape.more_below {
+            rows.push(unread(true));
+        } else if let Some(base) = self.stack_base_branch().filter(|b| !b.is_empty()) {
             rows.push(StackListRow {
                 end: StackEnd::Base,
                 label: base,
@@ -330,6 +385,7 @@ impl App {
                 head: head == Some(StackEnd::Base),
                 against: against == Some(StackEnd::Base),
                 local: None,
+                outside: None,
             });
         }
         rows
@@ -416,7 +472,17 @@ impl App {
             Tab::AllFiles => self.set_files_source((!row.checked_out).then_some(row.end)),
             _ if row.checked_out => self.back_to_checked_out(),
             _ => match row.end {
-                StackEnd::Pr(n) => self.pick_stack_range(row.end, self.stack_parent(n)),
+                StackEnd::Pr(n) => match self.stack_parent(n) {
+                    StackEnd::Unread { .. } => {
+                        self.status = self.unread_parent_reason(n);
+                        Ok(())
+                    }
+                    parent => self.pick_stack_range(row.end, parent),
+                },
+                StackEnd::Unread { .. } => {
+                    self.status = unread_status(&row);
+                    Ok(())
+                }
                 StackEnd::Base => {
                     let key = self.keymap().hint(crate::keymap::Action::StackAgainst).label();
                     self.status = format!("the base is only compared against — {key} sets it");
@@ -435,6 +501,10 @@ impl App {
         }
         let rows = self.stack_list_rows();
         let Some(row) = rows.get(self.stack_list_cursor()).cloned() else { return Ok(()) };
+        if matches!(row.end, StackEnd::Unread { .. }) {
+            self.status = unread_status(&row);
+            return Ok(());
+        }
         let head = match (&self.stack_range, self.scope) {
             (Some(r), Scope::Stack) => Some(r.to.end),
             _ => self.pr_checked_out_number().map(StackEnd::Pr),

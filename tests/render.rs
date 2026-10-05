@@ -6150,3 +6150,50 @@ fn all_files_names_the_browsed_tree_and_marks_its_row() {
     assert!(ten.contains("tree"), "{ten}");
     assert!(out.contains("f10.rs") && !out.contains("f12.rs"), "{out}");
 }
+
+#[test]
+fn a_cut_stack_shows_more_below_and_no_base_on_the_pr_tab() {
+    use herdr_reviewr::forge::{NativeStack, PrView};
+    for borders in ["", "pane_outer_borders = false\n"] {
+        let (_r, mut app) = stack_app(borders);
+        let mut cut = stack_pr(11);
+        cut.stack[0].base_ref = "head-9".to_string();
+        cut.stack_shape.more_below = true;
+        cut.stack_shape.more_above = true;
+        app.apply_pr(PrView::Pr(Box::new(cut)));
+        let text = dump(&render_size(&app, 140, 30));
+        let below = text.lines().position(|l| l.contains("… more below — not read"));
+        let above = text.lines().position(|l| l.contains("… more above — not read"));
+        let top = text.lines().position(|l| l.contains("#12 open"));
+        let bottom = text.lines().position(|l| l.contains("#10 open"));
+        assert!(above < top && bottom < below && below.is_some(), "{text}");
+        assert!(!text.contains("└ head-9") && !text.contains("└ main"), "no fake base: {text}");
+
+        // GitHub's own stack names itself, counts its members, and marks a PR merely on top.
+        let mut native = stack_pr(11);
+        native.stack_shape.native =
+            Some(NativeStack { number: 1153, members: vec![10, 11], base_ref: "main".into() });
+        app.apply_pr(PrView::Pr(Box::new(native)));
+        let text = dump(&render_size(&app, 140, 30));
+        assert!(text.contains("stack #1153 · 2"), "{text}");
+        assert!(line_with(&text, "#12 open").contains("not in stack #1153"), "{text}");
+        assert!(!line_with(&text, "#10 open").contains("not in"), "{text}");
+        assert!(text.contains("└ main"), "{text}");
+    }
+}
+
+#[test]
+fn a_cut_stack_shows_more_below_in_the_navigator_stack_list() {
+    use herdr_reviewr::forge::PrView;
+    let (_r, mut app) = stack_render_app(true);
+    let mut home = app.pr_checked_out_snapshot().unwrap().clone();
+    home.stack[0].base_ref = "head-9".to_string();
+    home.stack_shape.more_below = true;
+    app.apply_pr(PrView::Pr(Box::new(home)));
+    let out = render(&app);
+    let (ten_y, _) = stack_line(&out, "#10 open").expect("#10's row");
+    let (more_y, _) = stack_line(&out, "… more below — not read").expect("the cut row");
+    assert_eq!(more_y, ten_y + 1, "{out}");
+    assert!(!out.contains("└ head-9") && !out.contains("└ main"), "no fake base: {out}");
+    assert!(out.contains("Stack · 3"), "the cut row is no PR: {out}");
+}
