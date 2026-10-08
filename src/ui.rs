@@ -1840,7 +1840,7 @@ fn render_file_list(frame: &mut Frame, app: &App, pane: Pane) {
         .skip(app.file_scroll)
         .take(inner.height as usize)
         .map(|(i, row)| {
-            // The selected row fills with the cursor color, dimmed when the list is unfocused.
+            // The selected row takes the list cursor's step, half of it when unfocused.
             let fill = (i == app.file_cursor).then(|| p.list_cursor_bg(app.focus == Focus::Files));
             let nest = "  ".repeat(row.depth);
             match &row.kind {
@@ -4624,10 +4624,11 @@ fn text_style(p: &Palette) -> Style {
     Style::default().fg(p.text)
 }
 
-/// A list row, highlighted with the shared selection fill (`surface2` + bold, full
-/// width) when `selected` — the same treatment the diff cursor uses, so every cursor
-/// in the UI reads the same. The fill is applied per span (with a trailing pad) so it
-/// spans the full width under the `List` widget, matching the diff's `Paragraph` rows.
+/// A list row, highlighted with `fill` (bold, full width) when it is the cursor row. Every
+/// list passes [`Palette::list_cursor_bg`] — herdr's subtle selection step — or a stack
+/// list's viewed-row tint, so every list cursor in the UI reads the same. The fill is
+/// applied per span (with a trailing pad) so it spans the full width under the `List`
+/// widget, matching the diff's `Paragraph` rows.
 fn selectable_row(
     p: &Palette,
     mut spans: Vec<Span<'static>>,

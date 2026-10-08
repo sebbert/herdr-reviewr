@@ -245,10 +245,14 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   the selected thread from inside it brings its header back to the top of the pane.
 
 ### Changed
-- **Subtler selection, matching herdr's own lists.** Every list's cursor row (the file and
-  PR navigators, the stack list, the comments list, the agent, base, and commit pickers, the
-  search results) fills with the theme's `surface0`, the role herdr's `selection_bg` plays,
-  in place of `surface2`; in an unfocused pane it is half that step from the background.
+- **Subtler selection, matching herdr's own lists.** Every list's cursor row (the Changes
+  file list and the All files tree, the PR navigator, the stack list in both views, the
+  comments list, the agent, base, and commit pickers, the search results and the search
+  preview's hit line) fills with the theme's `surface0`, the role herdr's `selection_bg`
+  plays, in place of `surface2`; in an unfocused pane it is half that step from the
+  background. No view highlights a row with `surface1` or `surface2` any more, and a render
+  test fails if one does. Borders, the divider, rules, the scrollbar, and the header and
+  footer bars keep their colours: they are not selection.
   The viewed stack PR's row is a faint violet over the background, and over `surface0`
   under the cursor (no longer over `surface2`). Each violet stays no further from the
   background than the list fill it pairs with, so light themes, where violet darkens fast,

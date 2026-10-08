@@ -2937,6 +2937,51 @@ mod search_screen_render {
     }
 
     #[test]
+    fn search_results_and_the_preview_highlight_with_the_subtle_step() {
+        let repo = Repo::init();
+        let body = (1..=40).map(|i| format!("line_{i}")).collect::<Vec<_>>().join("\n") + "\n";
+        repo.write("a.rs", &body);
+        repo.commit_all("c");
+        let mut app = open_on_all_files(&repo);
+        land(
+            &mut app,
+            SearchResults {
+                files: Vec::new(),
+                code: vec![
+                    CodeHit {
+                        path: "a.rs".into(),
+                        line: 20,
+                        text: "line_20".into(),
+                        spans: vec![],
+                    },
+                    CodeHit {
+                        path: "a.rs".into(),
+                        line: 30,
+                        text: "line_30".into(),
+                        spans: vec![],
+                    },
+                ],
+                file_total: 0,
+                code_more: false,
+            },
+        );
+        key(&mut app, KeyCode::Tab);
+        app.build_search_preview();
+        let buf = render_size(&app, 140, 40);
+        let p = *app.palette();
+        super::assert_subtle_highlights(&p, &buf, "search");
+        // The picked result and the preview's hit line both take the list cursor's fill.
+        let out = dump(&buf);
+        let filled = |needle: &str| {
+            out.lines().enumerate().any(|(y, l)| {
+                l.contains(needle)
+                    && (0..140u16).any(|x| buf[(x, y as u16)].bg == p.list_cursor_bg(true))
+            })
+        };
+        assert!(filled("line_20"), "the picked result and its preview hit line:\n{out}");
+    }
+
+    #[test]
     fn preview_centers_and_bands_the_hit() {
         let repo = Repo::init();
         let lines: Vec<String> = (1..=60).map(|i| format!("line_{i}")).collect();
@@ -6759,4 +6804,96 @@ fn the_pr_navigator_and_the_comments_list_select_with_the_subtle_list_cursor() {
     let buf = render_buffer(&app);
     assert_eq!(bg_at(&buf, "@nav_first comment"), LIST_CURSOR_BG, "{}", dump(&buf));
     assert_ne!(bg_at(&buf, "@nav_second comment"), LIST_CURSOR_BG);
+}
+
+/// Fail when a frame paints a background only the old, brighter cursors used: no list row,
+/// in any view, highlights with `surface1` or `surface2` any more.
+fn assert_subtle_highlights(p: &herdr_reviewr::theme::Palette, buf: &Buffer, view: &str) {
+    for (i, cell) in buf.content.iter().enumerate() {
+        let (x, y) = (i % buf.area.width as usize, i / buf.area.width as usize);
+        assert!(
+            cell.bg != p.surface1 && cell.bg != p.surface2,
+            "{view}: ({x}, {y}) paints {:?}, brighter than the list cursor:\n{}",
+            cell.bg,
+            dump(buf),
+        );
+    }
+}
+
+#[test]
+fn every_list_highlights_its_cursor_with_the_subtle_list_step() {
+    use herdr_reviewr::forge::PrView;
+    let check = |app: &App, view: &str, needle: &str, focused: bool| {
+        let buf = render_buffer(app);
+        let p = *app.palette();
+        assert_subtle_highlights(&p, &buf, view);
+        assert_eq!(bg_at(&buf, needle), p.list_cursor_bg(focused), "{view}:\n{}", dump(&buf));
+    };
+
+    // The Changes file list, focused and not, and the All files tree.
+    let r = Repo::init();
+    r.write("hello.rs", "alpha\nbeta\n");
+    r.commit_all("init");
+    r.write("hello.rs", "alpha\nBETA\n");
+    let mut app = app_on(&r);
+    check(&app, "changes files", "M hello.rs", true);
+    app.focus = Focus::Diff;
+    check(&app, "changes files, unfocused", "M hello.rs", false);
+    enter_tab(&mut app, Tab::AllFiles);
+    app.focus = Focus::Files;
+    check(&app, "all files tree", "M hello.rs", true);
+    enter_tab(&mut app, Tab::Changes);
+
+    // The comments list, the agent picker, and the base picker.
+    let mut app = picker_app();
+    check(&app, "agent picker", "claude", true);
+    app.close_picker();
+    app.open_list();
+    check(&app, "comments list", "hello.rs:2  one", true);
+    app.close_list();
+    app.base_picker = Some(BasePicker {
+        rows: vec![BaseChoice::Branch {
+            name: "picker-base".to_string(),
+            pr_base: false,
+            is_default: true,
+            current: false,
+            tip_secs: 1,
+        }],
+        cursor: 0,
+        query: String::new(),
+        caret: 0,
+        probe: BaseProbe::Idle,
+    });
+    app.mode = Mode::BasePick;
+    check(&app, "base picker", "picker-base", true);
+
+    // The commit picker.
+    let (_r, mut app, _shas) = commits_app();
+    app.open_commit_picker();
+    check(&app, "commit picker", "Stop counting git's own lock files", true);
+
+    // The PR navigator: a comment row under the cursor, and the stack rows around it.
+    let (_r, mut app) = stack_app("");
+    app.apply_pr(PrView::Pr(Box::new(stack_pr(11))));
+    let buf = render_buffer(&app);
+    let p = *app.palette();
+    assert_subtle_highlights(&p, &buf, "pr navigator");
+    assert_eq!(bg_at(&buf, "#11 open"), p.view_bg, "the viewed stack row's faint tint");
+    app.pr_move(-1);
+    let buf = render_buffer(&app);
+    assert_subtle_highlights(&p, &buf, "pr navigator on the stack");
+
+    // The stack list on the file tabs, holding the keyboard.
+    let (_r, mut app) = stack_render_app(true);
+    app.focus_stack_list();
+    let buf = render_buffer(&app);
+    let p = *app.palette();
+    assert_subtle_highlights(&p, &buf, "stack list");
+    let cursor = app.stack_list_rows()[app.stack_list_cursor()].label.clone();
+    let fill = bg_at(&buf, &cursor);
+    assert!(
+        fill == p.list_cursor_bg(true) || fill == p.view_cursor_bg,
+        "stack list cursor on {cursor:?}: {fill:?}\n{}",
+        dump(&buf)
+    );
 }
