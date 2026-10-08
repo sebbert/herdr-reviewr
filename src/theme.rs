@@ -80,20 +80,66 @@ pub struct Palette {
 }
 
 impl Palette {
-    /// The cursor-row fill: the strongest-contrast surface (`surface2`) in the focused pane, a
-    /// step softer (`surface1`) when not, so which pane holds the cursor reads at a glance.
-    /// ("Strongest", not "brightest": light themes step surfaces toward black, not white.)
-    pub fn cursor_bg(&self, focused: bool) -> Color {
-        if focused { self.surface2 } else { self.surface1 }
-    }
-
     /// A list's cursor-row fill — the file and PR navigators, the stack list, the overlay
     /// lists and pickers, the search results. Subtle, the way herdr's own space and agent
-    /// lists select: `surface0` (herdr's `selection_bg`) in the focused pane, halfway from the
-    /// background to it when not, so the focus still reads without the row shouting. The
-    /// diff and read panes keep [`Self::cursor_bg`]: their cursor marks one line among many.
+    /// lists select: `surface0` (herdr's `selection_bg`) in the focused pane, half that step
+    /// from the background when not, so the focus still reads without the row shouting.
     pub fn list_cursor_bg(&self, focused: bool) -> Color {
-        if focused { self.surface0 } else { blend(self.base, self.surface0, 0.5) }
+        self.lift(self.base, if focused { 1.0 } else { 0.5 })
+    }
+
+    /// The diff's line-cursor fill over a row whose own fill is `under` (`None`: a context row
+    /// on the background). On the background it is the list cursor: herdr's selection step,
+    /// full in the focused pane, half when not. On an added or removed line it keeps the
+    /// row's green or red and deepens it toward the line's word-emphasis fill — halfway when
+    /// focused, a quarter when not. Both ends of that blend clear the diff fills' contrast
+    /// floor, so the cursor costs the code on the line no legibility, where a lift toward the
+    /// text colour would push a floor-hugging fill under it.
+    pub fn line_cursor_bg(&self, under: Option<Color>, focused: bool) -> Color {
+        self.line_fill(under, if focused { 1.0 } else { 0.5 })
+    }
+
+    /// The diff's range-selection fill (`select` held open over lines) over a row's own fill:
+    /// half the cursor's step. A range only exists in the focused pane, so it never meets the
+    /// unfocused cursor's equal half step.
+    pub fn line_select_bg(&self, under: Option<Color>) -> Color {
+        self.line_fill(under, 0.5)
+    }
+
+    /// The band behind a folded run of unmodified lines: half the cursor's step over the
+    /// background, so the cursor's own step on top of it still reads.
+    pub fn fold_bg(&self) -> Color {
+        self.lift(self.base, 0.5)
+    }
+
+    /// `under` stepped by `share` of a cursor's step: on a diff row toward its emphasis fill,
+    /// or — where the theme floored both at one colour, leaving no room — by herdr's selection
+    /// step away from the text, which only raises the code's contrast; anywhere else by
+    /// herdr's selection step.
+    fn line_fill(&self, under: Option<Color>, share: f64) -> Color {
+        let emphasis = match under {
+            Some(fill) if fill == self.del_bg => Some(self.emph_del_bg),
+            Some(fill) if fill == self.ins_bg => Some(self.emph_ins_bg),
+            _ => None,
+        };
+        match (under, emphasis) {
+            (Some(fill), Some(emph)) if emph != fill => blend(fill, emph, share / 2.0),
+            (Some(fill), Some(_)) => self.lift(fill, -share),
+            _ => self.lift(under.unwrap_or(self.base), share),
+        }
+    }
+
+    /// `fill` moved by `share` of herdr's selection step (`surface0` from `base`): lighter on
+    /// a dark theme, darker on a light one (a negative share the other way), each channel
+    /// clamped.
+    fn lift(&self, fill: Color, share: f64) -> Color {
+        let ((fr, fg, fb), (br, bg, bb), (sr, sg, sb)) =
+            (channels(fill), channels(self.base), channels(self.surface0));
+        let shift = |f: u8, b: u8, s: u8| {
+            let moved = f64::from(f) + (f64::from(s) - f64::from(b)) * share;
+            moved.round().clamp(0.0, 255.0) as u8
+        };
+        Color::Rgb(shift(fr, br, sr), shift(fg, bg, sg), shift(fb, bb, sb))
     }
 
     /// Lift a painted color onto a selection fill. The dim role (`dim2`) sits one surface
@@ -576,6 +622,17 @@ mod tests {
         // under the cursor.
         assert_eq!(p.view_bg, Color::Rgb(0x2e, 0x24, 0x47));
         assert_eq!(p.view_cursor_bg, Color::Rgb(0x3e, 0x36, 0x5a));
+        // The diff's line cursor takes the same step, from the row's own fill.
+        assert_eq!(p.line_cursor_bg(None, true), Color::Rgb(0x31, 0x32, 0x44));
+        assert_eq!(p.line_cursor_bg(None, false), Color::Rgb(0x28, 0x28, 0x39));
+        // On a diff row, the row's own hue deepened toward its word emphasis.
+        assert_eq!(p.line_cursor_bg(Some(p.ins_bg), true), Color::Rgb(0x28, 0x48, 0x35));
+        assert_eq!(p.line_cursor_bg(Some(p.ins_bg), false), Color::Rgb(0x23, 0x41, 0x2f));
+        assert_eq!(p.line_cursor_bg(Some(p.del_bg), true), Color::Rgb(0x5a, 0x2c, 0x3b));
+        assert_eq!(p.line_cursor_bg(Some(p.del_bg), false), Color::Rgb(0x4f, 0x27, 0x35));
+        assert_eq!(p.line_select_bg(None), Color::Rgb(0x28, 0x28, 0x39));
+        assert_eq!(p.fold_bg(), Color::Rgb(0x28, 0x28, 0x39));
+        assert_eq!(p.line_cursor_bg(Some(p.fold_bg()), true), Color::Rgb(0x3b, 0x3c, 0x4f));
     }
 
     #[test]
@@ -759,6 +816,69 @@ mod tests {
                     "{name}: text on {fill:?}"
                 );
                 assert!(contrast(dim, fill) >= dim_before, "{name}: secondary text on {fill:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn the_line_cursor_steps_each_rows_own_fill_and_every_state_reads_apart() {
+        for &(name, _) in NAMED {
+            let p = resolve(Some(name)).palette;
+            // On the background, the line cursor is the list cursor: herdr's selection step.
+            assert_eq!(p.line_cursor_bg(None, true), p.list_cursor_bg(true), "{name}");
+            assert_eq!(p.line_cursor_bg(None, false), p.list_cursor_bg(false), "{name}");
+            let rows = [None, Some(p.del_bg), Some(p.ins_bg)];
+            let mut seen = Vec::new();
+            for under in rows {
+                let plain = under.unwrap_or(p.base);
+                let (focused, soft, select) = (
+                    p.line_cursor_bg(under, true),
+                    p.line_cursor_bg(under, false),
+                    p.line_select_bg(under),
+                );
+                // The focused cursor, the softer states, and the bare row all differ, and
+                // the step stays subtle: closer to the row's own fill than `surface1` is to
+                // the background.
+                for (a, b) in [(focused, soft), (focused, plain), (soft, plain), (select, plain)] {
+                    assert_ne!(a, b, "{name}: two line states share a fill over {plain:?}");
+                }
+                assert!(contrast(focused, plain) < contrast(p.surface1, p.base), "{name}");
+                assert!(contrast(soft, plain) < contrast(focused, plain), "{name}");
+                // A diff row keeps its hue under the cursor: never the plain cursor's fill,
+                // never its word emphasis.
+                if under.is_some() {
+                    assert_ne!(focused, p.line_cursor_bg(None, true), "{name}");
+                    assert!(![p.emph_del_bg, p.emph_ins_bg].contains(&focused), "{name}");
+                }
+                seen.extend([(plain, focused), (plain, soft)]);
+                // Text on a context row reads at least as well as on the old `surface2`
+                // cursor, above the row floor; on a diff row it keeps the diff fills' floor
+                // (or the row's own contrast, where its fill already sits below it).
+                let floor = match under {
+                    None => contrast(p.text, p.surface2).max(super::MIN_ROW_CONTRAST),
+                    Some(_) => MIN_FILL_CONTRAST.min(contrast(p.text, plain)),
+                };
+                for fill in [focused, soft, select] {
+                    assert!(contrast(p.text, fill) >= floor, "{name}: text on {fill:?}");
+                }
+            }
+            // Rows a theme already tells apart by fill stay apart under the cursor. (A light
+            // theme can floor a diff fill to the bare background; those rows share one.)
+            for (i, (row_a, a)) in seen.iter().enumerate() {
+                for (row_b, b) in &seen[i + 1..] {
+                    if row_a != row_b {
+                        assert_ne!(a, b, "{name}: two rows' cursors share a fill");
+                    }
+                }
+            }
+            // The fold band shows, and the cursor on it still reads, focused and not.
+            let band = p.fold_bg();
+            let (on, soft) =
+                (p.line_cursor_bg(Some(band), true), p.line_cursor_bg(Some(band), false));
+            assert!(band != p.base && on != band && soft != band && on != soft, "{name}");
+            assert_ne!(on, p.line_cursor_bg(None, true), "{name}: a fold's cursor reads apart");
+            for fill in [band, on, soft] {
+                assert!(contrast(p.text, fill) >= contrast(p.text, p.surface2), "{name}: {fill:?}");
             }
         }
     }

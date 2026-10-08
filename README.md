@@ -446,8 +446,9 @@ checks, description, and conversation. Nothing is checked out, and nothing outsi
 changes. The file tabs, the branch scope's base, and your comments stay with the checked-out
 branch. The header says `viewing #12 · not checked out` while you look. The row of the PR on
 screen, checked out or not, carries a faint violet tint, a step stronger when the cursor
-sits on it. List cursors are as subtle as herdr's own space and agent lists: the theme's
-`surface0` in the focused pane, half that step when the pane is not focused. The list stays the checked-out PR's stack whichever PR you view. `o` opens the PR
+sits on it. List cursors, and the diff's line cursor, are as subtle as herdr's own space and agent
+lists: the theme's `surface0` in the focused pane, half that step when the pane is not
+focused. On an added or removed line the cursor keeps the line's green or red and deepens it. The list stays the checked-out PR's stack whichever PR you view. `o` opens the PR
 you are viewing. `0` (`checked-out-pr`), or the checked-out PR's own row, takes you back to
 where you were on it.
 

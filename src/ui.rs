@@ -2360,7 +2360,8 @@ fn render_row(row: &Row, layout: RowLayout<'_>, state: RowState) -> Vec<Line<'st
         if let Some(pad) = width.checked_sub(line.width()).filter(|p| *p > 0) {
             line.push_span(Span::raw(" ".repeat(pad)));
         }
-        let bg = if cursor { pal.cursor_bg(focused) } else { pal.surface0 };
+        let band = pal.fold_bg();
+        let bg = if cursor { pal.line_cursor_bg(Some(band), focused) } else { band };
         return vec![line.style(Style::default().bg(bg).add_modifier(Modifier::BOLD))];
     }
     // `0` is an unnumbered PR snippet row; file diffs are 1-based.
@@ -2377,20 +2378,23 @@ fn render_row(row: &Row, layout: RowLayout<'_>, state: RowState) -> Vec<Line<'st
         '+' => ("▌", pal.green),
         _ => (" ", pal.dim2),
     };
+    // The cursor and a range selection step the row's own fill, so an added or removed line
+    // keeps its hue under them.
+    let diff_bg = match row.marker() {
+        '-' => Some(pal.del_bg),
+        '+' => Some(pal.ins_bg),
+        _ => None,
+    };
     let row_bg = if cursor {
-        Some(pal.cursor_bg(focused))
+        Some(pal.line_cursor_bg(diff_bg, focused))
     } else if selected {
-        Some(pal.surface1)
+        Some(pal.line_select_bg(diff_bg))
     } else {
-        match row.marker() {
-            '-' => Some(pal.del_bg),
-            '+' => Some(pal.ins_bg),
-            _ => None,
-        }
+        diff_bg
     };
 
-    // Word emphasis brightens the changed words, unless the row's fill is a cursor or
-    // selection bg, which wins for readability.
+    // Word emphasis brightens the changed words, unless the row is under the cursor or a
+    // range selection: their step already deepens the whole row toward the emphasis fill.
     let emph_on = !cursor && !selected;
     let emph_bg = match row.marker() {
         '-' => pal.emph_del_bg,
@@ -4438,7 +4442,7 @@ fn search_preview_line(
             if pad > 0 {
                 line.push_span(Span::raw(" ".repeat(pad)));
             }
-            line.style(Style::default().bg(p.cursor_bg(true)))
+            line.style(Style::default().bg(p.line_cursor_bg(None, true)))
         }
     }
 }

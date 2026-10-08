@@ -245,18 +245,29 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   the selected thread from inside it brings its header back to the top of the pane.
 
 ### Changed
-- **Subtler list selection, matching herdr's own lists.** Every list's cursor row (the file
-  and PR navigators, the stack list, the comments list, the agent, base, and commit pickers,
-  the search results) fills with the theme's `surface0`, the role herdr's `selection_bg`
-  plays, in place of `surface2`; in an unfocused pane it is half that step from the
-  background. The viewed stack PR's row is a faint violet over the background, and over
-  `surface0` under the cursor (no longer over `surface2`). Each violet stays no further from
-  the background than the list fill it pairs with, so light themes, where violet darkens
-  fast, keep it as faint. Catppuccin: the focused list cursor `#585b70` → `#313244`, the
-  unfocused one `#45475a` → `#282839`, the viewed row `#3b2a5b` → `#2e2447`, and under the
-  cursor `#6e599a` → `#3e365a`. Text on every new fill reads at least as well as on the old
-  cursor in every theme. The diff and read panes' line cursor, the diff fills, the search
-  match, and the text-selection highlight are unchanged.
+- **Subtler selection, matching herdr's own lists.** Every list's cursor row (the file and
+  PR navigators, the stack list, the comments list, the agent, base, and commit pickers, the
+  search results) fills with the theme's `surface0`, the role herdr's `selection_bg` plays,
+  in place of `surface2`; in an unfocused pane it is half that step from the background.
+  The viewed stack PR's row is a faint violet over the background, and over `surface0`
+  under the cursor (no longer over `surface2`). Each violet stays no further from the
+  background than the list fill it pairs with, so light themes, where violet darkens fast,
+  keep it as faint.
+  The diff's line cursor (and the search preview's hit line) takes the same step. On an
+  added or removed line it keeps the row's green or red and deepens it toward the line's
+  word-emphasis fill, halfway when focused, a quarter when not; both ends clear the diff
+  fills' 4.5:1 floor, so the code stays as legible. Where a theme floors both fills to one
+  colour, the cursor steps that fill away from the text instead. A range selection takes
+  half the cursor's step over each row's own fill (it used to replace the diff fill with
+  `surface1`), and a fold's band is half the step, so the cursor still reads on it.
+  Catppuccin before → after: list cursor `#585b70` → `#313244`, unfocused `#45475a` →
+  `#282839`; viewed stack row `#3b2a5b` → `#2e2447`, under the cursor `#6e599a` →
+  `#3e365a`; diff cursor on a context line `#585b70` → `#313244`, unfocused `#45475a` →
+  `#282839`; on a removed line `#585b70` → `#5a2c3b` (unfocused `#4f2735`), on an added line
+  `#585b70` → `#284835` (unfocused `#23412f`); range selection `#45475a` → `#282839` on
+  context lines (`#4f2735`/`#23412f` on removed/added lines); fold band `#313244` →
+  `#282839`, under the cursor `#585b70` → `#3b3c4f`. The diff fills, the word emphasis, the
+  search match, and the text-selection highlight are unchanged.
 - **The checked-out PR's stack row wears a filled `●` and a `checked out` tag**, in place of the
   small `▸`. The tag gives way in a narrow pane; the mark stays.
 - **A split gives reviewr 40% by default**, not herdr's even halves: `split_ratio` defaults to

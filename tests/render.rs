@@ -51,8 +51,11 @@ fn render_size(app: &App, width: u16, height: u16) -> Buffer {
     terminal.backend().buffer().clone()
 }
 
-/// Catppuccin surface2 — the shared selection/cursor fill.
-const SELECTION_BG: ratatui::style::Color = ratatui::style::Color::Rgb(0x58, 0x5b, 0x70);
+/// Catppuccin surface2 — the old cursor fill, which no cursor paints any more.
+const SURFACE2: ratatui::style::Color = ratatui::style::Color::Rgb(0x58, 0x5b, 0x70);
+/// Catppuccin's removed-line fill deepened halfway to its word emphasis — the focused diff
+/// cursor on a `-` row.
+const DEL_CURSOR_BG: ratatui::style::Color = ratatui::style::Color::Rgb(0x5a, 0x2c, 0x3b);
 /// Catppuccin orange — the comment-editor caret block.
 const PEACH: ratatui::style::Color = ratatui::style::Color::Rgb(0xfa, 0xb3, 0x87);
 
@@ -537,17 +540,19 @@ fn a_changed_word_gets_the_emphasis_background() {
     assert!(found, "a changed word carries the emphasis background");
 }
 
-/// Catppuccin surface1 — the cursor fill of the pane that does not hold focus.
-const UNFOCUSED_CURSOR_BG: ratatui::style::Color = ratatui::style::Color::Rgb(0x45, 0x47, 0x5a);
+/// The unfocused diff cursor on a `-` row: a quarter of the way to the word emphasis.
+const DEL_CURSOR_SOFT_BG: ratatui::style::Color = ratatui::style::Color::Rgb(0x4f, 0x27, 0x35);
 
 #[test]
 fn the_diff_cursor_row_is_marked_from_either_pane() {
-    // The diff pane's cursor row fills like the file list's: brightest when the pane holds
-    // focus, a step softer when it does not. A hunk step driven from the file list moves this
-    // cursor, so it has to be visible from there.
+    // The diff pane's cursor row is as subtle as the lists': a context row takes herdr's
+    // selection step (`surface0`), a changed row keeps its red or green and deepens it toward
+    // its word emphasis. A step softer while the file list holds focus — a hunk step driven
+    // from the file list moves this cursor, so it has to show from there.
     let mut app = edited_app();
     app.focus = Focus::Diff;
     app.next_hunk();
+    assert_eq!(app.visible[app.diff_cursor].marker(), '-', "the hunk opens on the removal");
     let cursor_y = |app: &App| 2 + app.diff_cursor as u16; // border at y=1, first row at y=2
     let fill = |app: &App, bg| {
         let buf = render_buffer(app);
@@ -555,13 +560,56 @@ fn the_diff_cursor_row_is_marked_from_either_pane() {
         (1..40u16).filter(|&x| buf.cell((x, y)).is_some_and(|c| c.bg == bg)).count()
     };
 
-    assert!(fill(&app, SELECTION_BG) > 10, "the focused diff fills its cursor row with surface2");
-
+    assert!(fill(&app, DEL_CURSOR_BG) > 10, "a removed line keeps its red under the cursor");
+    assert_eq!(fill(&app, SURFACE2), 0, "never the old surface2");
     app.focus = Focus::Files;
-    assert!(
-        fill(&app, UNFOCUSED_CURSOR_BG) > 10,
-        "and still marks it, a step softer, while the file list holds focus"
-    );
+    assert!(fill(&app, DEL_CURSOR_SOFT_BG) > 10, "a step softer from the file list");
+
+    // A context row: the list cursor's own fills.
+    app.focus = Focus::Diff;
+    app.diff_cursor = 0;
+    assert_eq!(app.visible[0].marker(), ' ');
+    assert!(fill(&app, LIST_CURSOR_BG) > 10, "a context row takes surface0");
+    app.focus = Focus::Files;
+    assert!(fill(&app, LIST_CURSOR_SOFT_BG) > 10, "and the half step unfocused");
+}
+
+#[test]
+fn a_range_selection_and_a_fold_take_half_the_cursors_step() {
+    let r = Repo::init();
+    let lines = (0..30).map(|n| format!("line {n}")).collect::<Vec<_>>().join("\n") + "\n";
+    r.write("long.rs", &lines);
+    r.commit_all("init");
+    r.write("long.rs", &lines.replace("line 15\n", "LINE 15\n"));
+    let mut app = app_on(&r);
+    app.focus = Focus::Diff;
+    let p = *app.palette();
+    let row_of = |app: &App, pred: &dyn Fn(char) -> bool| {
+        app.visible.iter().position(|row| pred(row.marker())).unwrap()
+    };
+    let bg_of_row = |app: &App, row: usize| {
+        let buf = render_buffer(app);
+        // The read pane's rows follow the visible rows one display line each here.
+        buf[(20, 2 + row as u16)].bg
+    };
+    // The fold above the hunk: half the step as its band, the cursor's step on top of it.
+    let fold = app.visible.iter().position(|r| matches!(r, herdr_reviewr::diff::Row::Fold { .. }));
+    let fold = fold.expect("a long unchanged run folds");
+    app.diff_cursor = row_of(&app, &|m| m == '-');
+    assert_eq!(bg_of_row(&app, fold), p.fold_bg());
+    app.diff_cursor = fold;
+    assert_eq!(bg_of_row(&app, fold), p.line_cursor_bg(Some(p.fold_bg()), true));
+    // A range over the removal, the addition, and a context line: each row's own fill
+    // steps half the cursor's way; the cursor row its full way.
+    let del = row_of(&app, &|m| m == '-');
+    app.diff_cursor = del;
+    app.select_anchor = Some(del);
+    app.diff_cursor = del + 2;
+    let rows = [(del, Some(p.del_bg)), (del + 1, Some(p.ins_bg))];
+    for (row, under) in rows {
+        assert_eq!(bg_of_row(&app, row), p.line_select_bg(under), "row {row}");
+    }
+    assert_eq!(bg_of_row(&app, del + 2), p.line_cursor_bg(None, true));
 }
 
 /// Catppuccin surface0 — the focused list cursor, herdr's own `selection_bg`.
@@ -579,7 +627,7 @@ fn the_selected_file_row_fills_with_the_subtle_list_cursor() {
         (files_x0..139).filter(|&x| buf.cell((x, 2)).is_some_and(|c| c.bg == bg)).count()
     };
     assert!(filled(&app, LIST_CURSOR_BG) > 10, "the focused list fills its row with surface0");
-    assert_eq!(filled(&app, SELECTION_BG), 0, "never the diff cursor's surface2");
+    assert_eq!(filled(&app, SURFACE2), 0, "never the old surface2");
     // Focus on the diff: the list keeps its row, a half step softer.
     app.focus = Focus::Diff;
     assert!(filled(&app, LIST_CURSOR_SOFT_BG) > 10, "the unfocused list softens its cursor");
@@ -595,7 +643,7 @@ fn a_hidden_navigator_gives_the_read_pane_the_whole_body() {
     let fill = |app: &App| {
         let buf = render_buffer(app);
         (1..139u16)
-            .filter(|&x| buf.cell((x, cursor_y)).is_some_and(|c| c.bg == SELECTION_BG))
+            .filter(|&x| buf.cell((x, cursor_y)).is_some_and(|c| c.bg == DEL_CURSOR_BG))
             .count()
     };
     let visible_fill = fill(&app);
@@ -606,7 +654,7 @@ fn a_hidden_navigator_gives_the_read_pane_the_whole_body() {
     let hidden_fill = fill(&app);
     assert!(
         hidden_fill > visible_fill && hidden_fill > 120,
-        "the cursor row fills the whole body with surface2: {hidden_fill} vs {visible_fill}"
+        "the cursor row fills the whole body: {hidden_fill} vs {visible_fill}"
     );
     let out = render(&app);
     assert!(out.contains("z show"), "the collapsed footer names the way back");
