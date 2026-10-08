@@ -338,7 +338,8 @@ draw four round pictures.
 ### Inline images
 
 Opt in to paint the images in a PR's description and comments, `![alt](url)` and HTML
-`<img>`, as pictures in place of their `⧉ alt` links:
+`<img>` (a `<picture>` shows the source for your theme's light or dark scheme), as pictures
+in place of their `⧉ alt` links:
 
 ```toml
 inline_images = true   # default: false (alt links)
@@ -351,13 +352,17 @@ A picture is sized from its pixels, or from `<img width height>`. It never grows
 size, the box's width, or 20 rows. A badge (shields.io and the like) stays one row tall and
 sits in its line of text. A taller image gets rows of its own.
 
-Images load lazily, visible ones first, and nothing waits on them. Until one arrives, and for
+Images load lazily, visible ones first, and nothing waits on them. One inside a closed
+`<details>` loads once you open it. Until one arrives, and for
 good if it fails, it stays its dim `⧉ alt` link. When it lands it swaps in. If it lands above
 where you're reading, the pane scrolls with it, so your text stays put.
 
 On a GitHub PR, an image on GitHub's own host (`github.com` or your GHES host), such as a
-pasted `user-attachments` screenshot, downloads with your `gh auth token`. reviewr reads the
-token once, on a background thread. It goes to that host over `https` and nowhere else.
+pasted `user-attachments` screenshot, downloads with your `gh auth token`. A file in the
+repository linked as `github.com/<owner>/<repo>/raw/…` or `…/blob/…?raw=true` downloads from
+`raw.githubusercontent.com` (on GHES, the host's own `/raw/` path), so a private repo's
+diagrams load too. reviewr reads the token once, on a background thread. It goes to that host
+(and, for github.com, `raw.githubusercontent.com`) over `https` and nowhere else.
 `curl` reads it from stdin, so it never shows in `ps`. GitLab's `/uploads/…` paths resolve
 under the project and download without a token. GitLab and Azure DevOps images that need a
 sign-in stay alt links. Downloads are capped at 10 MB and 20 seconds, and redirect only to

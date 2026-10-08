@@ -2430,14 +2430,18 @@ impl App {
         };
         // Inline images belong to the PR conversation only; the preview keeps alt links.
         let uploads = self.image_uploads_base().map(str::to_string);
-        let resolve = |dest: &str| crate::images::resolve(dest, uploads.as_deref());
+        let github = (self.pr_forge == crate::git::Forge::GitHub)
+            .then(|| self.pr_forge_host().map(str::to_string))
+            .flatten();
+        let base = crate::images::Base { uploads: uploads.as_deref(), github: github.as_deref() };
+        let resolve = |dest: &str| crate::images::resolve(dest, base);
         let paint = self.inline_images_paint();
         let size = |url: &str| if paint { self.images.size(url) } else { None };
         let source = (self.tab == Tab::Pr && self.inline_images_wanted()).then(|| {
             crate::markdown::ImageSource {
                 cell: self.cell_px.unwrap_or(crate::graphics::FALLBACK_CELL),
                 max_rows: crate::images::MAX_ROWS,
-                salt: uploads.clone().unwrap_or_default(),
+                salt: format!("{}|{}", base.uploads.unwrap_or(""), base.github.unwrap_or("")),
                 resolve: &resolve,
                 size: &size,
             }
@@ -2489,19 +2493,38 @@ impl App {
     pub fn expand_pr_details(&mut self) {
         let width = self.pane_width.get().max(1);
         let bodies = self.pr_markdown_bodies();
-        let mut summaries = HashSet::new();
+        // A disclosure is open when its expand flag differs from its authored default.
+        let mut flip = Vec::new();
         for text in &bodies {
             for m in &self.markdown_render(text, width).meta {
                 if let Some(d) = &m.details {
-                    summaries.insert(d.summary.to_string());
+                    flip.push((d.summary.to_string(), d.open_default));
                 }
             }
         }
-        self.pr_expanded_details.extend(summaries);
+        for (summary, open_default) in flip {
+            if open_default {
+                self.pr_expanded_details.remove(&summary);
+            } else {
+                self.pr_expanded_details.insert(summary);
+            }
+        }
     }
 
+    /// Fold every disclosure, `<details open>` ones too: back to the authored defaults, then
+    /// each open-by-default one flipped shut.
     pub fn collapse_pr_details(&mut self) {
         self.pr_expanded_details.clear();
+        let width = self.pane_width.get().max(1);
+        let mut shut = Vec::new();
+        for text in &self.pr_markdown_bodies() {
+            for m in &self.markdown_render(text, width).meta {
+                if let Some(d) = m.details.as_ref().filter(|d| d.open_default) {
+                    shut.push(d.summary.to_string());
+                }
+            }
+        }
+        self.pr_expanded_details.extend(shut);
     }
 
     /// Every markdown body the read pane's conversation paints: the description, then each

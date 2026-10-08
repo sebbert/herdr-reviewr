@@ -638,12 +638,16 @@ pub fn gh_token(host: &str) -> Option<String> {
     (out.status.success() && plausible_token(&token)).then_some(token)
 }
 
-/// The host a token may go to for `url`: the forge's own host, exactly, over `https`, and
-/// nothing with credentials in it. `None` sends no token.
+/// The forge host whose token may go with `url`, `None` for no token. Only over `https`,
+/// with no credentials in the URL, and only to the forge's own host, exactly — or, for
+/// `github.com`, to `raw.githubusercontent.com`, where a private repository's files are
+/// served. The answer names the forge (the host `gh auth token` reads), not the URL's host.
 #[must_use]
 pub fn token_host(url: &str, forge_host: &str) -> Option<String> {
-    let host = https_authority(url)?;
-    (!forge_host.is_empty() && host.eq_ignore_ascii_case(forge_host)).then(|| host.to_lowercase())
+    let host = https_authority(url)?.to_ascii_lowercase();
+    let forge = forge_host.to_ascii_lowercase();
+    let raw = forge == "github.com" && host == "raw.githubusercontent.com";
+    (!forge.is_empty() && (host == forge || raw)).then_some(forge)
 }
 
 /// The authority (`host[:port]`) of an `https` URL, `None` for anything else or for one
@@ -709,7 +713,14 @@ mod tests {
             "https://user:pw@github.com/x.png",
             "https://x@github.com/x.png",
             "https://avatars.githubusercontent.com/u/1",
-            "https://raw.githubusercontent.com/o/r/main/a.png",
+            "http://raw.githubusercontent.com/o/r/main/a.png",
+            "https://raw.githubusercontent.com.evil.example/o/r/main/a.png",
+            "https://evil-raw.githubusercontent.com/o/r/main/a.png",
+            "https://raw.githubusercontent.co/o/r/main/a.png",
+            "https://xraw.githubusercontent.com/o/r/main/a.png",
+            "https://raw.githubusercontent.com:8443/o/r/main/a.png",
+            "https://u@raw.githubusercontent.com/o/r/main/a.png",
+            "https://githubusercontent.com/o/r/main/a.png",
             "https://img.shields.io/badge/a-b-c",
             "github.com/x.png",
             "ftp://github.com/x.png",
@@ -717,6 +728,18 @@ mod tests {
             assert_eq!(token_host(url, forge), None, "{url}");
         }
         assert_eq!(token_host(ok, ""), None, "no forge host: no token");
+        // A private repository's raw files: github.com's token, read for github.com.
+        for raw in [
+            "https://raw.githubusercontent.com/o/r/main/a.png",
+            "https://RAW.githubusercontent.com/o/r/main/a.png",
+        ] {
+            assert_eq!(token_host(raw, forge).as_deref(), Some("github.com"), "{raw}");
+        }
+        assert_eq!(
+            token_host("https://raw.githubusercontent.com/o/r/main/a.png", "ghe.corp"),
+            None,
+            "a GHES token never leaves its own host"
+        );
         assert_eq!(
             token_host("https://ghe.corp:8443/a.png", "ghe.corp:8443").as_deref(),
             Some("ghe.corp:8443")

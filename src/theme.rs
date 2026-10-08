@@ -466,6 +466,15 @@ fn contrast(fg: Color, bg: Color) -> f64 {
     (hi + 0.05) / (lo + 0.05)
 }
 
+impl Palette {
+    /// Whether the theme is dark: its background anchor darker than its text. Picks a
+    /// `<picture>`'s `prefers-color-scheme` source.
+    #[must_use]
+    pub fn is_dark(&self) -> bool {
+        luminance(self.base) < luminance(self.text)
+    }
+}
+
 /// WCAG relative luminance, with sRGB linearization.
 fn luminance(color: Color) -> f64 {
     let (r, g, b) = channels(color);
@@ -665,6 +674,36 @@ mod tests {
             // Light theme: dark text on a lighter surface. Dark theme: the reverse.
             let text_darker = super::luminance(p.text) < super::luminance(p.surface0);
             assert_eq!(text_darker, light, "{name}: text/surface contrast points the wrong way");
+        }
+    }
+
+    #[test]
+    fn darkness_follows_each_themes_cast() {
+        for name in [
+            "catppuccin",
+            "dracula",
+            "nord",
+            "gruvbox",
+            "one-dark",
+            "solarized",
+            "catppuccin-frappe",
+            "catppuccin-macchiato",
+            "monokai",
+            "tokyo-night",
+            "rose-pine",
+        ] {
+            assert!(super::resolve(Some(name)).palette.is_dark(), "{name}");
+        }
+        for name in [
+            "catppuccin-latte",
+            "gruvbox-light",
+            "one-light",
+            "solarized-light",
+            "github-light",
+            "tokyo-night-day",
+            "rose-pine-dawn",
+        ] {
+            assert!(!super::resolve(Some(name)).palette.is_dark(), "{name}");
         }
     }
 }

@@ -6,8 +6,9 @@
 //! the verdict and the cell size, then paints each image the way the PR read pane does: packed
 //! as a PNG, sized into cells (at most 20 rows, the terminal's width), and drawn through Unicode
 //! placeholder cells between `│` markers. Without URLs it paints a built-in shields-style SVG
-//! badge (text included, through the system's fonts) and a test gradient. A URL on github.com
-//! goes with the `gh` token, as reviewr sends it for a GitHub PR. A working terminal shows each
+//! badge (text included, through the system's fonts) and a test gradient. A URL resolves as
+//! on a github.com PR — a `github.com/<o>/<r>/raw/…` page fetches its raw file — and goes with
+//! the `gh` token where reviewr would send it. A working terminal shows each
 //! picture in its box; one without the protocol shows blank or odd cells, and reviewr would
 //! paint the `⧉ alt` link there instead.
 
@@ -68,9 +69,16 @@ fn main() {
         sources.push(("built-in 320×120 gradient".into(), Some(png)));
     }
     let limits = graphics::Limits { max_bytes: 10_000_000, max_time: 20, https_redirects: true };
+    // Resolved as on a github.com PR: a `/raw/` or `?raw=true` file page goes to its raw file.
+    let base = images::Base { uploads: None, github: Some("github.com") };
     for url in urls {
-        let token = graphics::token_host(&url, "github.com").and_then(|h| graphics::gh_token(&h));
-        let bytes = graphics::curl(&url, limits, token.as_deref());
+        let fetch = images::resolve(&url, base).unwrap_or_else(|| url.clone());
+        let token = graphics::token_host(&fetch, "github.com").and_then(|h| graphics::gh_token(&h));
+        println!(
+            "{url}\n  fetching {fetch}{}",
+            if token.is_some() { " with the gh token" } else { "" }
+        );
+        let bytes = graphics::curl(&fetch, limits, token.as_deref());
         sources.push((url, bytes));
     }
 

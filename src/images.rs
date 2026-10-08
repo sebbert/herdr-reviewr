@@ -98,28 +98,70 @@ pub fn fit(
     Cells { cols: cols as u16, rows: rows as u16 }
 }
 
+/// What resolving an image destination needs from the PR: a GitLab project's web URL, under
+/// which its `/uploads/…` paths live, and a GitHub PR's host, whose file URLs are rewritten.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Base<'a> {
+    pub uploads: Option<&'a str>,
+    pub github: Option<&'a str>,
+}
+
 /// A markdown image destination as a URL to fetch: absolute `http(s)`, a protocol-relative
-/// `//host/…` as `https`, or a GitLab `/uploads/…` path under the project's web URL
-/// (`uploads`). Anything else — a repository-relative path, a `data:` URL — is not fetched.
+/// `//host/…` as `https`, or a GitLab `/uploads/…` path under the project's web URL. A GitHub
+/// file page goes to its raw file ([`github_raw`]). Anything else — a repository-relative
+/// path, a `data:` URL — is not fetched.
 #[must_use]
-pub fn resolve(dest: &str, uploads: Option<&str>) -> Option<String> {
+pub fn resolve(dest: &str, base: Base<'_>) -> Option<String> {
     let dest = dest.trim();
     if dest.is_empty() || dest.chars().any(|c| c.is_whitespace() || c.is_control()) {
         return None;
     }
     let lower = dest.to_ascii_lowercase();
-    if lower.starts_with("https://") || lower.starts_with("http://") {
-        return Some(dest.to_string());
-    }
-    if let Some(rest) = dest.strip_prefix("//") {
-        return (!rest.is_empty()).then(|| format!("https://{rest}"));
-    }
-    match uploads {
-        Some(base) if dest.starts_with("/uploads/") => {
-            Some(format!("{}{dest}", base.trim_end_matches('/')))
+    let url = if lower.starts_with("https://") || lower.starts_with("http://") {
+        dest.to_string()
+    } else if let Some(rest) = dest.strip_prefix("//") {
+        if rest.is_empty() {
+            return None;
         }
-        _ => None,
+        format!("https://{rest}")
+    } else {
+        match base.uploads {
+            Some(project) if dest.starts_with("/uploads/") => {
+                format!("{}{dest}", project.trim_end_matches('/'))
+            }
+            _ => return None,
+        }
+    };
+    Some(base.github.and_then(|host| github_raw(&url, host)).unwrap_or(url))
+}
+
+/// A GitHub file URL on `host` as the URL that serves its bytes to a token:
+/// `/<owner>/<repo>/raw/<ref>/<path>`, or `/blob/<ref>/<path>?raw=true`, becomes
+/// `raw.githubusercontent.com/<owner>/<repo>/<ref>/<path>` on github.com and
+/// `<host>/raw/<owner>/<repo>/<ref>/<path>` on GitHub Enterprise. The github.com forms answer
+/// only a browser session, never a token. The ref and path stay one string, so GitHub
+/// settles a ref with a slash in it. `None` for anything else.
+#[must_use]
+pub fn github_raw(url: &str, host: &str) -> Option<String> {
+    let authority = graphics::https_authority(url)?;
+    if host.is_empty() || !authority.eq_ignore_ascii_case(host) {
+        return None;
     }
+    let rest = &url["https://".len() + authority.len()..];
+    let rest = rest.split_once('#').map_or(rest, |(path, _)| path);
+    let (path, query) = rest.split_once('?').map_or((rest, None), |(p, q)| (p, Some(q)));
+    let mut parts = path.trim_start_matches('/').splitn(4, '/');
+    let (owner, repo, kind, file) = (parts.next()?, parts.next()?, parts.next()?, parts.next()?);
+    let raw_query = query.is_some_and(|q| q.split('&').any(|kv| kv == "raw=true" || kv == "raw=1"));
+    let file_page = kind == "raw" || (kind == "blob" && raw_query);
+    if owner.is_empty() || repo.is_empty() || file.is_empty() || !file_page {
+        return None;
+    }
+    Some(if host.eq_ignore_ascii_case("github.com") {
+        format!("https://raw.githubusercontent.com/{owner}/{repo}/{file}")
+    } else {
+        format!("https://{authority}/raw/{owner}/{repo}/{file}")
+    })
 }
 
 /// A GitLab merge request's project web URL — where its `/uploads/` paths live.
@@ -493,18 +535,60 @@ mod tests {
     }
 
     #[test]
-    fn destinations_resolve_to_fetchable_urls_only() {
-        let up = Some("https://gitlab.com/g/p");
+    fn github_file_pages_resolve_to_the_raw_file_a_token_can_fetch() {
+        let gh = Base { uploads: None, github: Some("github.com") };
+        let diagram_bot = "https://github.com/o/r/raw/diagrams/7/abc/c-light-1f.svg";
         assert_eq!(
-            resolve("https://a.example/x.png", None).as_deref(),
+            resolve(diagram_bot, gh).as_deref(),
+            Some("https://raw.githubusercontent.com/o/r/diagrams/7/abc/c-light-1f.svg")
+        );
+        for (url, want) in [
+            (
+                "https://github.com/o/r/blob/main/docs/a.png?raw=true",
+                Some("https://raw.githubusercontent.com/o/r/main/docs/a.png"),
+            ),
+            (
+                "https://github.com/o/r/blob/feature/x/a.png?foo=1&raw=1#frag",
+                Some("https://raw.githubusercontent.com/o/r/feature/x/a.png"),
+            ),
+            (
+                "https://GitHub.com/o/r/raw/main/a.png",
+                Some("https://raw.githubusercontent.com/o/r/main/a.png"),
+            ),
+            ("https://github.com/o/r/blob/main/a.png", None),
+            ("https://github.com/o/r/raw/", None),
+            ("https://github.com/user-attachments/assets/abc", None),
+            ("https://github.com/o/r/pull/3", None),
+            ("http://github.com/o/r/raw/main/a.png", None),
+            ("https://github.com.evil.example/o/r/raw/main/a.png", None),
+            ("https://evil.example/o/r/raw/main/a.png", None),
+        ] {
+            assert_eq!(github_raw(url, "github.com").as_deref(), want, "{url}");
+        }
+        // GitHub Enterprise serves raw files on its own host.
+        assert_eq!(
+            github_raw("https://ghe.corp/o/r/raw/main/a.svg", "ghe.corp").as_deref(),
+            Some("https://ghe.corp/raw/o/r/main/a.svg")
+        );
+        assert_eq!(github_raw("https://github.com/o/r/raw/main/a.svg", "ghe.corp"), None);
+        // Not a GitHub PR: no rewrite.
+        assert_eq!(resolve(diagram_bot, Base::default()).as_deref(), Some(diagram_bot));
+    }
+
+    #[test]
+    fn destinations_resolve_to_fetchable_urls_only() {
+        let up = Base { uploads: Some("https://gitlab.com/g/p"), github: None };
+        let none = Base::default();
+        assert_eq!(
+            resolve("https://a.example/x.png", none).as_deref(),
             Some("https://a.example/x.png")
         );
         assert_eq!(
-            resolve(" http://a.example/x.png ", None).as_deref(),
+            resolve(" http://a.example/x.png ", none).as_deref(),
             Some("http://a.example/x.png")
         );
         assert_eq!(
-            resolve("//cdn.example/x.svg", None).as_deref(),
+            resolve("//cdn.example/x.svg", none).as_deref(),
             Some("https://cdn.example/x.svg")
         );
         assert_eq!(
@@ -520,7 +604,7 @@ mod tests {
             "javascript:x",
             "https://a.example/a b.png",
         ] {
-            assert_eq!(resolve(dest, None), None, "{dest}");
+            assert_eq!(resolve(dest, none), None, "{dest}");
         }
         assert_eq!(resolve("docs/a.png", up), None);
         assert_eq!(

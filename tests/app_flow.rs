@@ -9110,3 +9110,46 @@ fn a_drag_across_an_inline_image_copies_its_markdown_never_its_cells() {
     assert!(!copied.contains('⧉'), "not the alt link it painted over: {copied:?}");
     assert!(!copied.contains(herdr_reviewr::graphics::PLACEHOLDER), "{copied:?}");
 }
+
+#[test]
+fn expand_all_and_collapse_all_reach_an_authored_open_details_too() {
+    use herdr_reviewr::app::Tab;
+    use herdr_reviewr::forge::{Comment, PrSnapshot, PrView};
+    let r = Repo::init();
+    r.write("x.rs", "y\n");
+    r.commit_all("init");
+    let mut app = app_on(&r);
+    app.set_tab(Tab::Pr).unwrap();
+    app.apply_pr(PrView::Pr(Box::new(PrSnapshot {
+        comments: vec![Comment {
+            body: include_str!("fixtures/diagram_bot_comment.md").into(),
+            ..common::comment()
+        }],
+        ..common::pr_snapshot()
+    })));
+    let read = |app: &App| {
+        let backend = ratatui::backend::TestBackend::new(SEL_AREA.width, 80);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal.draw(|f| herdr_reviewr::ui::render(f, app)).unwrap();
+        let buf = terminal.backend().buffer().clone();
+        (0..buf.area.height)
+            .map(|y| (0..buf.area.width).map(|x| buf[(x, y)].symbol()).collect::<String>())
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    let shown = read(&app);
+    assert!(shown.contains("▾ Pipeline containers"), "authored open: {shown}");
+    assert!(shown.contains("▸ Intake flow"));
+
+    app.collapse_pr_details();
+    let folded = read(&app);
+    assert!(folded.contains("▸ Pipeline containers"), "collapse-all folds it: {folded}");
+    assert!(!folded.contains("Sorting components"), "and what is inside it");
+
+    app.expand_pr_details();
+    let opened = read(&app);
+    assert!(
+        opened.contains("▾ Pipeline containers") && opened.contains("▾ Intake flow"),
+        "{opened}"
+    );
+}

@@ -228,6 +228,34 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   reply count on threads.
 
 ### Fixed
+- **Inline images on a private GitHub repository's files, in `<picture>`, and in `<details>`.**
+  A diagram-bot bot comment's diagrams stayed alt links. The comment links them as
+  `github.com/<o>/<r>/raw/<ref>/<path>` inside `<a href><picture>`, inside a `<details open>`
+  with more `<details>` nested. Decisions:
+  - **Raw file URLs.** On a GitHub PR, `github.com/<o>/<r>/raw/<ref>/<path>` and
+    `…/blob/<ref>/<path>?raw=true` are fetched from `raw.githubusercontent.com/<o>/<r>/<ref>/<path>`.
+    The github.com form answers only a browser session, never a token. The ref and path stay
+    one string, so GitHub settles a ref with a slash in it. GHES fetches
+    `<host>/raw/<o>/<r>/<ref>/<path>` on its own host. The rewritten URL is the image's identity
+    and its fetch.
+  - **One more token host, exactly.** For a github.com PR, the `gh` token may also go to
+    `raw.githubusercontent.com`: that exact host, over `https`, no credentials in the URL, no
+    other port, and still read as github.com's token. Look-alike hosts and every other host
+    get none. A GHES token never leaves its own host, and curl still drops it on a cross-host
+    redirect.
+  - **`<picture>`** takes the `<source>` whose `media` names the theme's own
+    `prefers-color-scheme` (dark themes take `dark`, light ones `light`). Without one it takes
+    the `<img src>`. From a `srcset` it takes the first URL. The `<img>`'s `alt` and
+    `width`/`height` still apply.
+  - **HTML `<a href>`** is now a link like a markdown one, with no dim destination appended,
+    since its author wrote what it shows. Around an image it is the image block's link
+    (OSC 8 and click). A markdown link around a landed image no longer appends its
+    destination after the picture either.
+  - **`<details open>`** renders open, as on GitHub. Before, every disclosure started closed.
+    The expand state flips the authored default, so a click folds it, and expand-all and
+    collapse-all reach it too. Images in a closed disclosure are neither laid out nor
+    fetched until it opens, then they load like any other.
+  - Attribute reads match whole names: `src` is never read out of `data-src` or `srcset`.
 - **Deep stacks resolve whole, and a cut stack never shows a fake base.** The stack walk
   stopped five levels down, so a PR six above `main` listed its stack's lowest PR's
   branch as the base, and `vs parent` on the lowest PR compared against that PR branch. The walk

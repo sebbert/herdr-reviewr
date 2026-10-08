@@ -102,6 +102,8 @@ pub struct DetailsHit {
     pub start: usize,
     pub end: usize,
     pub summary: std::sync::Arc<str>,
+    /// The disclosure was authored `<details open>`: the expand state flips it from open.
+    pub open_default: bool,
 }
 
 /// A clickable span on one rendered line: `start..end` display columns and where it
@@ -172,6 +174,8 @@ pub fn render_with_images<S: std::hash::BuildHasher>(
         expanded: &expanded,
         details: Vec::new(),
         skip_relative: false,
+        html_links: Vec::new(),
+        picture: None,
         img_src: images,
         ready_imgs: Vec::new(),
         unsettled: Vec::new(),
@@ -341,6 +345,9 @@ struct Renderer<'a> {
     expanded: &'a HashSet<String>,
     details: Vec<DetailsFrame>,
     skip_relative: bool,
+    /// One entry per open HTML `<a>`: whether it opened a link (an `href` did).
+    html_links: Vec<bool>,
+    picture: Option<Picture>,
     img_src: Option<&'a ImageSource<'a>>,
     /// The landed images of the block being assembled, indexed by their chunks.
     ready_imgs: Vec<ReadyImage>,
@@ -356,6 +363,14 @@ struct DetailsFrame {
     summary: String,
     collecting_summary: bool,
     skip: bool,
+    open_default: bool,
+}
+
+/// An open `<picture>`: the first URL of its dark and light `<source>`s, either way.
+#[derive(Default)]
+struct Picture {
+    dark: Option<String>,
+    light: Option<String>,
 }
 
 impl Renderer<'_> {
@@ -529,7 +544,7 @@ impl Renderer<'_> {
             TagEnd::Emphasis | TagEnd::Strong | TagEnd::Strikethrough => {
                 self.styles.pop();
             }
-            TagEnd::Link => self.end_link(),
+            TagEnd::Link => self.end_link(true),
             TagEnd::Image => self.end_image(),
             TagEnd::TableHead => {
                 if let Some(t) = &mut self.table {
@@ -592,14 +607,20 @@ impl Renderer<'_> {
     }
 
     /// Close a link: when its visible text differs from the destination, append the
-    /// destination dim.
-    fn end_link(&mut self) {
+    /// destination dim — never for an HTML `<a>` (`show_dest` false), whose author wrote
+    /// what it shows, nor after a picture, whose block is the link.
+    fn end_link(&mut self, show_dest: bool) {
         self.styles.pop();
         let Some((id, start)) = self.links.pop() else {
             return;
         };
         let dest = self.urls[id].clone();
-        let text: String = self.chunks_mut()[start..].iter().map(|c| c.text.as_str()).collect();
+        // A block emitted inside the link (an HTML block's line) took its chunks with it.
+        let Some(chunks) = self.chunks_mut().get(start..) else { return };
+        if !show_dest || chunks.iter().any(|c| c.image.is_some()) {
+            return;
+        }
+        let text: String = chunks.iter().map(|c| c.text.as_str()).collect();
         if !dest.is_empty() && text != *dest {
             let style = Style::default().fg(self.p.dim2);
             // The dim destination shares the click target with the text.
@@ -705,11 +726,46 @@ impl Renderer<'_> {
                 if self.emitting() {
                     self.flush_block(true);
                 }
+                let open_default = html_has_attr(raw, "open");
                 self.details.push(DetailsFrame {
                     summary: String::new(),
                     collecting_summary: false,
-                    skip: true,
+                    skip: !open_default,
+                    open_default,
                 });
+            }
+            ("a", false, false) if self.emitting() && !self.collecting_summary() => {
+                let href = html_attr(raw, "href").filter(|h| !h.trim().is_empty());
+                self.html_links.push(href.is_some());
+                if let Some(href) = href {
+                    let at = self.chunk_len();
+                    self.urls.push(std::sync::Arc::from(href.trim()));
+                    self.links.push((self.urls.len() - 1, at));
+                    let blue = self.p.blue;
+                    self.push_style(|s| s.fg(blue).add_modifier(Modifier::UNDERLINED));
+                }
+            }
+            ("a", true, _) if self.emitting() && !self.collecting_summary() => {
+                if self.html_links.pop() == Some(true) {
+                    self.end_link(false);
+                }
+            }
+            ("picture", false, false) => self.picture = Some(Picture::default()),
+            ("picture", true, _) => self.picture = None,
+            ("source", _, _) => {
+                let media = html_attr(raw, "media").unwrap_or_default().to_ascii_lowercase();
+                let media: String = media.chars().filter(|c| !c.is_whitespace()).collect();
+                let first = html_attr(raw, "srcset").and_then(|set| {
+                    let first = set.split(',').next()?.split_whitespace().next()?.to_string();
+                    Some(first)
+                });
+                if let (Some(p), Some(url)) = (self.picture.as_mut(), first) {
+                    if media.contains("prefers-color-scheme:dark") {
+                        p.dark.get_or_insert(url);
+                    } else if media.contains("prefers-color-scheme:light") {
+                        p.light.get_or_insert(url);
+                    }
+                }
             }
             ("details", true, _) => {
                 if self.emitting() {
@@ -735,7 +791,12 @@ impl Renderer<'_> {
             }
             ("img", _, _) if self.emitting() && !self.collecting_summary() => {
                 let alt = html_attr(raw, "alt").unwrap_or_default();
-                let src = html_attr(raw, "src").unwrap_or_default();
+                // Inside a `<picture>`, the source for the theme's own scheme wins.
+                let themed = self
+                    .picture
+                    .as_ref()
+                    .and_then(|p| if self.p.is_dark() { p.dark.clone() } else { p.light.clone() });
+                let src = themed.or_else(|| html_attr(raw, "src")).unwrap_or_default();
                 let px = |key| html_attr(raw, key).as_deref().and_then(html_pixels);
                 self.emit_image(&alt, &src, (px("width"), px("height")));
             }
@@ -771,16 +832,18 @@ impl Renderer<'_> {
         let summary = d.summary.split_whitespace().collect::<Vec<_>>().join(" ");
         let summary = sanitize(&summary);
         d.summary.clone_from(&summary);
-        let open = self.expanded.contains(&summary);
+        let open_default = d.open_default;
+        // The expand state flips the authored default: `<details open>` starts open.
+        let open = self.expanded.contains(&summary) != open_default;
         if let Some(d) = self.details.last_mut() {
             d.skip = !open;
         }
         if !self.details.iter().rev().skip(1).any(|d| d.skip) {
-            self.emit_details_summary(&summary, open);
+            self.emit_details_summary(&summary, open, open_default);
         }
     }
 
-    fn emit_details_summary(&mut self, summary: &str, open: bool) {
+    fn emit_details_summary(&mut self, summary: &str, open: bool, open_default: bool) {
         self.flush_block(true);
         self.blank_before_block();
         let glyph = if open { "▾ " } else { "▸ " };
@@ -793,6 +856,7 @@ impl Renderer<'_> {
             start: off,
             end: off + glyph.width() + summary_w,
             summary: std::sync::Arc::from(summary),
+            open_default,
         });
         self.push_line(
             Line::from(vec![
@@ -1399,11 +1463,27 @@ fn fill(chip: &str, cols: u16, space: char) -> String {
     out
 }
 
-fn html_attr(tag: &str, key: &str) -> Option<String> {
+/// Where attribute `key` names itself in `tag`: the byte after the name, at a name boundary
+/// on both sides — `src` is never found inside `data-src` or `srcset`.
+fn html_attr_at(tag: &str, key: &str) -> Option<usize> {
     let lower = tag.to_ascii_lowercase();
-    let needle = format!("{key}=");
-    let at = lower.find(&needle)?;
-    let rest = tag.get(at + needle.len()..)?;
+    lower.match_indices(key).find_map(|(at, _)| {
+        let before = lower[..at].chars().next_back();
+        let after = lower[at + key.len()..].chars().next();
+        let starts = before.is_some_and(char::is_whitespace);
+        let ends = after.is_none_or(|c| c == '=' || c == '>' || c == '/' || c.is_whitespace());
+        (starts && ends).then_some(at + key.len())
+    })
+}
+
+/// Whether `tag` carries attribute `key`, valued or bare (`<details open>`).
+fn html_has_attr(tag: &str, key: &str) -> bool {
+    html_attr_at(tag, key).is_some()
+}
+
+fn html_attr(tag: &str, key: &str) -> Option<String> {
+    let at = html_attr_at(tag, key)?;
+    let rest = tag.get(at..)?.trim_start().strip_prefix('=')?;
     let rest = rest.trim_start();
     let bytes = rest.as_bytes();
     if bytes.first().copied() == Some(b'"') {
@@ -2213,7 +2293,7 @@ mod tests {
     /// their size, on a 10×20-pixel cell.
     fn render_imaged(md: &str, width: usize, landed: &[(&str, (u32, u32))]) -> Rendered {
         let (hl, p) = setup();
-        let resolve = |d: &str| crate::images::resolve(d, None);
+        let resolve = |d: &str| crate::images::resolve(d, crate::images::Base::default());
         let size = |u: &str| landed.iter().find(|(l, _)| *l == u).map(|(_, s)| *s);
         let src = super::ImageSource {
             cell: (10, 20),
@@ -2353,7 +2433,7 @@ mod tests {
         let url = "https://img.example/a.png";
         let md = format!("![x]({url})");
         let landed = std::cell::Cell::new(false);
-        let resolve = |d: &str| crate::images::resolve(d, None);
+        let resolve = |d: &str| crate::images::resolve(d, crate::images::Base::default());
         let size = |u: &str| (landed.get() && u == url).then_some((100, 40));
         let src = super::ImageSource {
             cell: (10, 20),
@@ -2369,5 +2449,142 @@ mod tests {
         let after = cache.get_with_images(&md, 60, &hl, &p, &HashSet::new(), Some(&src));
         assert_eq!(after.lines.len(), 2, "the landed image's block, not the memo's alt line");
         assert_eq!(cache.get(&md, 60, &hl, &p).lines.len(), 1, "without images: the alt link");
+    }
+
+    const DIAGRAM_BOT: &str = include_str!("../tests/fixtures/diagram_bot_comment.md");
+    const RAW: &str = "https://raw.githubusercontent.com/o/r/diagrams/7/0123abcd";
+
+    /// Render the diagram-bot fixture as a GitHub PR's comment under `theme`, with `expanded`
+    /// summaries flipped and every image landed at 1284×600.
+    fn render_lens(theme: &str, expanded: &[&str]) -> Rendered {
+        let t = theme::resolve(Some(theme));
+        let hl = Highlighter::new(t.syntax);
+        let base = crate::images::Base { uploads: None, github: Some("github.com") };
+        let resolve = |d: &str| crate::images::resolve(d, base);
+        let size = |_: &str| Some((1284, 600));
+        let src = super::ImageSource {
+            cell: (10, 20),
+            max_rows: 20,
+            salt: String::new(),
+            resolve: &resolve,
+            size: &size,
+        };
+        let expanded: HashSet<String> = expanded.iter().map(|s| (*s).to_string()).collect();
+        super::render_with_images(DIAGRAM_BOT, 80, &hl, &t.palette, &expanded, Some(&src))
+    }
+
+    fn urls(r: &Rendered) -> Vec<String> {
+        r.images.iter().map(|i| i.url.to_string()).collect()
+    }
+
+    #[test]
+    fn an_open_details_renders_its_picture_and_a_closed_one_waits_for_its_expand() {
+        let r = render_lens("catppuccin-latte", &[]);
+        let t = texts(&r.lines);
+        assert!(t.iter().any(|l| l == "▾ Pipeline containers"), "authored open: {t:#?}");
+        assert!(t.iter().any(|l| l == "▸ Sorting components"), "nested, closed: {t:#?}");
+        assert!(t.iter().any(|l| l == "▸ Intake flow"), "closed: {t:#?}");
+        assert_eq!(
+            urls(&r),
+            [format!("{RAW}/containers-light-aa11.svg")],
+            "only the open one's picture, rewritten to the raw file; nothing closed is fetched"
+        );
+        let hit = r
+            .meta
+            .iter()
+            .find_map(|m| m.details.as_ref().filter(|d| &*d.summary == "Pipeline containers"));
+        assert!(hit.unwrap().open_default);
+        // The open picture is a block, and its `<a href>` is the block's link.
+        let rows: Vec<_> = r.meta.iter().filter(|m| !m.images.is_empty()).collect();
+        assert_eq!(rows.len(), 19, "1284×600 px scaled into 80 columns: 19 rows");
+        let link = "https://github.com/o/r/raw/diagrams/7/0123abcd/containers-light-aa11.svg";
+        assert!(rows.iter().all(|m| &*m.links[0].url == link));
+        assert!(!t.iter().any(|l| l.contains("(https://")), "no dim destination after a picture");
+        assert!(t.iter().any(|l| l.contains("The intake boundary connects")));
+
+        // Expanding the nested and the closed one renders their pictures too.
+        let r = render_lens("catppuccin-latte", &["Sorting components", "Intake flow"]);
+        assert_eq!(
+            urls(&r),
+            [
+                format!("{RAW}/containers-light-aa11.svg"),
+                format!("{RAW}/components-light-cc33.svg"),
+                format!("{RAW}/flow-light-ee55.svg"),
+            ]
+        );
+        // The expand state flips an authored-open one shut, and its nested one with it.
+        let r = render_lens("catppuccin-latte", &["Pipeline containers", "Sorting components"]);
+        let t = texts(&r.lines);
+        assert!(t.iter().any(|l| l == "▸ Pipeline containers"), "{t:#?}");
+        assert!(!t.iter().any(|l| l.contains("Sorting components")));
+        assert!(urls(&r).is_empty());
+    }
+
+    #[test]
+    fn a_picture_takes_the_source_for_the_themes_scheme_else_its_img() {
+        let dark = render_lens("catppuccin", &[]);
+        assert_eq!(urls(&dark), [format!("{RAW}/containers-dark-bb22.svg")]);
+        let span = dark.meta.iter().flat_map(|m| &m.images).next().unwrap();
+        assert_eq!(&*span.alt, "Pipeline containers", "the <img>'s alt");
+        // width="1284" sized it, not only its pixels: the fit is the pane's 80 columns.
+        assert_eq!(span.cells.cols, 80);
+
+        let (hl, p) = setup();
+        let resolve = |d: &str| crate::images::resolve(d, crate::images::Base::default());
+        let size = |_: &str| None;
+        let src = super::ImageSource {
+            cell: (10, 20),
+            max_rows: 20,
+            salt: String::new(),
+            resolve: &resolve,
+            size: &size,
+        };
+        let found = |md: &str| {
+            let r = super::render_with_images(md, 80, &hl, &p, &HashSet::new(), Some(&src));
+            urls(&r)
+        };
+        // Only a light source on a dark theme: the <img>.
+        assert_eq!(
+            found(
+                "<picture><source media=\"(prefers-color-scheme: light)\" srcset=\"https://x.example/l.png\"><img src=\"https://x.example/i.png\"></picture>"
+            ),
+            ["https://x.example/i.png"]
+        );
+        // srcset descriptors: the first URL.
+        assert_eq!(
+            found(
+                "<picture><source media=\"(prefers-color-scheme:dark)\" srcset=\"https://x.example/d1.png 1x, https://x.example/d2.png 2x\"><img src=\"https://x.example/i.png\"></picture>"
+            ),
+            ["https://x.example/d1.png"]
+        );
+        // After the picture closes, an <img> is its own src again.
+        assert_eq!(
+            found(
+                "<picture><source media=\"(prefers-color-scheme: dark)\" srcset=\"https://x.example/d.png\"><img src=\"https://x.example/i.png\"></picture>\n\n<img src=\"https://x.example/after.png\">"
+            ),
+            ["https://x.example/d.png", "https://x.example/after.png"]
+        );
+        // `src` is never read out of `data-src` or `srcset`.
+        assert_eq!(
+            found("<img data-src=\"https://x.example/no.png\" src=\"https://x.example/yes.png\">"),
+            ["https://x.example/yes.png"]
+        );
+        assert_eq!(super::html_attr("<img srcset=\"a\" src=\"b\">", "src").as_deref(), Some("b"));
+        assert!(super::html_has_attr("<details open>", "open"));
+        assert!(super::html_has_attr("<details\n  open=\"\">", "open"));
+        assert!(!super::html_has_attr("<details class=\"opener\">", "open"));
+    }
+
+    #[test]
+    fn an_html_anchor_is_a_link_without_a_dim_destination() {
+        let (hl, p) = setup();
+        let r = render("See <a href=\"https://x.example/doc\">the doc</a> now.", 80, &hl, &p);
+        assert_eq!(text_of(&r.lines[0]), "See the doc now.");
+        let link = &r.meta[0].links[0];
+        assert_eq!((link.start, link.end, &*link.url), (4, 11, "https://x.example/doc"));
+        // An anchor without href is no link, and its close pops nothing it didn't open.
+        let r = render("<a name=\"x\">plain</a> [md](https://x.example/m)", 80, &hl, &p);
+        assert_eq!(r.meta[0].links.len(), 1);
+        assert_eq!(&*r.meta[0].links[0].url, "https://x.example/m");
     }
 }
