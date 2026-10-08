@@ -7149,8 +7149,8 @@ fn a_drag_across_an_avatar_byline_copies_the_text_never_the_image_cells() {
     let dir = tempfile::tempdir().unwrap();
     std::fs::write(dir.path().join("config.toml"), "avatars = true\n").unwrap();
     app.set_plugin_config(herdr_reviewr::config::plugin_config_in(dir.path()).unwrap());
-    app.avatar_graphics = Some(true);
-    app.avatar_cell = Some((10, 20));
+    app.graphics = Some(true);
+    app.cell_px = Some((10, 20));
     app.set_tab(Tab::Pr).unwrap();
     app.apply_pr(PrView::Pr(Box::new(PrSnapshot {
         comments: vec![Comment {
@@ -9065,4 +9065,48 @@ fn githubs_own_stack_marks_a_pr_merely_on_top_in_the_stack_list() {
             ("main".into(), None)
         ]
     );
+}
+
+#[test]
+fn a_drag_across_an_inline_image_copies_its_markdown_never_its_cells() {
+    use herdr_reviewr::app::Tab;
+    use herdr_reviewr::forge::{PrSnapshot, PrView};
+    let shot = "https://img.example/shot.png";
+    let r = Repo::init();
+    r.write("x.rs", "y\n");
+    r.commit_all("init");
+    let mut app = app_on(&r);
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("config.toml"), "inline_images = true\n").unwrap();
+    app.set_plugin_config(herdr_reviewr::config::plugin_config_in(dir.path()).unwrap());
+    app.graphics = Some(true);
+    app.cell_px = Some((10, 20));
+    app.set_tab(Tab::Pr).unwrap();
+    app.apply_pr(PrView::Pr(Box::new(PrSnapshot {
+        body: format!("before\n\n![the shot]({shot})\n\nafter"),
+        ..common::pr_snapshot()
+    })));
+    app.images.mark_requested(shot);
+    let prepared = herdr_reviewr::images::Prepared {
+        size: (120, 60),
+        pixels: 100,
+        payload: std::sync::Arc::from("QUJD"),
+    };
+    app.images.land(shot.into(), Some(prepared));
+    // Paint once and put the image on the terminal, as the loop would.
+    let backend = ratatui::backend::TestBackend::new(SEL_AREA.width, SEL_AREA.height);
+    let mut terminal = ratatui::Terminal::new(backend).unwrap();
+    terminal.draw(|f| herdr_reviewr::ui::render(f, &app)).unwrap();
+    let painted = app.take_painted_images();
+    assert!(app.images.place(&painted).1);
+    let inner = herdr_reviewr::ui::read_inner_rect(SEL_AREA, &app);
+    sel_mouse(&mut app, MouseEventKind::Down(MouseButton::Left), inner.x, inner.y);
+    sel_mouse(&mut app, MouseEventKind::Drag(MouseButton::Left), inner.x + 60, inner.y + 7);
+    sel_mouse(&mut app, MouseEventKind::Up(MouseButton::Left), inner.x + 60, inner.y + 7);
+    let copied = last_copy().expect("the drag copies");
+    assert!(copied.starts_with("before"), "{copied:?}");
+    assert!(copied.contains(&format!("![the shot]({shot})")), "{copied:?}");
+    assert!(copied.contains("after"), "{copied:?}");
+    assert!(!copied.contains('⧉'), "not the alt link it painted over: {copied:?}");
+    assert!(!copied.contains(herdr_reviewr::graphics::PLACEHOLDER), "{copied:?}");
 }

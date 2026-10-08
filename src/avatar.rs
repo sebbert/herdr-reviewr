@@ -7,33 +7,19 @@
 //! URL for the session. The event loop transmits a landed image once, out of band, and the
 //! renderer paints ordinary text cells — U+10EEEE plus row/column diacritics, the image id
 //! in the foreground colour — that the terminal swaps for the picture. Anything missing, a
-//! terminal that never answered the [`PROBE`], a failed download, keeps the dot.
+//! terminal that never answered the [`PROBE`], a failed download, keeps the dot. The
+//! protocol pieces, the probe, and the fetcher are `crate::graphics`, shared with inline
+//! PR images; what is here is the avatar's own: its circle, its cells, its store.
 
 use std::collections::HashMap;
-use std::sync::mpsc;
-use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
 
 use image::RgbaImage;
 
-/// The Kitty Unicode placeholder: a cell the terminal replaces with part of an image.
-pub const PLACEHOLDER: char = '\u{10EEEE}';
-
-/// The first row/column diacritics of the Kitty placeholder table: index 0, 1, 2.
-const DIACRITICS: [char; 3] = ['\u{0305}', '\u{030D}', '\u{030E}'];
-
-/// The graphics support query: a 1×1 RGB image the terminal validates without storing,
-/// answering `ESC _ G i=31 ; OK ESC \` when it speaks the protocol. Sent once, after the
-/// first paint, and never waited on: the answer arrives through the input stream.
-pub const PROBE: &str = "\x1b_Gi=31,s=1,v=1,a=q,t=d,f=24;AAAA\x1b\\";
-
-/// How long the probe's answer may take before the terminal counts as not speaking Kitty
-/// graphics. Only bounds the swallowing of the reply; nothing waits on it.
-pub const PROBE_WINDOW: Duration = Duration::from_millis(1500);
-
-/// The cell size in pixels when the terminal reports none: the terminal scales the image
-/// to the placement's cells anyway, so this only sets how sharp the circle is.
-pub const FALLBACK_CELL: (u16, u16) = (10, 20);
+#[cfg(test)]
+use crate::graphics::base64;
+pub use crate::graphics::{
+    FALLBACK_CELL, Fed, PLACEHOLDER, PROBE, PROBE_WINDOW, ProbeFilter, delete, id_rgb, parse_reply,
+};
 
 /// The download workers: enough to fill a screen of cards quickly, few enough that a slow
 /// avatar host never fans out a crowd of `curl`s.
@@ -45,13 +31,7 @@ const SOURCE_MAX: u32 = 128;
 /// The text of placeholder cell `col` (row 0) of a placement.
 #[must_use]
 pub fn placeholder_cell(col: usize) -> String {
-    format!("{PLACEHOLDER}{}{}", DIACRITICS[0], DIACRITICS[col.min(DIACRITICS.len() - 1)])
-}
-
-/// The foreground colour that names image `id` to the terminal: its low 24 bits as RGB.
-#[must_use]
-pub fn id_rgb(id: u32) -> (u8, u8, u8) {
-    ((id >> 16) as u8, (id >> 8) as u8, id as u8)
+    crate::graphics::placeholder(0, col.min(2))
 }
 
 /// The escape sequences that transmit `img` as image `id` with a virtual placement `cols`
@@ -59,54 +39,9 @@ pub fn id_rgb(id: u32) -> (u8, u8, u8) {
 /// protocol requires.
 #[must_use]
 pub fn transmit(id: u32, cols: u8, img: &RgbaImage) -> Vec<u8> {
-    const CHUNK: usize = 4096;
-    let payload = base64(img.as_raw());
-    let chunks: Vec<&[u8]> =
-        if payload.is_empty() { vec![&[][..]] } else { payload.as_bytes().chunks(CHUNK).collect() };
-    let mut out = Vec::with_capacity(payload.len() + 64 * chunks.len());
-    for (i, chunk) in chunks.iter().enumerate() {
-        let more = u8::from(i + 1 < chunks.len());
-        out.extend_from_slice(b"\x1b_G");
-        if i == 0 {
-            let head = format!(
-                "a=T,U=1,f=32,s={},v={},c={cols},r=1,i={id},q=2,",
-                img.width(),
-                img.height()
-            );
-            out.extend_from_slice(head.as_bytes());
-        }
-        out.extend_from_slice(format!("m={more};").as_bytes());
-        out.extend_from_slice(chunk);
-        out.extend_from_slice(b"\x1b\\");
-    }
-    out
-}
-
-/// The escape sequence that deletes image `id` and frees its data.
-#[must_use]
-pub fn delete(id: u32) -> Vec<u8> {
-    format!("\x1b_Ga=d,d=I,i={id},q=2\x1b\\").into_bytes()
-}
-
-/// Standard base64 with padding — the protocol's payload encoding.
-fn base64(bytes: &[u8]) -> String {
-    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
-    for chunk in bytes.chunks(3) {
-        let n = match chunk.len() {
-            3 => u32::from(chunk[0]) << 16 | u32::from(chunk[1]) << 8 | u32::from(chunk[2]),
-            2 => u32::from(chunk[0]) << 16 | u32::from(chunk[1]) << 8,
-            _ => u32::from(chunk[0]) << 16,
-        };
-        for i in 0..4 {
-            if i <= chunk.len() {
-                out.push(ALPHABET[(n >> (18 - 6 * i) & 63) as usize] as char);
-            } else {
-                out.push('=');
-            }
-        }
-    }
-    out
+    let head =
+        format!("a=T,U=1,f=32,s={},v={},c={cols},r=1,i={id},q=2,", img.width(), img.height());
+    crate::graphics::chunked(&head, &crate::graphics::base64(img.as_raw()))
 }
 
 /// What sizes the avatar's circle: the row's height, or the avatar cells' width.
@@ -234,61 +169,24 @@ pub fn decode(bytes: &[u8]) -> Option<RgbaImage> {
 /// limit, a size cap, and nothing but `http(s)`. `None` on any failure — the dot stays.
 #[must_use]
 pub fn curl(url: &str) -> Option<Vec<u8>> {
-    let mut cmd = crate::proc::user_command("curl")?;
-    let out = cmd
-        .args(["-fsSL", "--max-time", "8", "--connect-timeout", "4"])
-        .args(["--max-filesize", "2000000", "--proto", "=https,http", "--"])
-        .arg(url)
-        .stdin(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .output()
-        .ok()?;
-    (out.status.success() && !out.stdout.is_empty()).then_some(out.stdout)
+    let limits =
+        crate::graphics::Limits { max_bytes: 2_000_000, max_time: 8, https_redirects: false };
+    crate::graphics::curl(url, limits, None)
 }
 
 /// One finished download: the URL and its decoded source, `None` when it failed.
-pub type Landing = (String, Option<RgbaImage>);
+pub type Landing = crate::graphics::Landing<RgbaImage>;
 
-/// The avatar worker: a few threads downloading and decoding requested URLs in request
-/// order. Requests never block; a stalled download holds only its own thread. Dropping the
-/// fetcher lets the idle threads exit; a busy one finishes its bounded download first.
-#[derive(Debug)]
-pub struct Fetcher {
-    jobs: mpsc::Sender<String>,
-    done: mpsc::Receiver<Landing>,
-}
+/// The avatar worker: the shared [`crate::graphics::Fetcher`] downloading and decoding
+/// avatars, never with a token.
+pub type Fetcher = crate::graphics::Fetcher<RgbaImage>;
 
-impl Fetcher {
-    /// Spawn the workers over `download` (the real one is [`curl`]).
+impl crate::graphics::Fetcher<RgbaImage> {
+    /// Spawn the avatar workers over `download` (the real one is [`curl`]).
     pub fn spawn(download: fn(&str) -> Option<Vec<u8>>) -> Self {
-        let (jobs, job_rx) = mpsc::channel::<String>();
-        let (done_tx, done) = mpsc::channel();
-        let job_rx = Arc::new(Mutex::new(job_rx));
-        for _ in 0..WORKERS {
-            let job_rx = Arc::clone(&job_rx);
-            let done_tx = done_tx.clone();
-            std::thread::spawn(move || {
-                loop {
-                    let next = job_rx.lock().ok().and_then(|rx| rx.recv().ok());
-                    let Some(url) = next else { return };
-                    let image = download(&url).as_deref().and_then(decode);
-                    if done_tx.send((url, image)).is_err() {
-                        return;
-                    }
-                }
-            });
-        }
-        Self { jobs, done }
-    }
-
-    /// Queue `url`; never waits.
-    pub fn request(&self, url: &str) {
-        let _ = self.jobs.send(url.to_string());
-    }
-
-    /// One finished download, if any; never waits.
-    pub fn try_recv(&self) -> Option<Landing> {
-        self.done.try_recv().ok()
+        Self::spawn_with(WORKERS, move |r: &crate::graphics::Request| {
+            download(&r.url).as_deref().and_then(decode)
+        })
     }
 }
 
@@ -397,100 +295,10 @@ impl Store {
     }
 }
 
-/// What the probe filter made of one key event.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Fed {
-    /// Not part of a probe reply: handle the key as usual.
-    Pass,
-    /// Swallowed as part of the reply.
-    Swallowed,
-}
-
-/// The probe's answer, read back out of the key stream. The reply `ESC _ G … ESC \` reaches
-/// the input parser as `Alt+_`, its payload's characters, then `Alt+\`; while the probe is
-/// out, the filter swallows exactly that run and reads the verdict from it. The run is
-/// bounded in length and in time, so a real `Alt+_` costs at most the keys typed inside the
-/// window, and only for a reviewer who opted in.
-#[derive(Debug, Default)]
-pub struct ProbeFilter {
-    deadline: Option<Instant>,
-    reply: Option<String>,
-    answer: Option<bool>,
-}
-
-/// A reply longer than this is not the probe's.
-const REPLY_MAX: usize = 96;
-
-impl ProbeFilter {
-    /// The probe went out at `now`.
-    pub fn start(&mut self, now: Instant) {
-        self.deadline = Some(now + PROBE_WINDOW);
-    }
-
-    /// The verdict: `None` while the probe is out (dots meanwhile).
-    #[must_use]
-    pub fn answer(&self) -> Option<bool> {
-        self.answer
-    }
-
-    /// Settle a probe whose window passed unanswered: no graphics.
-    pub fn expire(&mut self, now: Instant) {
-        if self.answer.is_none() && self.deadline.is_some_and(|d| now >= d) {
-            self.answer = Some(false);
-            self.deadline = None;
-            self.reply = None;
-        }
-    }
-
-    /// Whether the probe is still out, so the loop keeps waking to expire it.
-    #[must_use]
-    pub fn waiting(&self) -> bool {
-        self.answer.is_none() && self.deadline.is_some()
-    }
-
-    /// Feed one pressed character; `alt` is its Alt modifier.
-    pub fn feed(&mut self, ch: char, alt: bool) -> Fed {
-        if self.answer.is_some() || self.deadline.is_none() {
-            return Fed::Pass;
-        }
-        match self.reply.as_mut() {
-            None if alt && ch == '_' => {
-                self.reply = Some(String::new());
-                Fed::Swallowed
-            }
-            None => Fed::Pass,
-            Some(reply) if alt && ch == '\\' => {
-                let verdict = parse_reply(reply);
-                self.reply = None;
-                if let Some(ok) = verdict {
-                    self.answer = Some(ok);
-                    self.deadline = None;
-                }
-                Fed::Swallowed
-            }
-            Some(reply) => {
-                reply.push(ch);
-                if reply.len() > REPLY_MAX {
-                    self.reply = None;
-                }
-                Fed::Swallowed
-            }
-        }
-    }
-}
-
-/// The verdict in one graphics reply payload (`Gi=31;OK`): `Some(true)` for the probe's OK,
-/// `Some(false)` for its error, `None` for a reply that is not the probe's.
-#[must_use]
-pub fn parse_reply(payload: &str) -> Option<bool> {
-    let rest = payload.strip_prefix('G')?;
-    let (keys, message) = rest.split_once(';')?;
-    keys.split(',').any(|k| k == "i=31").then(|| message == "OK")
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::{Duration, Instant};
     use unicode_width::UnicodeWidthStr;
 
     #[test]

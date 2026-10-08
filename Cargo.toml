@@ -15,13 +15,18 @@ categories = ["command-line-utilities", "development-tools"]
 anyhow = "1"
 dirs = "7"
 fff-search = "0.11.0"
-# Avatar decoding only: the formats forge avatar hosts serve, no encoders, no rayon.
+# Avatar and inline-image decoding: the formats forge hosts serve, no rayon. The PNG
+# encoder (part of `png`) packs inline images for the terminal.
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp"] }
 # The matcher fff-search scores with: the base picker ranks branch names by the same rule
 # as the search screen, over a plain string list.
 neo_frizbee = "0.13.3"
 pulldown-cmark = { version = "0.13.4", default-features = false }
 ratatui = "0.30"
+# Inline SVG images (badges, diagrams): text with the system's fonts, nothing else — no
+# raster images inside an SVG, no svgz, and usvg's href resolver is replaced so an SVG never
+# reads a file or a URL.
+resvg = { version = "0.48", default-features = false, features = ["text", "system-fonts", "memmap-fonts"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 similar = { version = "3.2.0", features = ["text"] }

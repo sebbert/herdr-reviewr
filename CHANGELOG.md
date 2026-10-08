@@ -7,6 +7,57 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ## [Unreleased]
 
 ### Added
+- **Opt-in inline images on the PR tab.** With `inline_images = true` (off by default,
+  validated like every key and in `--resolve-plugin-config`), the description's and comments'
+  images, `![alt](url)` and HTML `<img src width height alt>`, paint as pictures through the
+  Kitty graphics that avatars use: PNG, JPEG, GIF (first frame), WebP, and SVG. A picture is
+  sized from its pixels or its `<img>` attributes. It never grows past its own size, the box's
+  width, or 20 rows, and it takes at least one cell. A badge stays one row and rides its line
+  of text. A taller image parts the text and takes rows of its own. Until it loads, when it
+  fails, or wherever graphics don't paint, an image is the `⧉ alt` link it was. It loads
+  lazily, visible first, and nothing waits on it. When one lands above the reader, the read
+  pane's scroll moves by its growth, so the text on screen stays put. A copy of an image's
+  lines yields `![alt](url)`. `cargo run --example image_check [url …]` checks a terminal by
+  hand. Decisions:
+  - **One graphics layer.** The avatar code's protocol pieces moved into `src/graphics.rs`,
+    shared by both kinds: placeholder cells (now the full 297-entry diacritic table, so a
+    block names any row and column), chunked transmission and deletion, the probe and its
+    key-stream filter, a generic download `Fetcher`, `curl` with caps, and the token rule.
+    `avatar.rs` keeps its circle and store, and avatars behave as before. One probe serves
+    both kinds, and the loop's `GraphicsHost` replaces `AvatarHost`.
+  - **Layout, then pixels.** The markdown renderer lays an image out once it has landed, from
+    the store's size (`markdown::ImageSource`). The memo re-renders a body only when an image
+    in it lands. Image cells render as the alt text. The painter swaps them for placeholder
+    cells only while the terminal holds that exact image, and the loop places what a frame
+    painted right after it and repaints at once. So a landed image reserves its block a frame
+    before its pixels arrive, and a block never jumps as it fills in.
+  - **One terminal image per URL and size.** Each size an image paints at is transmitted as its
+    own image with one virtual placement, so cells never need a placement id in the underline
+    colour, which the hyperlink tags already use. The payload is a PNG (`f=100`), packed once on
+    the worker at up to 2048 px and 4 Mpx, and the terminal scales it to the cells. Ghostty and
+    herdr's own renderer both decode PNG. Avatars keep their exact-size raw RGBA.
+  - **A bounded terminal share.** At most 32 images and 24 Mpx at a time. Past that, the least
+    recently painted that is off screen is deleted, and comes back if it is painted again.
+    Images are also deleted on exit, before a terminal editor, and when the key is switched
+    off. A resize re-sends them.
+  - **Fetching.** `curl` with a 10 MB cap (enforced on the bytes read, not only the announced
+    length), 20 s, `http(s)` only, redirects to `https` only. On a GitHub PR, a URL on the PR's
+    own host over `https` downloads with `gh auth token --hostname <host>`. The token is read
+    once per host on a worker, never logged, written into curl's config on stdin (never argv),
+    and curl drops it on a redirect to another host. No other host, forge, or scheme gets a
+    token. GitLab `/uploads/…` paths resolve under the project and download without a token.
+    GitLab and Azure DevOps images that need a sign-in stay alt links (no `glab`/`az` token is
+    sent). A failure stays the alt link for the session.
+  - **SVG** rasterises in-process with `resvg` (text through the system fonts, loaded once on a
+    worker the first time an SVG has text). Every `<image>` href is refused, files and data
+    URLs included, so an SVG reads nothing and reaches nothing. It rasterises at up to 3× its
+    declared size, so a badge stays sharp on a dense terminal.
+  - **Unchanged elsewhere.** Severity badges (`P1`/`P2`/`P3`) stay chips, images in table cells
+    stay alt links, and the All files markdown preview keeps alt links.
+  - **Alt glyph.** The fallback keeps `⧉`. An emoji such as `🖼` has an ambiguous width
+    across terminals.
+  - **Copy.** Image cells are chrome. A selection never carries placeholder cells or the alt
+    text painted under them. A block's first cell copies as `![alt](url)`.
 - **A stack list in the navigator, on the Changes and All files tabs.** While the checked-out
   PR is part of a GitHub stack, the navigator shows it above the file list
   (`stack_list_position = "bottom"` puts it below, validated like every key): each PR top

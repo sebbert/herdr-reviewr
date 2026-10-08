@@ -192,7 +192,8 @@ and click a stack row to view that PR.
   root's first line. Click the header or press `a` to unfold it (`▾`), and again to fold it.
   Any thread folds this way, on every forge. Your folds stick to their threads across
   refreshes. A thread resolved while you read it stays open until you move to another one.
-  Names, ages, checks, and PR numbers are [links](#hyperlinks) to the forge.
+  Names, ages, checks, and PR numbers are [links](#hyperlinks) to the forge. Images in the
+  description and comments can paint as pictures ([Inline images](#inline-images)).
   reviewr never writes to the forge.
 
 ## Diff scopes
@@ -253,6 +254,7 @@ hyperlinks = false
 stack_fetch = true
 stack_list_position = "bottom"
 avatars = true
+inline_images = true
 github_host = "github.example.com"
 editor = "code -g {file}:{line}"
 
@@ -332,6 +334,42 @@ that need a sign-in stay dots.
 
 To check a terminal, run `cargo run --example avatar_check` inside a herdr pane. It should
 draw four round pictures.
+
+### Inline images
+
+Opt in to paint the images in a PR's description and comments, `![alt](url)` and HTML
+`<img>`, as pictures in place of their `⧉ alt` links:
+
+```toml
+inline_images = true   # default: false (alt links)
+```
+
+It uses the same Kitty graphics as [avatars](#avatars), and the same one question to the
+terminal. PNG, JPEG, GIF (the first frame), WebP, and SVG all paint. SVG renders inside
+reviewr with your system's fonts: no scripts, and nothing it references is ever loaded.
+A picture is sized from its pixels, or from `<img width height>`. It never grows past its own
+size, the box's width, or 20 rows. A badge (shields.io and the like) stays one row tall and
+sits in its line of text. A taller image gets rows of its own.
+
+Images load lazily, visible ones first, and nothing waits on them. Until one arrives, and for
+good if it fails, it stays its dim `⧉ alt` link. When it lands it swaps in. If it lands above
+where you're reading, the pane scrolls with it, so your text stays put.
+
+On a GitHub PR, an image on GitHub's own host (`github.com` or your GHES host), such as a
+pasted `user-attachments` screenshot, downloads with your `gh auth token`. reviewr reads the
+token once, on a background thread. It goes to that host over `https` and nowhere else.
+`curl` reads it from stdin, so it never shows in `ps`. GitLab's `/uploads/…` paths resolve
+under the project and download without a token. GitLab and Azure DevOps images that need a
+sign-in stay alt links. Downloads are capped at 10 MB and 20 seconds, and redirect only to
+`https`.
+
+reviewr holds at most 32 images in the terminal at a time and deletes the one shown least
+recently first. It deletes them all on exit, before a terminal editor takes the pane, and
+when you switch the key off. A copy of an image's lines yields `![alt](url)`, never the
+picture's cells.
+
+To check a terminal, run `cargo run --example image_check [url ...]` inside a herdr pane. With
+no URL it draws an SVG badge and a gradient.
 
 ### Base branch
 

@@ -164,9 +164,9 @@ fn scrim_behind(frame: &mut Frame, app: &App, area: Rect) {
         for y in band.y..band.y + band.height {
             for x in band.x..band.x + band.width {
                 if let Some(cell) = buf.cell_mut((x, y)) {
-                    // An avatar cell's foreground is its image id, not a colour: blending it
+                    // An image cell's foreground is its image id, not a colour: blending it
                     // would name another image.
-                    if cell.symbol().starts_with(crate::avatar::PLACEHOLDER) {
+                    if cell.symbol().starts_with(crate::graphics::PLACEHOLDER) {
                         continue;
                     }
                     cell.fg = p.scrim(cell.fg);
@@ -981,6 +981,26 @@ fn paint_text_span(
     }
 }
 
+/// A line's text as a copy carries it: image cells are chrome, never their alt text or the
+/// placeholders over it — an image's first cell copies as `![alt](url)`, the rest as nothing.
+fn copied_images(text: &str, spans: &[crate::markdown::ImageSpan]) -> String {
+    use std::fmt::Write as _;
+    let mut out = String::new();
+    let mut at = 0;
+    for span in spans {
+        out.push_str(&take_display_cols(
+            &skip_display_cols(text, at),
+            span.start.saturating_sub(at),
+        ));
+        if span.row == 0 && span.col0 == 0 {
+            let _ = write!(out, "![{}]({})", span.alt, span.url);
+        }
+        at = span.end;
+    }
+    out.push_str(&skip_display_cols(text, at));
+    out
+}
+
 /// A `Line`'s plain text, spans joined.
 fn line_text(line: &Line<'_>) -> String {
     line.spans.iter().map(|s| s.content.as_ref()).collect()
@@ -1137,16 +1157,27 @@ pub(crate) fn painted_sel(app: &App, area: Rect) -> Option<PaintedSel> {
         let max = content.lines.len().saturating_sub(rect.height as usize);
         let scroll = app.pr_read_scroll().min(max);
         let offsets: Vec<usize> = content.cols.iter().map(|(left, _)| *left).collect();
+        let images: std::collections::HashMap<usize, &[crate::markdown::ImageSpan]> = content
+            .body_meta
+            .iter()
+            .flat_map(|(row, _, r)| r.meta.iter().enumerate().map(move |(i, m)| (row + i, m)))
+            .filter(|(_, m)| !m.images.is_empty())
+            .map(|(line, m)| (line, m.images.as_slice()))
+            .collect();
         let texts = content
             .lines
             .iter()
             .zip(&content.cols)
-            .map(|(l, (left, text_w))| {
+            .enumerate()
+            .map(|(i, (l, (left, text_w)))| {
                 let text = skip_display_cols(&line_text(l), *left);
-                painted_text(&match text_w {
+                let text = match text_w {
                     Some(w) => take_display_cols(&text, *w),
                     None => text,
-                })
+                };
+                painted_text(
+                    &images.get(&i).map_or(text.clone(), |spans| copied_images(&text, spans)),
+                )
             })
             .collect();
         return Some(PaintedSel { rect, scroll, texts, offsets });
@@ -5102,6 +5133,98 @@ fn note_markdown_regions(
     }
 }
 
+/// One painted row of an image's cells, in absolute screen cells: `width` cells from `x` on
+/// row `y` are image row `row`, columns `col0..` of `url` at `cells`.
+struct ImageRun {
+    x: u16,
+    y: u16,
+    width: u16,
+    row: u16,
+    col0: usize,
+    cells: crate::images::Cells,
+    url: std::sync::Arc<str>,
+}
+
+/// The visible image cells of one markdown body, clipped to `inner`.
+fn markdown_image_runs(
+    rendered: &crate::markdown::Rendered,
+    inner: Rect,
+    scroll: usize,
+    offset: usize,
+) -> Vec<ImageRun> {
+    let viewport = inner.height as usize;
+    let mut out = Vec::new();
+    for (i, m) in rendered.meta.iter().enumerate() {
+        let Some(d) = (i + offset).checked_sub(scroll).filter(|d| *d < viewport) else {
+            continue;
+        };
+        for span in &m.images {
+            let x1 = span.start.min(inner.width as usize) as u16;
+            let x2 = span.end.min(inner.width as usize) as u16;
+            if x1 < x2 {
+                out.push(ImageRun {
+                    x: inner.x + x1,
+                    y: inner.y + d as u16,
+                    width: x2 - x1,
+                    row: span.row,
+                    col0: span.col0,
+                    cells: span.cells,
+                    url: span.url.clone(),
+                });
+            }
+        }
+    }
+    out
+}
+
+/// Swap painted image cells for Kitty placeholder cells — the image id in the foreground —
+/// where the terminal holds the image; elsewhere the alt text stays. Every run is noted, so
+/// the loop puts what this frame showed on the terminal.
+fn paint_image_runs(buf: &mut ratatui::buffer::Buffer, app: &App, runs: &[ImageRun]) {
+    for run in runs {
+        app.note_painted_image(&run.url, run.cells);
+        let Some(id) = app.image_id(&run.url, run.cells) else { continue };
+        let (r, g, b) = crate::graphics::id_rgb(id);
+        for i in 0..run.width {
+            if let Some(cell) = buf.cell_mut((run.x + i, run.y)) {
+                cell.set_symbol(&crate::graphics::placeholder(
+                    usize::from(run.row),
+                    run.col0 + usize::from(i),
+                ));
+                cell.fg = Color::Rgb(r, g, b);
+                cell.modifier = Modifier::empty();
+            }
+        }
+    }
+}
+
+/// Each inline image's block end in the read pane, by URL and occurrence in content order —
+/// what the scroll anchors on when an image above the reader lands.
+fn pr_read_image_ends(content: &PrReadContent) -> Vec<(std::sync::Arc<str>, usize, usize)> {
+    let mut seen: std::collections::HashMap<std::sync::Arc<str>, usize> =
+        std::collections::HashMap::new();
+    let mut out = Vec::new();
+    for (row, _, rendered) in &content.body_meta {
+        for image in &rendered.images {
+            let n = seen.entry(image.url.clone()).or_insert(0);
+            out.push((image.url.clone(), *n, row + image.end));
+            *n += 1;
+        }
+    }
+    out
+}
+
+/// The read pane's inline-image URLs: those whose block meets `visible` first, top down,
+/// then the rest in content order.
+fn pr_read_image_urls(content: &PrReadContent, visible: &std::ops::Range<usize>) -> Vec<String> {
+    let all = content.body_meta.iter().flat_map(|(row, _, rendered)| {
+        rendered.images.iter().map(move |image| (row + image.line, row + image.end, &image.url))
+    });
+    let (shown, rest): (Vec<_>, Vec<_>) = all
+        .partition(|(line, end, _)| *line < visible.end && *end.max(&(line + 1)) > visible.start);
+    shown.into_iter().chain(rest).map(|(.., url)| url.to_string()).collect()
+}
+
 /// A ratatui scroll row from a usize offset, saturating — a render past 65k lines must
 /// pin to the end, never wrap back near the top.
 fn saturating_row(scroll: usize) -> u16 {
@@ -5697,20 +5820,24 @@ fn render_pr_read(frame: &mut Frame, app: &App, pane: Pane) {
     // wrap below the clamp. Scrolling stops with the last line at the pane's bottom edge.
     let max = content.lines.len().saturating_sub(body.height as usize);
     app.note_pr_read_max_scroll(max);
-    let scroll = app.settle_pr_read_scroll(&content.tops, max);
+    let scroll = app.settle_pr_read_scroll(&content.tops, max, pr_read_image_ends(&content));
     app.clear_painted_avatars();
     let visible = scroll..scroll + body.height as usize;
     for (_, url) in content.avatars.iter().filter(|(line, _)| visible.contains(line)) {
         app.note_painted_avatar(url);
     }
+    app.note_painted_image_urls(pr_read_image_urls(&content, &visible));
+    let mut image_runs = Vec::new();
     for (row, col, rendered) in &content.body_meta {
         let col = (*col as u16).min(body.width);
         let shifted = Rect::new(body.x + col, body.y, body.width - col, body.height);
         note_markdown_regions(app, rendered, shifted, scroll, *row);
+        image_runs.extend(markdown_image_runs(rendered, shifted, scroll, *row));
     }
     note_pr_read_folds(app, &content, body, scroll);
     frame.render_widget(Paragraph::new(content.lines).scroll((saturating_row(scroll), 0)), body);
     app.tag_painted_links(frame.buffer_mut());
+    paint_image_runs(frame.buffer_mut(), app, &image_runs);
     render_overflow_scrollbar(
         frame,
         Rect::new(pane.track_x, body.y, 1, body.height),

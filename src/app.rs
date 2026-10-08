@@ -877,11 +877,24 @@ pub struct App {
     /// Every avatar this session asked for, keyed by URL (`crate::avatar`). Session memory:
     /// a config recovery carries it, so nothing transmitted is ever orphaned.
     pub avatars: crate::avatar::Store,
-    /// Whether the terminal answered the Kitty graphics probe: `None` until it answers or
-    /// the window passes. Dots meanwhile.
-    pub avatar_graphics: Option<bool>,
-    /// The terminal's cell size in pixels, read when avatars first need it and after a resize.
-    pub avatar_cell: Option<(u16, u16)>,
+    /// Every inline PR image this session asked for, keyed by URL (`crate::images`). Session
+    /// memory like the avatars, carried by a config recovery for the same reason.
+    pub images: crate::images::Store,
+    /// Whether the terminal answered the Kitty graphics probe (`crate::graphics`), which
+    /// avatars and inline images share: `None` until it answers or the window passes. Dots
+    /// and alt links meanwhile.
+    pub graphics: Option<bool>,
+    /// The terminal's cell size in pixels, read when graphics first need it and after a
+    /// resize.
+    pub cell_px: Option<(u16, u16)>,
+    /// The image cells painted this frame (`ui`), which the loop puts on the terminal.
+    painted_images: std::cell::RefCell<Vec<(String, crate::images::Cells)>>,
+    /// The inline-image URLs in the PR conversation as painted this frame: the visible ones
+    /// first, top down, then the rest — the order downloads start.
+    painted_image_urls: std::cell::RefCell<Vec<String>>,
+    /// Each inline image's block end in the read pane as last painted, by URL and occurrence:
+    /// when one above the reader grows, the scroll moves with it (Continuity).
+    pr_read_image_ends: std::cell::RefCell<Vec<(std::sync::Arc<str>, usize, usize)>>,
     /// The avatar URLs on the turns painted this frame, top first — the order downloads start.
     painted_avatars: std::cell::RefCell<Vec<String>>,
     /// The read pane's display-line layout as painted this frame (`ui::read_layout`) — the
@@ -1160,8 +1173,12 @@ impl App {
             link_table: std::cell::RefCell::new(crate::hyperlink::LinkTable::default()),
             painted_hyperlinks: std::cell::RefCell::new(Vec::new()),
             avatars: crate::avatar::Store::default(),
-            avatar_graphics: None,
-            avatar_cell: None,
+            images: crate::images::Store::default(),
+            graphics: None,
+            cell_px: None,
+            painted_images: std::cell::RefCell::new(Vec::new()),
+            painted_image_urls: std::cell::RefCell::new(Vec::new()),
+            pr_read_image_ends: std::cell::RefCell::new(Vec::new()),
             painted_avatars: std::cell::RefCell::new(Vec::new()),
             painted_slots: std::cell::RefCell::new(Vec::new()),
             painted_anchors: std::cell::RefCell::new(Vec::new()),
@@ -1359,8 +1376,9 @@ impl App {
         }
         self.search_pct = old.search_pct;
         self.avatars = std::mem::take(&mut old.avatars);
-        self.avatar_graphics = old.avatar_graphics;
-        self.avatar_cell = old.avatar_cell;
+        self.images = std::mem::take(&mut old.images);
+        self.graphics = old.graphics;
+        self.cell_px = old.cell_px;
         // A tab switch requested its refresh and recovery landed first: the carried fields
         // below may reinstate the stale stashed frame, so the pending request must survive
         // the swap or that frame never refreshes until the next poll.
@@ -2213,12 +2231,38 @@ impl App {
     /// Settle the read pane's scroll for this frame: resolve a pending reveal against the
     /// painted item tops (`tops[i]` is cursor item `i`'s first line), clamp to `max`, and note
     /// the cursor item's top for the next refresh's offset.
-    pub(crate) fn settle_pr_read_scroll(&self, tops: &[usize], max: usize) -> usize {
+    ///
+    /// `images` is each inline image's block end this frame, by URL and occurrence. With no
+    /// reveal pending, a block above the reader that grew or shrank since the last paint (an
+    /// image landed, or stopped painting) carries the scroll with it, so the text under the
+    /// reader stays put: the shift is the change at the last block that ended above the
+    /// pane's top edge.
+    pub(crate) fn settle_pr_read_scroll(
+        &self,
+        tops: &[usize],
+        max: usize,
+        images: Vec<(std::sync::Arc<str>, usize, usize)>,
+    ) -> usize {
         let top = tops.get(self.pr_cursor).copied();
+        let previous = self.pr_read_image_ends.replace(images);
         if let Some(top) = top
             && let Some(offset) = self.pr_read_reveal.take()
         {
             self.pr_read_scroll.set(top.saturating_add_signed(offset));
+        } else {
+            let scroll = self.pr_read_scroll.get();
+            let current = self.pr_read_image_ends.borrow();
+            let shift = previous
+                .iter()
+                .filter(|(.., end)| *end <= scroll)
+                .filter_map(|(url, n, was)| {
+                    let now = current.iter().find(|(u, m, _)| u == url && m == n)?.2;
+                    Some(now as isize - *was as isize)
+                })
+                .next_back();
+            if let Some(shift) = shift.filter(|s| *s != 0) {
+                self.pr_read_scroll.set(scroll.saturating_add_signed(shift));
+            }
         }
         self.pr_read_painted_top.set(top.map(|t| (self.pr_cursor, t)));
         let scroll = self.pr_read_scroll.get().min(max);
@@ -2384,12 +2428,27 @@ impl App {
         } else {
             &self.preview_expanded_details
         };
-        self.markdown_cache.borrow_mut().get_expanded(
+        // Inline images belong to the PR conversation only; the preview keeps alt links.
+        let uploads = self.image_uploads_base().map(str::to_string);
+        let resolve = |dest: &str| crate::images::resolve(dest, uploads.as_deref());
+        let paint = self.inline_images_paint();
+        let size = |url: &str| if paint { self.images.size(url) } else { None };
+        let source = (self.tab == Tab::Pr && self.inline_images_wanted()).then(|| {
+            crate::markdown::ImageSource {
+                cell: self.cell_px.unwrap_or(crate::graphics::FALLBACK_CELL),
+                max_rows: crate::images::MAX_ROWS,
+                salt: uploads.clone().unwrap_or_default(),
+                resolve: &resolve,
+                size: &size,
+            }
+        });
+        self.markdown_cache.borrow_mut().get_with_images(
             text,
             width,
             &self.highlighter,
             &self.palette,
             expanded,
+            source.as_ref(),
         )
     }
 
@@ -2510,7 +2569,7 @@ impl App {
     #[must_use]
     pub fn avatar_cols(&self) -> Option<u8> {
         let config = self.plugin_config().filter(|c| c.avatars())?;
-        (self.avatar_graphics == Some(true)).then(|| config.avatar_width())
+        (self.graphics == Some(true)).then(|| config.avatar_width())
     }
 
     /// Where avatars paint around the dot this frame, when they paint at all.
@@ -2518,7 +2577,7 @@ impl App {
     pub fn avatar_geometry(&self) -> Option<crate::avatar::Geometry> {
         let cols = self.avatar_cols()?;
         let fit = self.plugin_config()?.avatar_fit();
-        let cell = self.avatar_cell.unwrap_or(crate::avatar::FALLBACK_CELL);
+        let cell = self.cell_px.unwrap_or(crate::avatar::FALLBACK_CELL);
         Some(crate::avatar::geometry(cell, cols, fit))
     }
 
@@ -2534,6 +2593,87 @@ impl App {
     pub fn avatar_id(&self, url: Option<&str>) -> Option<u32> {
         self.avatar_cols()?;
         self.avatars.painted_id(url?)
+    }
+
+    /// Whether the config asks for inline PR images — the gate on the probe (with avatars)
+    /// and every image download.
+    #[must_use]
+    pub fn inline_images_wanted(&self) -> bool {
+        self.plugin_config().is_some_and(crate::config::PluginConfig::inline_images)
+    }
+
+    /// Whether inline images paint: opted in, and the terminal answered the probe.
+    #[must_use]
+    pub fn inline_images_paint(&self) -> bool {
+        self.inline_images_wanted() && self.graphics == Some(true)
+    }
+
+    /// The PR's forge host (its page's authority), the one host a forge token may go to.
+    fn pr_forge_host(&self) -> Option<&str> {
+        crate::graphics::url_authority(&self.pr_snapshot()?.url)
+    }
+
+    /// Where a GitLab merge request's `/uploads/` image paths live: its project's web URL.
+    fn image_uploads_base(&self) -> Option<&str> {
+        if self.pr_forge != crate::git::Forge::GitLab {
+            return None;
+        }
+        crate::images::gitlab_project_url(&self.pr_snapshot()?.url)
+    }
+
+    /// The download for inline image `url`: with the `gh` token when the PR is on GitHub
+    /// (or GHES) and `url` is on that same host over `https` (`crate::graphics::token_host`).
+    #[must_use]
+    pub fn image_request(&self, url: &str) -> crate::graphics::Request {
+        let token_host = (self.pr_forge == crate::git::Forge::GitHub)
+            .then(|| self.pr_forge_host())
+            .flatten()
+            .and_then(|host| crate::graphics::token_host(url, host));
+        crate::graphics::Request { url: url.to_string(), token_host }
+    }
+
+    /// The inline images the painted conversation names and this session has not asked for,
+    /// the visible ones first. Empty unless inline images paint.
+    #[must_use]
+    pub fn image_requests(&self) -> Vec<crate::graphics::Request> {
+        if !self.inline_images_paint() {
+            return Vec::new();
+        }
+        let urls = self.painted_image_urls.borrow();
+        let mut out: Vec<crate::graphics::Request> = Vec::new();
+        for url in urls.iter() {
+            if self.images.is_new(url) && !out.iter().any(|r| &r.url == url) {
+                out.push(self.image_request(url));
+            }
+        }
+        out
+    }
+
+    /// Note the conversation's inline-image URLs as this frame painted them, visible first.
+    pub(crate) fn note_painted_image_urls(&self, urls: Vec<String>) {
+        *self.painted_image_urls.borrow_mut() = urls;
+    }
+
+    /// Note image cells painted this frame at `cells`.
+    pub(crate) fn note_painted_image(&self, url: &str, cells: crate::images::Cells) {
+        let mut painted = self.painted_images.borrow_mut();
+        if !painted.iter().any(|(u, c)| u == url && *c == cells) {
+            painted.push((url.to_string(), cells));
+        }
+    }
+
+    /// The images this frame painted, which the loop puts on the terminal; clears the list.
+    pub fn take_painted_images(&self) -> Vec<(String, crate::images::Cells)> {
+        std::mem::take(&mut *self.painted_images.borrow_mut())
+    }
+
+    /// The image id that paints `url` at `cells`, once the terminal holds it.
+    #[must_use]
+    pub(crate) fn image_id(&self, url: &str, cells: crate::images::Cells) -> Option<u32> {
+        if !self.inline_images_paint() {
+            return None;
+        }
+        self.images.placed_id(url, cells)
     }
 
     /// Note an avatar URL on a turn painted this frame.

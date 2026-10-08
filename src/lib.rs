@@ -20,9 +20,11 @@ pub mod file_list;
 pub mod forge;
 pub mod git;
 pub mod gitlab;
+pub mod graphics;
 pub mod herdr;
 pub mod highlight;
 pub mod hyperlink;
+pub mod images;
 pub mod keymap;
 #[macro_use]
 pub mod log;
@@ -311,9 +313,10 @@ fn run_editor(
     // raw mode is a signal, not a key. That gap is the editor's own startup and reviewr adds
     // nothing to it.
     app.forget_pointer();
-    // The editor gets a clean pane: no avatar of reviewr's under its text. The next tick
+    // The editor gets a clean pane: no image of reviewr's under its text. The next tick
     // re-transmits them on the way back.
     write_terminal(&app.avatars.deletions());
+    write_terminal(&app.images.deletions());
     release_terminal(kbd);
     let launched = cmd.status();
     claim_terminal(kbd);
@@ -902,38 +905,56 @@ fn glyph_clears(lit_for: Duration) -> bool {
 /// build's own speed — shared by the world and search workers.
 const WORKER_TIGHT_WAKE: Duration = Duration::from_millis(15);
 
-/// The wake while an avatar download or the graphics probe is out: an avatar is a
-/// cosmetic swap, so a looser beat than a worker landing that the reviewer waits on.
-const AVATAR_WAKE: Duration = Duration::from_millis(50);
+/// The wake while an image download or the graphics probe is out: a picture is a cosmetic
+/// swap, so a looser beat than a worker landing that the reviewer waits on.
+const GRAPHICS_WAKE: Duration = Duration::from_millis(50);
 
-/// The loop's avatar side (`crate::avatar`): the graphics probe, the download worker, and
-/// the out-of-band terminal writes. Everything here writes or polls; nothing waits — not on
-/// the probe's answer, not on a download, not on a decode.
+/// The loop's pixel-graphics side (`crate::graphics`), shared by avatars (`crate::avatar`)
+/// and inline images (`crate::images`): the one graphics probe, each kind's download worker,
+/// and the out-of-band terminal writes. Everything here writes or polls; nothing waits — not
+/// on the probe's answer, not on a download, not on a decode.
 #[derive(Default)]
-struct AvatarHost {
-    probe: crate::avatar::ProbeFilter,
+struct GraphicsHost {
+    probe: crate::graphics::ProbeFilter,
     probe_sent: bool,
-    fetcher: Option<crate::avatar::Fetcher>,
+    avatars: Option<crate::avatar::Fetcher>,
+    images: Option<crate::graphics::Fetcher<crate::images::Prepared>>,
+    /// Images went out after the last draw: the next frame paints them without waiting.
+    repaint: bool,
 }
 
-impl AvatarHost {
-    /// Run before every draw: land finished downloads and transmit them, so this draw's
-    /// placeholder cells name images the terminal holds. Avatars switched off in the config
-    /// delete whatever was sent.
+impl GraphicsHost {
+    /// Run before every draw: land finished downloads and transmit avatars, so this draw's
+    /// placeholder cells name images the terminal holds. A kind switched off in the config
+    /// deletes whatever it sent.
     fn before_draw(&mut self, app: &mut App) {
+        self.repaint = false;
         if !app.avatars_wanted() {
             write_terminal(&app.avatars.deletions());
+        }
+        if !app.inline_images_wanted() {
+            write_terminal(&app.images.deletions());
+        }
+        if !app.avatars_wanted() && !app.inline_images_wanted() {
             return;
         }
         self.probe.expire(Instant::now());
-        app.avatar_graphics = self.probe.answer();
+        app.graphics = self.probe.answer();
+        if app.graphics != Some(true) {
+            return;
+        }
+        if app.cell_px.is_none() {
+            app.cell_px = Some(cell_pixels());
+        }
+        if let Some(fetcher) = &self.images {
+            while let Some((url, image)) = fetcher.try_recv() {
+                app.images.land(url, image);
+            }
+        }
         if app.avatar_cols().is_none() {
             return;
         }
-        if app.avatar_cell.is_none() {
-            app.avatar_cell = Some(cell_pixels());
-        }
-        if let Some(fetcher) = &self.fetcher {
+        if let Some(fetcher) = &self.avatars {
             while let Some((url, image)) = fetcher.try_recv() {
                 app.avatars.land(url, image);
             }
@@ -943,37 +964,58 @@ impl AvatarHost {
         }
     }
 
-    /// Run after every draw: send the probe once avatars are wanted, and request the
-    /// missing URLs — the turns this frame painted first, so the visible cards fill in first.
-    /// The PR snapshot has already painted with dots by the time anything is asked for.
+    /// Run after every draw: send the probe once either kind is wanted, request the missing
+    /// URLs — what this frame painted first, so the visible cards fill in first — and put
+    /// the images this frame laid out on the terminal, so the next frame shows them. The PR
+    /// snapshot has already painted with dots and alt links by the time anything is asked for.
     fn after_draw(&mut self, app: &mut App) {
-        if !app.avatars_wanted() {
+        let painted = app.take_painted_images();
+        if !app.avatars_wanted() && !app.inline_images_wanted() {
             return;
         }
         if !self.probe_sent {
             self.probe_sent = true;
             self.probe.start(Instant::now());
-            write_terminal(crate::avatar::PROBE.as_bytes());
+            write_terminal(crate::graphics::PROBE.as_bytes());
         }
         let requests = app.avatar_requests();
-        if requests.is_empty() {
+        if !requests.is_empty() {
+            let fetcher = self
+                .avatars
+                .get_or_insert_with(|| crate::avatar::Fetcher::spawn(crate::avatar::curl));
+            for url in requests {
+                app.avatars.mark_requested(&url);
+                fetcher.request(&url);
+            }
+        }
+        if !app.inline_images_paint() {
             return;
         }
-        let fetcher =
-            self.fetcher.get_or_insert_with(|| crate::avatar::Fetcher::spawn(crate::avatar::curl));
-        for url in requests {
-            app.avatars.mark_requested(&url);
-            fetcher.request(&url);
+        let requests = app.image_requests();
+        if !requests.is_empty() {
+            let fetcher = self.images.get_or_insert_with(crate::images::spawn_fetcher);
+            for request in requests {
+                app.images.mark_requested(&request.url);
+                fetcher.request_with(request);
+            }
         }
+        let (bytes, sent) = app.images.place(&painted);
+        write_terminal(&bytes);
+        self.repaint = sent;
     }
 
-    /// Whether the loop should keep waking for avatar work: the probe's window, or downloads.
+    /// Whether the loop should keep waking for graphics work: the probe's window, or
+    /// downloads of a kind that is wanted.
     fn busy(&self, app: &App) -> bool {
-        app.avatars_wanted() && (self.probe.waiting() || app.avatars.pending())
+        let wanted = app.avatars_wanted() || app.inline_images_wanted();
+        wanted
+            && (self.probe.waiting()
+                || (app.avatars_wanted() && app.avatars.pending())
+                || (app.inline_images_wanted() && app.images.pending()))
     }
 
     /// Swallow a key that is part of the probe's reply, which the input parser reads as an
-    /// `Alt+_`, payload, `Alt+\` run (`crate::avatar::ProbeFilter`).
+    /// `Alt+_`, payload, `Alt+\` run (`crate::graphics::ProbeFilter`).
     fn swallows(&mut self, event: &Event) -> bool {
         let Event::Key(k) = event else { return false };
         let KeyCode::Char(ch) = k.code else { return false };
@@ -981,7 +1023,7 @@ impl AvatarHost {
             return false;
         }
         let alt = k.modifiers.contains(KeyModifiers::ALT);
-        self.probe.feed(ch, alt) == crate::avatar::Fed::Swallowed
+        self.probe.feed(ch, alt) == crate::graphics::Fed::Swallowed
     }
 }
 
@@ -992,7 +1034,7 @@ fn cell_pixels() -> (u16, u16) {
         Ok(w) if w.columns > 0 && w.rows > 0 && w.width >= w.columns && w.height >= w.rows => {
             (w.width / w.columns, w.height / w.rows)
         }
-        _ => crate::avatar::FALLBACK_CELL,
+        _ => crate::graphics::FALLBACK_CELL,
     }
 }
 
@@ -1062,7 +1104,7 @@ fn event_loop(terminal: &mut Term, app: &mut App, cfg: &Config, kbd: bool) -> Re
     let mut config_epoch = 0_u64;
     let mut status_at = Instant::now();
     let mut last_status = String::new();
-    let mut avatars = AvatarHost::default();
+    let mut graphics = GraphicsHost::default();
     // Fetch the PR snapshot as soon as the panel opens, not on first switching to the tab, so the
     // tab is already populated when the user gets there.
     app.pr_pending = None;
@@ -1171,9 +1213,9 @@ fn event_loop(terminal: &mut Term, app: &mut App, cfg: &Config, kbd: bool) -> Re
             }
             app.bound_file_scroll(file_vp);
             let painted_frame = PaintedFrameSnapshot::capture(app);
-            avatars.before_draw(app);
+            graphics.before_draw(app);
             draw(terminal, app)?;
-            avatars.after_draw(app);
+            graphics.after_draw(app);
 
             // A world completion reconciles into the view only while the view it described is
             // still current; the worker's baseline is authoritative either way.
@@ -1497,8 +1539,11 @@ fn event_loop(terminal: &mut Term, app: &mut App, cfg: &Config, kbd: bool) -> Re
             if let Some(started) = pr.wait_started {
                 timeout = timeout.min(INDICATOR_DELAY.saturating_sub(started.elapsed()));
             }
-            if avatars.busy(app) {
-                timeout = timeout.min(AVATAR_WAKE);
+            if graphics.busy(app) {
+                timeout = timeout.min(GRAPHICS_WAKE);
+            }
+            if graphics.repaint {
+                timeout = Duration::ZERO;
             }
             if app.config_error().is_none()
                 && let Some(wait) = app.base_probe_wait()
@@ -1514,7 +1559,7 @@ fn event_loop(terminal: &mut Term, app: &mut App, cfg: &Config, kbd: bool) -> Re
                     continue;
                 }
                 let event = event::read()?;
-                if avatars.swallows(&event) {
+                if graphics.swallows(&event) {
                     continue;
                 }
                 if app.config_error().is_some() {
@@ -1627,6 +1672,7 @@ fn event_loop(terminal: &mut Term, app: &mut App, cfg: &Config, kbd: bool) -> Re
     })();
     // Nothing reviewr transmitted outlives it in the herdr pane.
     write_terminal(&app.avatars.deletions());
+    write_terminal(&app.images.deletions());
     restore_terminal(kbd);
     browse.cancel();
     drain_pr_shutdown(&mut pr, &probe_rx, &pr_rx);
@@ -2231,7 +2277,8 @@ fn handle_resize(app: &mut App) {
     app.hover = None;
     // A resize can change the cell size and may drop images: measure again and re-send.
     app.avatars.forget_sent();
-    app.avatar_cell = None;
+    app.images.forget_sent();
+    app.cell_px = None;
 }
 
 /// Route a mouse-down over selectable text: it arms the text gesture, carrying its

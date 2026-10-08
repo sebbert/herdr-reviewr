@@ -4900,8 +4900,8 @@ fn with_avatars(app: &mut App, width: u8, fit: &str, graphics: Option<bool>) {
     )
     .unwrap();
     app.set_plugin_config(herdr_reviewr::config::plugin_config_in(dir.path()).unwrap());
-    app.avatar_graphics = graphics;
-    app.avatar_cell = Some((10, 20));
+    app.graphics = graphics;
+    app.cell_px = Some((10, 20));
 }
 
 /// A PR tab whose one comment and its reply carry avatar URLs.
@@ -6196,4 +6196,197 @@ fn a_cut_stack_shows_more_below_in_the_navigator_stack_list() {
     assert_eq!(more_y, ten_y + 1, "{out}");
     assert!(!out.contains("└ head-9") && !out.contains("└ main"), "no fake base: {out}");
     assert!(out.contains("Stack · 3"), "the cut row is no PR: {out}");
+}
+
+/// Load a config with inline images on, the terminal's graphics answer `graphics`.
+fn with_inline_images(app: &mut App, graphics: Option<bool>) {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("config.toml"), "inline_images = true\n").unwrap();
+    app.set_plugin_config(herdr_reviewr::config::plugin_config_in(dir.path()).unwrap());
+    app.graphics = graphics;
+    app.cell_px = Some((10, 20));
+}
+
+const SHOT: &str = "https://img.example/shot.png";
+const BADGE: &str = "https://img.shields.io/badge/ci-passing-green.svg";
+
+/// A GitHub PR whose description holds a screenshot and whose comment holds a badge.
+fn image_pr_app() -> App {
+    use herdr_reviewr::forge::{Comment, PrSnapshot, PrView};
+    let mut app = edited_app();
+    app.set_tab(Tab::Pr).unwrap();
+    app.pr_forge = herdr_reviewr::git::Forge::GitHub;
+    app.apply_pr(PrView::Pr(Box::new(PrSnapshot {
+        url: "https://github.com/o/r/pull/7".into(),
+        body: format!("Intro line.\n\n![the screenshot]({SHOT})\n\nOutro line."),
+        comments: vec![Comment { body: format!("![ci]({BADGE}) green"), ..common::comment() }],
+        ..common::pr_snapshot()
+    })));
+    app
+}
+
+fn prepared(size: (u32, u32)) -> herdr_reviewr::images::Prepared {
+    herdr_reviewr::images::Prepared { size, pixels: 100, payload: std::sync::Arc::from("QUJD") }
+}
+
+/// Render, put what the frame painted on the terminal as the loop would, render again.
+fn render_placed(app: &mut App) -> Buffer {
+    let _ = render_buffer(app);
+    let painted = app.take_painted_images();
+    let _ = app.images.place(&painted);
+    render_buffer(app)
+}
+
+#[test]
+fn an_image_is_its_alt_link_while_graphics_are_off_unanswered_loading_or_failed() {
+    let plain = image_pr_app();
+    let today = render_buffer(&plain);
+    assert!(dump(&today).contains("⧉ the screenshot"));
+
+    for graphics in [None, Some(false)] {
+        let mut app = image_pr_app();
+        with_inline_images(&mut app, graphics);
+        assert_eq!(render_buffer(&app), today, "graphics {graphics:?}: byte-identical");
+        assert!(app.image_requests().is_empty(), "nothing downloads without graphics");
+    }
+
+    let mut app = image_pr_app();
+    with_inline_images(&mut app, Some(true));
+    let _ = render_buffer(&app);
+    let requests: Vec<String> = app.image_requests().into_iter().map(|r| r.url).collect();
+    assert_eq!(requests, [SHOT, BADGE], "the visible images, top down");
+    for url in &requests {
+        app.images.mark_requested(url);
+    }
+    assert_eq!(render_buffer(&app), today, "loading: the alt link, never a gap");
+    assert!(app.image_requests().is_empty(), "nothing asked for twice");
+    for url in requests {
+        app.images.land(url, None);
+    }
+    assert_eq!(render_buffer(&app), today, "a failure stays the alt link");
+    assert_eq!(render_placed(&mut app), today, "a failed image places nothing");
+}
+
+#[test]
+fn a_landed_image_paints_its_block_of_placeholder_cells_once_on_the_terminal() {
+    let mut app = image_pr_app();
+    with_inline_images(&mut app, Some(true));
+    let _ = render_buffer(&app);
+    for request in app.image_requests() {
+        app.images.mark_requested(&request.url);
+    }
+    // 120×60 px at 10×20-px cells: 12 columns by 3 rows. The badge: 9×1.
+    app.images.land(SHOT.into(), Some(prepared((120, 60))));
+    app.images.land(BADGE.into(), Some(prepared((90, 20))));
+
+    // The first frame lays the block out (its alt on top) before the terminal holds it.
+    let first = dump(&render_buffer(&app));
+    assert!(first.contains("⧉ the screen"), "{first}");
+    assert!(!first.contains(herdr_reviewr::graphics::PLACEHOLDER));
+
+    let buf = render_placed(&mut app);
+    let shot = herdr_reviewr::images::Cells { cols: 12, rows: 3 };
+    let id = app.images.placed_id(SHOT, shot).expect("placed");
+    let (r, g, b) = herdr_reviewr::graphics::id_rgb(id);
+    let cells: Vec<(u16, u16)> = (0..buf.area.height)
+        .flat_map(|y| (0..buf.area.width).map(move |x| (x, y)))
+        .filter(|&(x, y)| buf[(x, y)].fg == ratatui::style::Color::Rgb(r, g, b))
+        .collect();
+    assert_eq!(cells.len(), 36, "12 × 3 cells");
+    let (x0, y0) = cells[0];
+    for &(x, y) in &cells {
+        let want = herdr_reviewr::graphics::placeholder((y - y0) as usize, (x - x0) as usize);
+        assert_eq!(buf[(x, y)].symbol(), want, "cell ({x}, {y})");
+    }
+    let out = dump(&buf);
+    assert!(out.contains("Intro line.") && out.contains("Outro line."));
+    assert!(!out.contains("⧉ the screen"), "the picture replaced its alt");
+    // The badge rides its comment's line, then the text.
+    let badge = herdr_reviewr::images::Cells { cols: 9, rows: 1 };
+    let bid = app.images.placed_id(BADGE, badge).expect("the badge placed too");
+    let (r, g, b) = herdr_reviewr::graphics::id_rgb(bid);
+    let row = (0..buf.area.height)
+        .find(|&y| {
+            (0..buf.area.width).any(|x| buf[(x, y)].fg == ratatui::style::Color::Rgb(r, g, b))
+        })
+        .unwrap();
+    assert!(out.lines().nth(row as usize).unwrap().contains(" green"));
+
+    // Switched off: the alt links again, and the loop deletes what it sent.
+    with_inline_images(&mut app, Some(true));
+    let mut off = app;
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("config.toml"), "inline_images = false\n").unwrap();
+    off.set_plugin_config(herdr_reviewr::config::plugin_config_in(dir.path()).unwrap());
+    assert!(dump(&render_buffer(&off)).contains("⧉ the screenshot"));
+    assert!(!off.images.deletions().is_empty());
+}
+
+#[test]
+fn the_forge_token_rides_only_requests_to_the_forge_host() {
+    let mut app = image_pr_app();
+    let req = |app: &App, url: &str| app.image_request(url).token_host;
+    assert_eq!(
+        req(&app, "https://github.com/user-attachments/assets/1").as_deref(),
+        Some("github.com")
+    );
+    assert_eq!(req(&app, "https://private-user-images.githubusercontent.com/1.png"), None);
+    assert_eq!(req(&app, BADGE), None);
+    assert_eq!(req(&app, "http://github.com/user-attachments/assets/1"), None);
+    // A GitLab or Azure PR never sends a `gh` token.
+    app.pr_forge = herdr_reviewr::git::Forge::GitLab;
+    assert_eq!(req(&app, "https://github.com/user-attachments/assets/1"), None);
+}
+
+#[test]
+fn an_image_landing_above_the_reader_leaves_their_view_still() {
+    use herdr_reviewr::forge::{PrSnapshot, PrView};
+    let mut app = image_pr_app();
+    let paras = (0..30).map(|n| format!("para-{n:02}")).collect::<Vec<_>>().join("\n\n");
+    app.apply_pr(PrView::Pr(Box::new(PrSnapshot {
+        url: "https://github.com/o/r/pull/7".into(),
+        body: format!("Intro.\n\n![shot]({SHOT})\n\n{paras}"),
+        ..common::pr_snapshot()
+    })));
+    with_inline_images(&mut app, Some(true));
+    let read = |app: &mut App| -> Vec<String> {
+        let out = dump(&render_placed(app));
+        read_column(&out).iter().map(|l| l.trim_end().to_string()).collect()
+    };
+    let _ = read(&mut app);
+    let area = Rect::new(0, 0, 140, 40);
+    for _ in 0..4 {
+        handle_mouse(
+            &mut app,
+            MouseEvent {
+                kind: MouseEventKind::ScrollDown,
+                column: 5,
+                row: 10,
+                modifiers: KeyModifiers::NONE,
+            },
+            area,
+            &[],
+            &Keymap::default(),
+            &herdr_reviewr::export::Clipboard,
+        )
+        .unwrap();
+    }
+    let before = read(&mut app);
+    assert!(!before.iter().any(|l| l.contains("⧉ shot")), "the image is above the pane");
+    let scroll = app.pr_read_scroll();
+
+    for request in app.image_requests() {
+        app.images.mark_requested(&request.url);
+    }
+    // 100×200 px: ten rows where the alt link was one.
+    app.images.land(SHOT.into(), Some(prepared((100, 200))));
+    let after = read(&mut app);
+    assert_eq!(before, after, "the reader's view does not move");
+    assert_eq!(app.pr_read_scroll(), scroll + 9, "the scroll absorbs the growth");
+
+    // From the top, the same landing simply shows the block.
+    let mut top = image_pr_app();
+    with_inline_images(&mut top, Some(true));
+    let _ = read(&mut top);
+    assert_eq!(top.pr_read_scroll(), 0);
 }

@@ -66,7 +66,7 @@ impl Config {
     }
 }
 
-const PLUGIN_CONFIG_KEYS: [&str; 21] = [
+const PLUGIN_CONFIG_KEYS: [&str; 22] = [
     "theme",
     "default_scope",
     "navigator_position",
@@ -82,6 +82,7 @@ const PLUGIN_CONFIG_KEYS: [&str; 21] = [
     "avatars",
     "avatar_width",
     "avatar_fit",
+    "inline_images",
     "github_host",
     "gitlab_host",
     "azure_devops_host",
@@ -243,6 +244,9 @@ pub struct PluginConfig {
     avatar_width: u8,
     /// Whether the avatar's circle is as tall as the row or as wide as its cells.
     avatar_fit: crate::avatar::Fit,
+    /// Opt-in: paint the PR description's and comments' images in place of their alt links,
+    /// through the same Kitty graphics as avatars.
+    inline_images: bool,
     github_host: Option<String>,
     gitlab_host: Option<String>,
     azure_devops_host: Option<String>,
@@ -269,6 +273,7 @@ impl Default for PluginConfig {
             avatars: false,
             avatar_width: 1,
             avatar_fit: crate::avatar::Fit::Height,
+            inline_images: false,
             github_host: None,
             gitlab_host: None,
             azure_devops_host: None,
@@ -342,6 +347,10 @@ impl PluginConfig {
         self.avatar_fit
     }
 
+    pub fn inline_images(&self) -> bool {
+        self.inline_images
+    }
+
     pub fn github_host(&self) -> Option<&str> {
         self.github_host.as_deref()
     }
@@ -404,6 +413,7 @@ impl PluginConfig {
             "avatars": self.avatars,
             "avatar_width": self.avatar_width,
             "avatar_fit": self.avatar_fit.as_str(),
+            "inline_images": self.inline_images,
             "github_host": self.github_host,
             "gitlab_host": self.gitlab_host,
             "azure_devops_host": self.azure_devops_host,
@@ -620,6 +630,10 @@ fn parse_plugin_config(path: &Path) -> Result<PluginConfig, PluginConfigError> {
             "width" => crate::avatar::Fit::Width,
             _ => return Err(value_error(path, "avatar_fit", expected)),
         };
+    }
+    if let Some(value) = table.get("inline_images") {
+        config.inline_images =
+            value.as_bool().ok_or_else(|| value_error(path, "inline_images", "a boolean"))?;
     }
     if let Some(value) = table.get("github_host") {
         config.github_host = Some(parse_forge_host(path, "github_host", value)?);
@@ -945,6 +959,7 @@ mod tests {
         assert!(config.pane_outer_borders(), "today's framed look by default");
         assert!(!config.pr_nav_separators(), "separators are opt-in");
         assert!(!config.avatars(), "avatars are opt-in");
+        assert!(!config.inline_images(), "inline images are opt-in");
         assert!(config.hyperlinks(), "hyperlinks are on by default");
         assert!(!config.stack_fetch(), "stack fetching is opt-in");
         assert_eq!(config.stack_list_position(), super::StackListPosition::Top);
@@ -975,6 +990,7 @@ mod tests {
                 "avatars = true\n",
                 "avatar_width = 2\n",
                 "avatar_fit = \"width\"\n",
+                "inline_images = true\n",
                 "github_host = \"GitHub.Example.COM\"\n",
             ),
         )
@@ -1003,6 +1019,8 @@ mod tests {
         assert_eq!(config.to_json()["avatar_width"], 2);
         assert_eq!(config.avatar_fit(), crate::avatar::Fit::Width);
         assert_eq!(config.to_json()["avatar_fit"], "width");
+        assert!(config.inline_images());
+        assert_eq!(config.to_json()["inline_images"], true);
         assert_eq!(config.github_host(), Some("github.example.com"));
     }
 
@@ -1112,6 +1130,8 @@ mod tests {
             ("avatar_fit = \"cover\"\n", "`avatar_fit`"),
             ("avatar_fit = \"Height\"\n", "`avatar_fit`"),
             ("avatar_fit = 1\n", "`avatar_fit`"),
+            ("inline_images = \"yes\"\n", "`inline_images`"),
+            ("inline_images = 1\n", "`inline_images`"),
             ("github_host = \"https://github.example.com\"\n", "`github_host`"),
             ("editor = \"\"\n", "`editor`"),
             ("editor = \"   \"\n", "`editor`"),

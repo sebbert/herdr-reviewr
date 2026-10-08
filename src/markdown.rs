@@ -35,6 +35,52 @@ pub struct Rendered {
     pub meta: Vec<LineMeta>,
     /// Each heading's GitHub slug and the rendered line it starts on.
     pub anchors: Vec<(String, usize)>,
+    /// Every fetchable inline image, in document order — empty unless rendered with an
+    /// [`ImageSource`].
+    pub images: Vec<ImageRef>,
+}
+
+/// What the renderer knows about inline images (`crate::images`): the terminal's cell size
+/// and the tallest block, how a destination names its image, and — once an image has landed
+/// and graphics paint — its size. Without one, every image is its `⧉ alt` link.
+pub struct ImageSource<'a> {
+    pub cell: (u16, u16),
+    pub max_rows: u16,
+    /// Anything else `resolve` depends on (the forge's uploads base), for the memo's key.
+    pub salt: String,
+    pub resolve: &'a dyn Fn(&str) -> Option<String>,
+    pub size: &'a dyn Fn(&str) -> Option<(u32, u32)>,
+}
+
+impl std::fmt::Debug for ImageSource<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ImageSource").field("cell", &self.cell).finish_non_exhaustive()
+    }
+}
+
+/// One fetchable image of a render: its URL, the size its layout used (`None`: laid out as
+/// its alt link), and the rendered lines of the block it sits in, `line..end`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ImageRef {
+    pub url: std::sync::Arc<str>,
+    pub size: Option<(u32, u32)>,
+    pub line: usize,
+    pub end: usize,
+}
+
+/// Image cells on one rendered line: display columns `start..end` are row `row`, columns
+/// `col0..` of the image at `url` laid out at `cells`. They render as the alt text until the
+/// painter swaps them for placeholder cells.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ImageSpan {
+    pub start: usize,
+    pub end: usize,
+    pub row: u16,
+    pub col0: usize,
+    pub cells: crate::images::Cells,
+    pub url: std::sync::Arc<str>,
+    /// The image's alt text, which a copy of its first cell carries as `![alt](url)`.
+    pub alt: std::sync::Arc<str>,
 }
 
 /// One rendered line's metadata: the 1-based source line it maps to (its block's first
@@ -45,6 +91,8 @@ pub struct LineMeta {
     pub links: Vec<LinkSpan>,
     /// A `<details>` summary on this line, when the line is that disclosure.
     pub details: Option<DetailsHit>,
+    /// The image cells on this line.
+    pub images: Vec<ImageSpan>,
 }
 
 /// Click target for a `<details>` summary: display columns and the summary text the
@@ -79,6 +127,18 @@ pub fn render_expanded<S: std::hash::BuildHasher>(
     p: &Palette,
     expanded: &HashSet<String, S>,
 ) -> Rendered {
+    render_with_images(text, width, hl, p, expanded, None)
+}
+
+/// Like [`render_expanded`], laying out the images `images` knows about.
+pub fn render_with_images<S: std::hash::BuildHasher>(
+    text: &str,
+    width: usize,
+    hl: &Highlighter,
+    p: &Palette,
+    expanded: &HashSet<String, S>,
+    images: Option<&ImageSource<'_>>,
+) -> Rendered {
     let mut opts = Options::empty();
     opts.insert(Options::ENABLE_TABLES);
     opts.insert(Options::ENABLE_STRIKETHROUGH);
@@ -112,11 +172,16 @@ pub fn render_expanded<S: std::hash::BuildHasher>(
         expanded: &expanded,
         details: Vec::new(),
         skip_relative: false,
+        img_src: images,
+        ready_imgs: Vec::new(),
+        unsettled: Vec::new(),
     };
     for (event, range) in Parser::new_ext(text, opts).into_offset_iter() {
         r.event(event, range);
     }
     r.flush_block(false);
+    let end = r.out.lines.len();
+    r.settle_refs(end);
     r.out
 }
 
@@ -130,7 +195,7 @@ pub struct RenderCache {
     clock: u64,
 }
 
-type CacheKey = (String, usize, Vec<String>);
+type CacheKey = (String, usize, Vec<String>, Option<(u16, u16, u16, String)>);
 
 #[derive(Debug)]
 struct CacheSlot {
@@ -153,15 +218,33 @@ impl RenderCache {
         p: &Palette,
         expanded: &HashSet<String, S>,
     ) -> Rendered {
+        self.get_with_images(text, width, hl, p, expanded, None)
+    }
+
+    /// Like [`Self::get_expanded`], with images. A memoised render is reused only while
+    /// every image in it would still lay out the same — one that has since landed re-renders.
+    pub fn get_with_images<S: std::hash::BuildHasher>(
+        &mut self,
+        text: &str,
+        width: usize,
+        hl: &Highlighter,
+        p: &Palette,
+        expanded: &HashSet<String, S>,
+        images: Option<&ImageSource<'_>>,
+    ) -> Rendered {
         let mut expanded_key: Vec<String> = expanded.iter().cloned().collect();
         expanded_key.sort();
         self.clock += 1;
-        let key = (text.to_string(), width, expanded_key);
-        if let Some(slot) = self.slots.get_mut(&key) {
+        let image_key = images.map(|i| (i.cell.0, i.cell.1, i.max_rows, i.salt.clone()));
+        let key = (text.to_string(), width, expanded_key, image_key);
+        if let Some(slot) = self.slots.get_mut(&key)
+            && images
+                .is_none_or(|i| slot.rendered.images.iter().all(|r| (i.size)(&r.url) == r.size))
+        {
             slot.used = self.clock;
             return slot.rendered.clone();
         }
-        let rendered = render_expanded(text, width, hl, p, expanded);
+        let rendered = render_with_images(text, width, hl, p, expanded, images);
         if self.slots.len() >= CACHE_SLOTS
             && let Some(oldest) =
                 self.slots.iter().min_by_key(|(_, slot)| slot.used).map(|(k, _)| k.clone())
@@ -184,6 +267,21 @@ struct Chunk {
     text: String,
     style: Style,
     link: Option<usize>,
+    /// A landed image this chunk stands for (an index into the block's ready images); its
+    /// text is the alt link it falls back to.
+    image: Option<usize>,
+}
+
+/// A landed image waiting in the block being assembled.
+struct ReadyImage {
+    url: std::sync::Arc<str>,
+    size: (u32, u32),
+    attrs: (Option<u32>, Option<u32>),
+    /// The alt link's text, shown in the block until the picture is on the terminal.
+    chip: String,
+    alt: std::sync::Arc<str>,
+    /// Where a click goes: the link around the image, else the image itself.
+    target: std::sync::Arc<str>,
 }
 
 /// An in-progress code block: the fence's language tag, its content, and whether a
@@ -243,7 +341,15 @@ struct Renderer<'a> {
     expanded: &'a HashSet<String>,
     details: Vec<DetailsFrame>,
     skip_relative: bool,
+    img_src: Option<&'a ImageSource<'a>>,
+    /// The landed images of the block being assembled, indexed by their chunks.
+    ready_imgs: Vec<ReadyImage>,
+    /// The images seen since the last block was emitted, settled onto its lines.
+    unsettled: Vec<SeenImage>,
 }
+
+/// An image seen and not yet settled onto its block: its URL and the size it laid out at.
+type SeenImage = (std::sync::Arc<str>, Option<(u32, u32)>);
 
 /// An open `<details>`: its summary (while collecting), and whether its body is silent.
 struct DetailsFrame {
@@ -459,7 +565,7 @@ impl Renderer<'_> {
     }
 
     fn push_chunk(&mut self, text: String, style: Style, link: Option<usize>) {
-        self.chunks_mut().push(Chunk { text, style, link });
+        self.chunks_mut().push(Chunk { text, style, link, image: None });
     }
 
     /// The innermost open link's url index, stamped onto every chunk inside it.
@@ -512,10 +618,10 @@ impl Renderer<'_> {
         let chunks = self.chunks_mut();
         let alt: String = chunks[start..].iter().map(|c| c.text.as_str()).collect();
         chunks.truncate(start);
-        self.emit_image(alt.trim(), &dest);
+        self.emit_image(alt.trim(), &dest, (None, None));
     }
 
-    fn emit_image(&mut self, alt: &str, dest: &str) {
+    fn emit_image(&mut self, alt: &str, dest: &str, attrs: (Option<u32>, Option<u32>)) {
         if let Some(label) = badge_label(alt) {
             let fg = match label {
                 "P1" => self.p.orange,
@@ -526,17 +632,47 @@ impl Renderer<'_> {
             self.push_chunk(label.to_string(), style, self.current_link());
             return;
         }
+        let raw_dest = dest;
         let alt = sanitize(alt);
         let dest = sanitize(dest);
         let text = if alt.is_empty() { "⧉ image".to_string() } else { format!("⧉ {alt}") };
         let style = Style::default().fg(self.p.dim2);
+        let outer = self.current_link();
         let link = if dest.is_empty() {
-            self.current_link()
+            outer
         } else {
             self.urls.push(std::sync::Arc::from(dest));
             Some(self.urls.len() - 1)
         };
+        // A table cell keeps its alt link: a picture never fits a column.
+        let resolved = self
+            .img_src
+            .filter(|_| self.table.is_none())
+            .and_then(|src| Some((src, (src.resolve)(raw_dest)?)));
+        if let Some((src, url)) = resolved {
+            let url: std::sync::Arc<str> = std::sync::Arc::from(url);
+            let size = (src.size)(&url);
+            self.unsettled.push((url.clone(), size));
+            if let Some(size) = size {
+                let target = outer.map_or_else(|| url.clone(), |i| self.urls[i].clone());
+                let alt = std::sync::Arc::from(alt.as_str());
+                let chip = text.clone();
+                self.ready_imgs.push(ReadyImage { url, size, attrs, chip, alt, target });
+                let image = Some(self.ready_imgs.len() - 1);
+                self.chunks_mut().push(Chunk { text, style, link, image });
+                return;
+            }
+        }
         self.push_chunk(text, style, link);
+    }
+
+    /// Record the images seen since the last block onto the block that just ended at `end`,
+    /// which began at `start` — or, for images no block emitted, an empty block at `end`.
+    fn settle_refs(&mut self, start: usize) {
+        let end = self.out.lines.len();
+        for (url, size) in self.unsettled.drain(..) {
+            self.out.images.push(ImageRef { url, size, line: start.min(end), end });
+        }
     }
 
     fn handle_html(&mut self, html: &str, inline: bool) {
@@ -600,7 +736,8 @@ impl Renderer<'_> {
             ("img", _, _) if self.emitting() && !self.collecting_summary() => {
                 let alt = html_attr(raw, "alt").unwrap_or_default();
                 let src = html_attr(raw, "src").unwrap_or_default();
-                self.emit_image(&alt, &src);
+                let px = |key| html_attr(raw, key).as_deref().and_then(html_pixels);
+                self.emit_image(&alt, &src, (px("width"), px("height")));
             }
             (h @ ("h1" | "h2" | "h3" | "h4" | "h5" | "h6"), false, false)
                 if self.emitting() && !self.collecting_summary() =>
@@ -696,6 +833,16 @@ impl Renderer<'_> {
     /// Emit one rendered line with its metadata; lines and meta stay in lockstep. The
     /// pending heading anchor lands in the anchor list at the block's first line.
     fn push_line(&mut self, line: Line<'static>, links: Vec<LinkSpan>) {
+        self.push_imaged_line(line, links, Vec::new());
+    }
+
+    /// [`Self::push_line`] for a line carrying image cells.
+    fn push_imaged_line(
+        &mut self,
+        line: Line<'static>,
+        links: Vec<LinkSpan>,
+        images: Vec<ImageSpan>,
+    ) {
         if let Some(slug) = self.pending_anchor.take() {
             self.out.anchors.push((slug, self.out.lines.len()));
         }
@@ -703,6 +850,7 @@ impl Renderer<'_> {
             source_line: self.block_src,
             links,
             details: self.pending_details.take(),
+            images,
         });
         self.out.lines.push(line);
     }
@@ -721,6 +869,7 @@ impl Renderer<'_> {
                 source_line: self.block_src,
                 links: Vec::new(),
                 details: None,
+                images: Vec::new(),
             });
             self.out.lines.push(if bars.is_empty() {
                 Line::default()
@@ -736,15 +885,27 @@ impl Renderer<'_> {
     fn flush_block(&mut self, set_blank: bool) {
         if self.inline.iter().all(|c| c.text.trim().is_empty()) {
             self.inline.clear();
+            self.ready_imgs.clear();
+            if set_blank {
+                self.needs_blank = true;
+            }
+            let end = self.out.lines.len();
+            self.settle_refs(end);
+            return;
+        }
+        self.blank_before_block();
+        let start = self.out.lines.len();
+        let marker = self.marker.take();
+        let (first, cont) = self.prefix(marker.as_deref());
+        let chunks = std::mem::take(&mut self.inline);
+        if !self.ready_imgs.is_empty() {
+            self.emit_with_images(chunks, first, &cont);
+            self.settle_refs(start);
             if set_blank {
                 self.needs_blank = true;
             }
             return;
         }
-        self.blank_before_block();
-        let marker = self.marker.take();
-        let (first, cont) = self.prefix(marker.as_deref());
-        let chunks = std::mem::take(&mut self.inline);
         let fragments: Vec<Fragment> =
             chunks.into_iter().map(|c| (c.text, c.style, c.link)).collect();
         let wrapped = wrap_fragments(&fragments, self.budget(first.width()), true);
@@ -764,8 +925,123 @@ impl Renderer<'_> {
             line.extend(spans);
             self.push_line(Line::from(line), link_spans);
         }
+        self.settle_refs(start);
         if set_blank {
             self.needs_blank = true;
+        }
+    }
+
+    /// Emit a block holding landed images. An image one row tall rides in the text like a
+    /// word (a badge); a taller one parts the text around it as rows of its own. Every image
+    /// cell renders its alt text until the painter swaps in placeholders, and links where the
+    /// image does.
+    fn emit_with_images(&mut self, chunks: Vec<Chunk>, first: Span<'static>, cont: &Span<'static>) {
+        let Some(src) = self.img_src else { return };
+        let imgs = std::mem::take(&mut self.ready_imgs);
+        let budget = self.budget(first.width());
+        let mut first = Some(first);
+        let mut run: Vec<Fragment> = Vec::new();
+        // Each inline image's own link id, so its columns come back out of the wrap.
+        let mut inline: std::collections::HashMap<usize, (usize, crate::images::Cells)> =
+            std::collections::HashMap::new();
+        for c in chunks {
+            let Some(i) = c.image else {
+                run.push((c.text, c.style, c.link));
+                continue;
+            };
+            let img = &imgs[i];
+            let cells = crate::images::fit(img.size, img.attrs, src.cell, budget, src.max_rows);
+            if cells.rows <= 1 {
+                self.urls.push(img.target.clone());
+                let id = self.urls.len() - 1;
+                inline.insert(id, (i, cells));
+                run.push((fill(&img.chip, cells.cols, '\u{a0}'), c.style, Some(id)));
+            } else {
+                let before = std::mem::take(&mut run);
+                self.emit_run(&before, &mut first, cont, budget, &inline, &imgs);
+                self.emit_image_block(&imgs[i], cells, c.style, &mut first, cont);
+            }
+        }
+        self.emit_run(&run, &mut first, cont, budget, &inline, &imgs);
+    }
+
+    /// Wrap and emit one run of text and inline images, the first line under the block's
+    /// first prefix while it is unused.
+    fn emit_run(
+        &mut self,
+        run: &[Fragment],
+        first: &mut Option<Span<'static>>,
+        cont: &Span<'static>,
+        budget: usize,
+        inline: &std::collections::HashMap<usize, (usize, crate::images::Cells)>,
+        imgs: &[ReadyImage],
+    ) {
+        let has_image = run.iter().any(|(_, _, l)| l.is_some_and(|l| inline.contains_key(&l)));
+        if !has_image && run.iter().all(|(t, _, _)| t.trim().is_empty()) {
+            return;
+        }
+        let mut consumed: std::collections::HashMap<usize, usize> =
+            std::collections::HashMap::new();
+        for (spans, links) in wrap_fragments(run, budget, true) {
+            let prefix = first.take().unwrap_or_else(|| cont.clone());
+            let off = prefix.width();
+            let mut images = Vec::new();
+            let mut link_spans = Vec::new();
+            for (start, end, id) in links {
+                if let Some((i, cells)) = inline.get(&id) {
+                    let col0 = consumed.entry(id).or_insert(0);
+                    images.push(ImageSpan {
+                        start: start + off,
+                        end: end + off,
+                        row: 0,
+                        col0: *col0,
+                        cells: *cells,
+                        url: imgs[*i].url.clone(),
+                        alt: imgs[*i].alt.clone(),
+                    });
+                    *col0 += end - start;
+                }
+                link_spans.push(LinkSpan {
+                    start: start + off,
+                    end: end + off,
+                    url: self.urls[id].clone(),
+                });
+            }
+            let mut line = vec![prefix];
+            line.extend(spans);
+            self.push_imaged_line(Line::from(line), link_spans, images);
+        }
+    }
+
+    /// Emit one image as rows of its own: the alt text on its first row, blank cells under it.
+    fn emit_image_block(
+        &mut self,
+        img: &ReadyImage,
+        cells: crate::images::Cells,
+        style: Style,
+        first: &mut Option<Span<'static>>,
+        cont: &Span<'static>,
+    ) {
+        let cols = usize::from(cells.cols);
+        for row in 0..cells.rows {
+            let prefix = first.take().unwrap_or_else(|| cont.clone());
+            let off = prefix.width();
+            let text = if row == 0 { fill(&img.chip, cells.cols, ' ') } else { " ".repeat(cols) };
+            let link = LinkSpan { start: off, end: off + cols, url: img.target.clone() };
+            let span = ImageSpan {
+                start: off,
+                end: off + cols,
+                row,
+                col0: 0,
+                cells,
+                url: img.url.clone(),
+                alt: img.alt.clone(),
+            };
+            self.push_imaged_line(
+                Line::from(vec![prefix, Span::styled(text, style)]),
+                vec![link],
+                vec![span],
+            );
         }
     }
 
@@ -1096,6 +1372,33 @@ fn html_tag_name(name: &str) -> String {
     name.trim().to_ascii_lowercase()
 }
 
+/// An `<img>` `width`/`height` attribute in pixels: a number, optionally `px`. A percentage
+/// or anything else sizes nothing.
+fn html_pixels(value: &str) -> Option<u32> {
+    let v = value.trim();
+    let v = v.strip_suffix("px").unwrap_or(v).trim();
+    let n: f64 = v.parse().ok()?;
+    (n.is_finite() && (1.0..=100_000.0).contains(&n)).then(|| n.round() as u32)
+}
+
+/// `chip` cut or padded to exactly `cols` display columns, its spaces as `space` — a
+/// no-break space keeps an inline image one unbreakable word.
+fn fill(chip: &str, cols: u16, space: char) -> String {
+    let cols = usize::from(cols);
+    let mut out = String::new();
+    let mut used = 0;
+    for ch in chip.chars() {
+        let w = char_width(ch);
+        if used + w > cols {
+            break;
+        }
+        used += w;
+        out.push(if ch == ' ' { space } else { ch });
+    }
+    out.extend(std::iter::repeat_n(space, cols - used));
+    out
+}
+
 fn html_attr(tag: &str, key: &str) -> Option<String> {
     let lower = tag.to_ascii_lowercase();
     let needle = format!("{key}=");
@@ -1266,6 +1569,11 @@ impl Wrapper {
         }
         self.word_w = 0;
     }
+}
+
+#[cfg(test)]
+fn char_width_str(s: &str) -> usize {
+    s.chars().map(char_width).sum()
 }
 
 fn char_width(c: char) -> usize {
@@ -1899,5 +2207,167 @@ mod tests {
         assert!(joined.contains("ok"), "{t:?}");
         assert!(!joined.contains("2026-09-16"), "{t:?}");
         assert!(!joined.contains("relative-time"), "{t:?}");
+    }
+
+    /// Render `md` with images: every `http(s)` destination fetchable, the `landed` ones at
+    /// their size, on a 10×20-pixel cell.
+    fn render_imaged(md: &str, width: usize, landed: &[(&str, (u32, u32))]) -> Rendered {
+        let (hl, p) = setup();
+        let resolve = |d: &str| crate::images::resolve(d, None);
+        let size = |u: &str| landed.iter().find(|(l, _)| *l == u).map(|(_, s)| *s);
+        let src = super::ImageSource {
+            cell: (10, 20),
+            max_rows: 20,
+            salt: String::new(),
+            resolve: &resolve,
+            size: &size,
+        };
+        super::render_with_images(md, width, &hl, &p, &HashSet::new(), Some(&src))
+    }
+
+    #[test]
+    fn markdown_and_html_images_are_found_with_their_attributes() {
+        let md = concat!(
+            "Intro ![shot](https://img.example/a.png) text.\n\n",
+            "<img alt=\"diagram\" src=\"https://img.example/d.svg\" width=\"300\" height=\"100px\">\n\n",
+            "<img src='https://img.example/w.png' width=\"50%\">\n\n",
+            "![rel](docs/local.png) ![data](data:image/png;base64,AAAA)\n",
+        );
+        let r = render_imaged(md, 80, &[]);
+        let urls: Vec<&str> = r.images.iter().map(|i| &*i.url).collect();
+        assert_eq!(
+            urls,
+            ["https://img.example/a.png", "https://img.example/d.svg", "https://img.example/w.png"],
+            "only fetchable destinations"
+        );
+        assert!(r.images.iter().all(|i| i.size.is_none()), "nothing landed");
+        // Unlanded, every image is today's alt link, linked to its url.
+        let plain = render(md, 80, &setup().0, &setup().1);
+        assert_eq!(texts(&r.lines), texts(&plain.lines));
+        assert!(texts(&r.lines).iter().any(|l| l == "⧉ diagram"));
+        assert!(r.meta.iter().all(|m| m.images.is_empty()));
+        // Attribute parsing: px and bare numbers; percentages and junk size nothing.
+        assert_eq!(super::html_pixels("300"), Some(300));
+        assert_eq!(super::html_pixels(" 100px "), Some(100));
+        assert_eq!(super::html_pixels("50%"), None);
+        assert_eq!(super::html_pixels("auto"), None);
+        assert_eq!(super::html_pixels("0"), None);
+        // The attributes size a landed image: 300×100 px is 30×5 cells, whatever its pixels.
+        let r = render_imaged(md, 80, &[("https://img.example/d.svg", (3000, 3000))]);
+        let span = r.meta.iter().flat_map(|m| &m.images).next().unwrap();
+        assert_eq!(span.cells, crate::images::Cells { cols: 30, rows: 5 });
+    }
+
+    #[test]
+    fn a_landed_image_takes_a_block_of_rows_with_its_alt_on_the_first() {
+        let url = "https://img.example/a.png";
+        let md = format!("Before.\n\n![shot]({url})\n\nAfter.");
+        let r = render_imaged(&md, 60, &[(url, (400, 200))]);
+        let t = texts(&r.lines);
+        assert_eq!(t[0], "Before.");
+        assert_eq!(t[2].trim_end(), "⧉ shot", "the alt text until the picture is painted");
+        let rows: Vec<_> =
+            r.meta.iter().enumerate().filter(|(_, m)| !m.images.is_empty()).collect();
+        assert_eq!(rows.len(), 10, "200 px is ten 20-px rows");
+        for (n, (line, m)) in rows.iter().enumerate() {
+            let span = &m.images[0];
+            assert_eq!((span.start, span.end, span.row, span.col0), (0, 40, n as u16, 0));
+            assert_eq!(&*span.url, url);
+            assert_eq!(&*m.links[0].url, url, "every image row links to the image");
+            assert_eq!(*line, 2 + n);
+            assert_eq!(super::char_width_str(&t[*line]), 40);
+        }
+        assert_eq!(t[13], "After.");
+        assert_eq!(
+            r.images,
+            vec![super::ImageRef { url: url.into(), size: Some((400, 200)), line: 2, end: 12 }]
+        );
+        // Too wide for the pane: scaled to its width, aspect kept.
+        let r = render_imaged(&md, 20, &[(url, (400, 200))]);
+        let span = r.meta.iter().flat_map(|m| &m.images).next().unwrap();
+        assert_eq!(span.cells, crate::images::Cells { cols: 20, rows: 5 });
+    }
+
+    #[test]
+    fn a_badge_rides_inline_and_a_large_image_parts_the_text() {
+        let badge = "https://img.shields.io/badge/ci-passing-green.svg";
+        let shot = "https://img.example/shot.png";
+        let md = format!(
+            "[![ci]({badge})](https://ci.example/run) status, see ![screen]({shot}) below."
+        );
+        let r = render_imaged(&md, 60, &[(badge, (90, 20)), (shot, (100, 60))]);
+        let t = texts(&r.lines);
+        // The badge is a one-row word in the first line, linked where its link goes.
+        let first = &r.meta[0];
+        assert_eq!(first.images.len(), 1);
+        let b = &first.images[0];
+        assert_eq!((b.start, b.end, b.row, b.cells.rows), (0, 9, 0, 1));
+        let link = first.links.iter().find(|l| l.start == 0).unwrap();
+        assert_eq!(&*link.url, "https://ci.example/run");
+        assert!(t[0].ends_with("status, see"), "{t:?}");
+        // The screenshot (3 rows) parts the paragraph; the text resumes after it.
+        let shot_rows: Vec<_> =
+            r.meta.iter().filter(|m| m.images.iter().any(|i| &*i.url == shot)).collect();
+        assert_eq!(shot_rows.len(), 3);
+        assert_eq!(t.last().unwrap(), "below.");
+        // Badges in a row stay one line of text.
+        let md = format!("![a]({badge}) ![b]({badge}) ![c]({badge})");
+        let r = render_imaged(&md, 60, &[(badge, (90, 20))]);
+        assert_eq!(r.lines.len(), 1);
+        let starts: Vec<usize> = r.meta[0].images.iter().map(|i| i.start).collect();
+        assert_eq!(starts, [0, 10, 20]);
+        // Wrapping keeps a badge whole on the next line.
+        let r = render_imaged(&md, 15, &[(badge, (90, 20))]);
+        assert_eq!(r.lines.len(), 3);
+        assert!(
+            r.meta.iter().all(|m| m.images.len() == 1 && m.images[0].end - m.images[0].start == 9)
+        );
+    }
+
+    #[test]
+    fn images_in_tables_lists_and_quotes_lay_out_under_their_prefix() {
+        let url = "https://img.example/a.png";
+        let r =
+            render_imaged(&format!("| a |\n|---|\n| ![x]({url}) |\n"), 60, &[(url, (400, 200))]);
+        assert!(r.meta.iter().all(|m| m.images.is_empty()), "a table cell keeps its alt link");
+        assert!(r.images.is_empty());
+        let r = render_imaged(&format!("- ![x]({url})\n"), 60, &[(url, (100, 40))]);
+        let spans: Vec<_> = r.meta.iter().flat_map(|m| &m.images).collect();
+        assert_eq!(spans.len(), 2);
+        assert!(spans.iter().all(|s| s.start == 2), "after the marker, then under it");
+        assert!(
+            text_of(&r.lines[0]).starts_with("• ") || text_of(&r.lines[0]).starts_with("- "),
+            "{:?}",
+            texts(&r.lines)
+        );
+        let r = render_imaged(&format!("> ![x]({url})\n"), 60, &[(url, (100, 40))]);
+        let rows: Vec<_> =
+            r.lines.iter().zip(&r.meta).filter(|(_, m)| !m.images.is_empty()).collect();
+        assert_eq!(rows.len(), 2);
+        assert!(rows.iter().all(|(l, m)| text_of(l).starts_with("▎ ") && m.images[0].start == 2));
+    }
+
+    #[test]
+    fn the_memo_re_renders_a_body_once_its_image_lands() {
+        let (hl, p) = setup();
+        let url = "https://img.example/a.png";
+        let md = format!("![x]({url})");
+        let landed = std::cell::Cell::new(false);
+        let resolve = |d: &str| crate::images::resolve(d, None);
+        let size = |u: &str| (landed.get() && u == url).then_some((100, 40));
+        let src = super::ImageSource {
+            cell: (10, 20),
+            max_rows: 20,
+            salt: String::new(),
+            resolve: &resolve,
+            size: &size,
+        };
+        let mut cache = RenderCache::default();
+        let before = cache.get_with_images(&md, 60, &hl, &p, &HashSet::new(), Some(&src));
+        assert_eq!(before.lines.len(), 1);
+        landed.set(true);
+        let after = cache.get_with_images(&md, 60, &hl, &p, &HashSet::new(), Some(&src));
+        assert_eq!(after.lines.len(), 2, "the landed image's block, not the memo's alt line");
+        assert_eq!(cache.get(&md, 60, &hl, &p).lines.len(), 1, "without images: the alt link");
     }
 }
