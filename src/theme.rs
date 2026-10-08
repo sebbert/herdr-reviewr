@@ -67,14 +67,15 @@ pub struct Palette {
     /// plain row, a syntax-colored row, and the preview's banded hit line alike.
     pub match_hl: Color,
     /// The text-selection highlight, live and settled: a cool fill distinct by hue from the
-    /// `surface1`/`surface2` row fills, so a selection reads inside a cursor row in any pane
+    /// neutral cursor fills, so a selection reads inside a cursor row in any pane
     pub sel_bg: Color,
-    /// The row of the PR the `PR` tab is showing, in the navigator's stack: a violet tint
-    /// apart by hue from the neutral cursor fills, the blue selection, the diff fills, and
-    /// the warm search match.
+    /// The row of the PR the tab is showing, in a stack list: a faint violet over the
+    /// background, at the unfocused list cursor's brightness, apart by hue from the neutral
+    /// cursor fills, the blue selection, the diff fills, and the warm search match.
     pub view_bg: Color,
-    /// The same row under the navigator cursor: the violet at full strength, so the cursor
-    /// still reads there and the row still says it is the one showing.
+    /// The same row under the list cursor: the same faint violet over the focused list
+    /// cursor's `surface0`, so the cursor still reads there and the row still says it is the
+    /// one showing.
     pub view_cursor_bg: Color,
 }
 
@@ -84,6 +85,15 @@ impl Palette {
     /// ("Strongest", not "brightest": light themes step surfaces toward black, not white.)
     pub fn cursor_bg(&self, focused: bool) -> Color {
         if focused { self.surface2 } else { self.surface1 }
+    }
+
+    /// A list's cursor-row fill — the file and PR navigators, the stack list, the overlay
+    /// lists and pickers, the search results. Subtle, the way herdr's own space and agent
+    /// lists select: `surface0` (herdr's `selection_bg`) in the focused pane, halfway from the
+    /// background to it when not, so the focus still reads without the row shouting. The
+    /// diff and read panes keep [`Self::cursor_bg`]: their cursor marks one line among many.
+    pub fn list_cursor_bg(&self, focused: bool) -> Color {
+        if focused { self.surface0 } else { blend(self.base, self.surface0, 0.5) }
     }
 
     /// Lift a painted color onto a selection fill. The dim role (`dim2`) sits one surface
@@ -206,8 +216,22 @@ fn catppuccin() -> Theme {
             match_hl: Color::Rgb(0x5c, 0x51, 0x2b),
             sel_bg: Color::Rgb(0x35, 0x3d, 0x7d),
             // Later slots, derived the way every other theme derives them.
-            view_bg: row_tint(MOCHA_BASE, MOCHA_PURPLE, MOCHA_TEXT, VIEW_TINT),
-            view_cursor_bg: row_tint(MOCHA_SURFACE2, MOCHA_PURPLE, MOCHA_TEXT, VIEW_CURSOR_TINT),
+            view_bg: view_fill(
+                MOCHA_BASE,
+                MOCHA_SURFACE0,
+                MOCHA_SURFACE1,
+                MOCHA_PURPLE,
+                MOCHA_TEXT,
+            )
+            .0,
+            view_cursor_bg: view_fill(
+                MOCHA_BASE,
+                MOCHA_SURFACE0,
+                MOCHA_SURFACE1,
+                MOCHA_PURPLE,
+                MOCHA_TEXT,
+            )
+            .1,
         },
         syntax: SyntaxChoice::Bundled(MOCHA_TM),
     }
@@ -216,7 +240,8 @@ fn catppuccin() -> Theme {
 const MOCHA_BASE: Color = Color::Rgb(0x1e, 0x1e, 0x2e);
 const MOCHA_TEXT: Color = Color::Rgb(0xcd, 0xd6, 0xf4);
 const MOCHA_PURPLE: Color = Color::Rgb(0xcb, 0xa6, 0xf7);
-const MOCHA_SURFACE2: Color = Color::Rgb(0x58, 0x5b, 0x70);
+const MOCHA_SURFACE0: Color = Color::Rgb(0x31, 0x32, 0x44);
+const MOCHA_SURFACE1: Color = Color::Rgb(0x45, 0x47, 0x5a);
 
 /// A theme whose palette is derived from `anchors`, paired with a bundled `.tmTheme`'s bytes.
 fn bundled(
@@ -346,8 +371,8 @@ fn derive(a: Anchors, appearance: Appearance) -> Palette {
         emph_ins_bg: readable_tint(a.green, a.base, a.text, appearance, true),
         match_hl: readable_tint(a.yellow, a.base, a.text, appearance, true),
         sel_bg: readable_tint(saturated(a.blue), a.base, a.text, appearance, true),
-        view_bg: row_tint(a.base, a.purple, a.text, VIEW_TINT),
-        view_cursor_bg: row_tint(surface(0.14), a.purple, a.text, VIEW_CURSOR_TINT),
+        view_bg: view_fill(a.base, surface(0.045), surface(0.09), a.purple, a.text).0,
+        view_cursor_bg: view_fill(a.base, surface(0.045), surface(0.09), a.purple, a.text).1,
     }
 }
 
@@ -409,28 +434,47 @@ fn readable_tint(
     base
 }
 
-/// The viewed-row fill's tint strength, over the background.
-const VIEW_TINT: f64 = 0.22;
-/// The viewed row's tint under the cursor, over the cursor's own fill.
-const VIEW_CURSOR_TINT: f64 = 0.30;
+/// The viewed-row fill's tint strength, over the background: faint, a hue more than a fill.
+const VIEW_TINT: f64 = 0.12;
+/// The viewed row's tint under the cursor, over the list cursor's own `surface0`.
+const VIEW_CURSOR_TINT: f64 = 0.12;
 /// The weakest tint a row marker steps down to: the mark must never vanish into the fill it
 /// tints, which would leave the viewed row indistinguishable from its neighbours or the cursor.
-const MIN_ROW_TINT: f64 = 0.08;
+const MIN_ROW_TINT: f64 = 0.03;
 /// The contrast a row marker keeps for the row's text — the bar the surface fills meet, not
 /// the diff fills' higher one, since a marked row holds bold UI text, not code.
 const MIN_ROW_CONTRAST: f64 = 3.0;
 
+/// The viewed row's two fills, `(alone, under the cursor)`: a faint violet over the
+/// background and over the focused list cursor's `surface0`. Each steps no further from the
+/// background than the list fill it pairs with — the alone fill than `surface0`, the cursor
+/// fill than halfway to `surface1` — so a violet that darkens a light theme fast stays as
+/// subtle as the neutral cursor rows around it.
+fn view_fill(
+    base: Color,
+    surface0: Color,
+    surface1: Color,
+    accent: Color,
+    fg: Color,
+) -> (Color, Color) {
+    let alone = row_tint(base, accent, fg, VIEW_TINT, contrast(surface0, base), base);
+    let ceiling = contrast(blend(surface0, surface1, 0.5), base);
+    let under = row_tint(surface0, accent, fg, VIEW_CURSOR_TINT, ceiling, base);
+    (alone, under)
+}
+
 /// A row-marker fill: `from` tinted toward the saturated `accent`, as strong as `start`
-/// while `fg` keeps [`MIN_ROW_CONTRAST`], never weaker than [`MIN_ROW_TINT`].
-fn row_tint(from: Color, accent: Color, fg: Color, start: f64) -> Color {
+/// while `fg` keeps [`MIN_ROW_CONTRAST`] and the fill steps no further from `base` than
+/// `ceiling` (as contrast against it), never weaker than [`MIN_ROW_TINT`].
+fn row_tint(from: Color, accent: Color, fg: Color, start: f64, ceiling: f64, base: Color) -> Color {
     let accent = saturated(accent);
     let mut t = start;
     while t > MIN_ROW_TINT {
         let fill = blend(from, accent, t);
-        if contrast(fg, fill) >= MIN_ROW_CONTRAST {
+        if contrast(fg, fill) >= MIN_ROW_CONTRAST && contrast(fill, base) <= ceiling {
             return fill;
         }
-        t -= 0.02;
+        t -= 0.01;
     }
     blend(from, accent, MIN_ROW_TINT)
 }
@@ -525,6 +569,13 @@ mod tests {
         // The selection fill: saturated `blue` tinted over `base` at emphasis strength — a
         // real hue, nothing near the gray `surface1`/`surface2` cursor fills.
         assert_eq!(p.sel_bg, Color::Rgb(0x35, 0x3d, 0x7d));
+        // The list cursors match herdr's catppuccin selection: `surface0`, and a half step.
+        assert_eq!(p.list_cursor_bg(true), Color::Rgb(0x31, 0x32, 0x44));
+        assert_eq!(p.list_cursor_bg(false), Color::Rgb(0x28, 0x28, 0x39));
+        // The viewed stack row: a faint violet over the background, and over `surface0`
+        // under the cursor.
+        assert_eq!(p.view_bg, Color::Rgb(0x2e, 0x24, 0x47));
+        assert_eq!(p.view_cursor_bg, Color::Rgb(0x3e, 0x36, 0x5a));
     }
 
     #[test]
@@ -649,20 +700,65 @@ mod tests {
     fn the_viewed_row_reads_apart_from_the_cursor_and_from_itself_under_it() {
         for &(name, _) in NAMED {
             let p = resolve(Some(name)).palette;
-            let fills = [p.cursor_bg(true), p.cursor_bg(false), p.view_bg, p.view_cursor_bg];
+            let fills =
+                [p.list_cursor_bg(true), p.list_cursor_bg(false), p.view_bg, p.view_cursor_bg];
             for (i, a) in fills.iter().enumerate() {
                 for b in &fills[i + 1..] {
                     assert_ne!(a, b, "{name}: two row treatments share a fill");
                 }
+                // Every row treatment is a visible fill, and none passes for a text selection.
+                assert_ne!(*a, p.base, "{name}: a row treatment vanishes into the background");
+                assert_ne!(*a, p.sel_bg, "{name}: a row treatment reads as a text selection");
             }
             // 3:1 like the surface fills, or within a tenth of the fill it tints where that
             // fill itself sits near the floor.
-            for (fill, under) in [(p.view_bg, p.base), (p.view_cursor_bg, p.surface2)] {
+            for (fill, under) in [(p.view_bg, p.base), (p.view_cursor_bg, p.surface0)] {
                 let floor = super::MIN_ROW_CONTRAST.min(0.9 * contrast(p.text, under));
                 assert!(
                     contrast(p.text, fill) >= floor,
                     "{name}: the viewed row's text drops below its legibility floor",
                 );
+            }
+        }
+    }
+
+    /// How far a fill steps away from the background, as contrast against it.
+    fn step(p: &Palette, fill: Color) -> f64 {
+        contrast(fill, p.base)
+    }
+
+    #[test]
+    fn list_cursors_and_the_viewed_row_stay_subtle_and_legible() {
+        for &(name, _) in NAMED {
+            let p = resolve(Some(name)).palette;
+            // herdr's selection role: the focused list cursor is `surface0`, the unfocused one a
+            // half step from the background toward it — focus reads, nothing shouts.
+            assert_eq!(p.list_cursor_bg(true), p.surface0, "{name}");
+            let (focused, unfocused) = (p.list_cursor_bg(true), p.list_cursor_bg(false));
+            assert!(step(&p, unfocused) < step(&p, focused), "{name}: unfocused is softer");
+            assert!(step(&p, unfocused) > 1.0, "{name}: unfocused still shows");
+            // The viewed row's two fills sit at the list cursor's level — below `surface1`,
+            // far below the old `surface2` cursor they used to tint.
+            for fill in [focused, unfocused, p.view_bg, p.view_cursor_bg] {
+                assert!(
+                    step(&p, fill) < step(&p, p.surface1),
+                    "{name}: {fill:?} is brighter than a subtle row fill",
+                );
+            }
+            // The viewed row under the cursor still reads stronger than the viewed row alone.
+            assert!(step(&p, p.view_cursor_bg) > step(&p, p.view_bg), "{name}");
+            // A selected row's text and its lifted secondary text read at least as well as
+            // they did on the old `surface2` cursor, and the text keeps the row floor.
+            let dim = p.on_fill(p.dim2);
+            let (text_before, dim_before) =
+                (contrast(p.text, p.surface2), contrast(dim, p.surface2));
+            for fill in [focused, unfocused, p.view_bg, p.view_cursor_bg] {
+                let text = contrast(p.text, fill);
+                assert!(
+                    text >= text_before.max(super::MIN_ROW_CONTRAST),
+                    "{name}: text on {fill:?}"
+                );
+                assert!(contrast(dim, fill) >= dim_before, "{name}: secondary text on {fill:?}");
             }
         }
     }

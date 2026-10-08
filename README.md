@@ -445,8 +445,9 @@ Move onto a stack row with `j`/`k` and press `Enter` (or click it) to view that 
 checks, description, and conversation. Nothing is checked out, and nothing outside the PR tab
 changes. The file tabs, the branch scope's base, and your comments stay with the checked-out
 branch. The header says `viewing #12 · not checked out` while you look. The row of the PR on
-screen, checked out or not, is filled with a violet tint, a step stronger when the cursor
-sits on it. The list stays the checked-out PR's stack whichever PR you view. `o` opens the PR
+screen, checked out or not, carries a faint violet tint, a step stronger when the cursor
+sits on it. List cursors are as subtle as herdr's own space and agent lists: the theme's
+`surface0` in the focused pane, half that step when the pane is not focused. The list stays the checked-out PR's stack whichever PR you view. `o` opens the PR
 you are viewing. `0` (`checked-out-pr`), or the checked-out PR's own row, takes you back to
 where you were on it.
 

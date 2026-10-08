@@ -1841,7 +1841,7 @@ fn render_file_list(frame: &mut Frame, app: &App, pane: Pane) {
         .take(inner.height as usize)
         .map(|(i, row)| {
             // The selected row fills with the cursor color, dimmed when the list is unfocused.
-            let fill = (i == app.file_cursor).then(|| p.cursor_bg(app.focus == Focus::Files));
+            let fill = (i == app.file_cursor).then(|| p.list_cursor_bg(app.focus == Focus::Files));
             let nest = "  ".repeat(row.depth);
             match &row.kind {
                 RowKind::Dir { expanded, has_change, .. } => {
@@ -3316,7 +3316,7 @@ fn render_comments_list(frame: &mut Frame, app: &App, area: Rect) {
                 spans.push(Span::styled("  (stale)", Style::default().fg(p.red)));
             }
             // The list overlay is the active modal, so its row reads at full brightness.
-            selectable_row(p, spans, width, (i == app.list_cursor).then_some(p.surface2))
+            selectable_row(p, spans, width, (i == app.list_cursor).then(|| p.list_cursor_bg(true)))
         })
         .collect();
     frame.render_widget(List::new(items), inner);
@@ -3465,7 +3465,7 @@ fn render_agent_picker(frame: &mut Frame, app: &App, area: Rect) {
                 p,
                 spans,
                 inner.width as usize,
-                (i == app.picker_cursor).then_some(p.surface2),
+                (i == app.picker_cursor).then(|| p.list_cursor_bg(true)),
             )
         })
         .collect();
@@ -3640,7 +3640,7 @@ fn render_base_picker(frame: &mut Frame, app: &App, area: Rect) {
                     Style::default().fg(p.dim2),
                 ));
             }
-            selectable_row(p, spans, width, (vi == bp.cursor).then_some(p.surface2))
+            selectable_row(p, spans, width, (vi == bp.cursor).then(|| p.list_cursor_bg(true)))
         })
         .collect();
     frame.render_widget(List::new(items), list_area);
@@ -3832,7 +3832,7 @@ fn render_commit_picker(frame: &mut Frame, app: &App, area: Rect) {
                     Style::default().fg(p.dim2),
                 ),
             ];
-            selectable_row(p, spans, width, (i == cp.cursor).then_some(p.surface2))
+            selectable_row(p, spans, width, (i == cp.cursor).then(|| p.list_cursor_bg(true)))
         })
         .collect();
     // A clipped list says so, like the search screen's results.
@@ -4010,7 +4010,7 @@ fn render_stack_list(frame: &mut Frame, app: &App, pane: Pane) {
             let under = focused && i == cursor;
             let fill = match (under, row.head) {
                 (true, true) => Some(p.view_cursor_bg),
-                (true, false) => Some(p.cursor_bg(true)),
+                (true, false) => Some(p.list_cursor_bg(true)),
                 (false, true) => Some(p.view_bg),
                 (false, false) => None,
             };
@@ -4284,7 +4284,7 @@ fn render_search_results(
             }
             SearchRow::File(i) => {
                 let hit = &s.results.files[*i];
-                let fill = (s.pick == *i).then_some(p.surface2);
+                let fill = (s.pick == *i).then(|| p.list_cursor_bg(true));
                 file_row_item(
                     &FileRowSpec {
                         indent: "",
@@ -4300,7 +4300,7 @@ fn render_search_results(
             }
             SearchRow::Code(i) => {
                 let hit = &s.results.code[*i];
-                let fill = (s.pick == *i).then_some(p.surface2);
+                let fill = (s.pick == *i).then(|| p.list_cursor_bg(true));
                 search_code_row(hit, width, fill, p)
             }
         })
@@ -4828,7 +4828,7 @@ fn render_pr_nav(frame: &mut Frame, app: &App, pane: Pane) {
             // so the cursor and "this is what you're looking at" both read on one row.
             let fill = match (row.selected(app), row.viewed) {
                 (true, true) => Some(p.view_cursor_bg),
-                (true, false) => Some(p.cursor_bg(true)),
+                (true, false) => Some(p.list_cursor_bg(true)),
                 (false, true) => Some(p.view_bg),
                 (false, false) => None,
             };

@@ -564,15 +564,26 @@ fn the_diff_cursor_row_is_marked_from_either_pane() {
     );
 }
 
+/// Catppuccin surface0 — the focused list cursor, herdr's own `selection_bg`.
+const LIST_CURSOR_BG: ratatui::style::Color = ratatui::style::Color::Rgb(0x31, 0x32, 0x44);
+/// Halfway from Catppuccin base to surface0 — the list cursor in an unfocused pane.
+const LIST_CURSOR_SOFT_BG: ratatui::style::Color = ratatui::style::Color::Rgb(0x28, 0x28, 0x39);
+
 #[test]
-fn the_selected_file_row_fills_with_the_shared_selection_color() {
-    let app = edited_app(); // one file, file_cursor = 0, Files focused
-    let buf = render_buffer(&app);
+fn the_selected_file_row_fills_with_the_subtle_list_cursor() {
+    let mut app = edited_app(); // one file, file_cursor = 0, Files focused
     // Files pane: right 32% of 140 cols; its border is at y=1, first content row at y=2.
     let files_x0 = 140 - 140 * 32 / 100 + 1;
-    let selected =
-        (files_x0..139).filter(|&x| buf.cell((x, 2)).is_some_and(|c| c.bg == SELECTION_BG)).count();
-    assert!(selected > 10, "the selected file row fills wide with surface2: {selected} cells");
+    let filled = |app: &App, bg| {
+        let buf = render_buffer(app);
+        (files_x0..139).filter(|&x| buf.cell((x, 2)).is_some_and(|c| c.bg == bg)).count()
+    };
+    assert!(filled(&app, LIST_CURSOR_BG) > 10, "the focused list fills its row with surface0");
+    assert_eq!(filled(&app, SELECTION_BG), 0, "never the diff cursor's surface2");
+    // Focus on the diff: the list keeps its row, a half step softer.
+    app.focus = Focus::Diff;
+    assert!(filled(&app, LIST_CURSOR_SOFT_BG) > 10, "the unfocused list softens its cursor");
+    assert_eq!(filled(&app, LIST_CURSOR_BG), 0);
 }
 
 #[test]
@@ -5255,7 +5266,7 @@ fn the_shown_prs_stack_row_is_filled_and_reads_apart_under_the_cursor() {
         app.pr_view_stack_row(0);
         let buf = render_size(&app, 140, 30);
         assert_eq!(bg_at(&buf, "#12 open"), p.view_cursor_bg, "{borders:?}");
-        assert_ne!(p.view_cursor_bg, p.cursor_bg(true));
+        assert_ne!(p.view_cursor_bg, p.list_cursor_bg(true));
         assert_ne!(bg_at(&buf, "#11 open"), p.view_bg, "the fill moved with the view");
         let header = dump(&buf).lines().next().unwrap().to_string();
         assert!(header.contains("viewing #12 · not checked out"), "{header}");
@@ -5264,7 +5275,7 @@ fn the_shown_prs_stack_row_is_filled_and_reads_apart_under_the_cursor() {
         app.pr_move(1);
         let buf = render_size(&app, 140, 30);
         assert_eq!(bg_at(&buf, "#12 open"), p.view_bg);
-        assert_eq!(bg_at(&buf, "#11 open"), p.cursor_bg(true));
+        assert_eq!(bg_at(&buf, "#11 open"), p.list_cursor_bg(true));
         let text = dump(&buf);
         let home = line_with(&text, "#11 open");
         assert!(home.contains("● #11") && home.contains("checked out"), "{text}");
@@ -6667,4 +6678,37 @@ fn the_default_style_keeps_the_words_in_their_six_cell_column() {
     assert!(cells.iter().all(|c| c.2 == app.palette().green));
     // `#12 open   pr 12 title`: the word padded to six cells and a space, as before.
     assert!(dump(&buf).contains("#12 open   pr 12 title"), "{}", dump(&buf));
+}
+
+#[test]
+fn the_pr_navigator_and_the_comments_list_select_with_the_subtle_list_cursor() {
+    use herdr_reviewr::forge::{Comment, PrSnapshot, PrView};
+    let mut app = edited_app();
+    // An overlay list: the comments list's cursor row.
+    composing(&mut app);
+    for ch in "LIST_ROW".chars() {
+        app.input_push(ch);
+    }
+    app.submit_comment();
+    app.open_list();
+    let buf = render_buffer(&app);
+    assert_eq!(bg_at(&buf, "hello.rs:2  LIST_ROW"), LIST_CURSOR_BG, "{}", dump(&buf));
+    app.close_list();
+
+    // The PR navigator's selected comment row.
+    app.set_tab(Tab::Pr).unwrap();
+    app.apply_pr(PrView::Pr(Box::new(PrSnapshot {
+        comments: vec![
+            Comment { author: "nav_first".into(), ..common::comment() },
+            Comment {
+                author: "nav_second".into(),
+                created_at: "2026-06-27T11:00:00Z".into(),
+                ..common::comment()
+            },
+        ],
+        ..common::pr_snapshot()
+    })));
+    let buf = render_buffer(&app);
+    assert_eq!(bg_at(&buf, "@nav_first comment"), LIST_CURSOR_BG, "{}", dump(&buf));
+    assert_ne!(bg_at(&buf, "@nav_second comment"), LIST_CURSOR_BG);
 }
