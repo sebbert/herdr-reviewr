@@ -66,7 +66,7 @@ impl Config {
     }
 }
 
-const PLUGIN_CONFIG_KEYS: [&str; 24] = [
+const PLUGIN_CONFIG_KEYS: [&str; 25] = [
     "theme",
     "default_scope",
     "navigator_position",
@@ -79,6 +79,7 @@ const PLUGIN_CONFIG_KEYS: [&str; 24] = [
     "hyperlinks",
     "stack_fetch",
     "stack_list_position",
+    "pr_state_style",
     "avatars",
     "avatar_width",
     "avatar_fit",
@@ -92,6 +93,31 @@ const PLUGIN_CONFIG_KEYS: [&str; 24] = [
     "url_opener",
     "keybindings",
 ];
+
+/// The `pr_state_style` values, as the value error names them.
+const PR_STATE_STYLES: &str = "\"word\", \"letter\", or \"nerd\"";
+
+/// How a stack PR's state paints: the word, one letter, or a Nerd Font Octicon.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum PrStateStyle {
+    /// The word: `open`, `draft`, `merged`, `closed`, in a six-cell column.
+    #[default]
+    Word,
+    /// One uppercase letter: `O`, `D`, `M`, `C`.
+    Letter,
+    /// The GitHub Octicons from a Nerd Font.
+    Nerd,
+}
+
+impl PrStateStyle {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Word => "word",
+            Self::Letter => "letter",
+            Self::Nerd => "nerd",
+        }
+    }
+}
 
 /// Where the stack list sits in the navigator: above the file list, or below it.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -239,6 +265,8 @@ pub struct PluginConfig {
     stack_fetch: bool,
     /// Where the stack list sits in the navigator.
     stack_list_position: StackListPosition,
+    /// How a stack PR's state paints.
+    pr_state_style: PrStateStyle,
     /// Opt-in: paint each PR conversation turn's dot as the author's avatar where the
     /// terminal speaks the Kitty graphics protocol.
     avatars: bool,
@@ -276,6 +304,7 @@ impl Default for PluginConfig {
             hyperlinks: true,
             stack_fetch: false,
             stack_list_position: StackListPosition::Top,
+            pr_state_style: PrStateStyle::Word,
             avatars: false,
             avatar_width: 1,
             avatar_fit: crate::avatar::Fit::Height,
@@ -341,6 +370,10 @@ impl PluginConfig {
 
     pub fn stack_list_position(&self) -> StackListPosition {
         self.stack_list_position
+    }
+
+    pub fn pr_state_style(&self) -> PrStateStyle {
+        self.pr_state_style
     }
 
     pub fn avatars(&self) -> bool {
@@ -427,6 +460,7 @@ impl PluginConfig {
             "hyperlinks": self.hyperlinks,
             "stack_fetch": self.stack_fetch,
             "stack_list_position": self.stack_list_position.as_str(),
+            "pr_state_style": self.pr_state_style.as_str(),
             "avatars": self.avatars,
             "avatar_width": self.avatar_width,
             "avatar_fit": self.avatar_fit.as_str(),
@@ -620,6 +654,15 @@ fn parse_plugin_config(path: &Path) -> Result<PluginConfig, PluginConfigError> {
     if let Some(value) = table.get("stack_fetch") {
         config.stack_fetch =
             value.as_bool().ok_or_else(|| value_error(path, "stack_fetch", "a boolean"))?;
+    }
+    if let Some(value) = table.get("pr_state_style") {
+        config.pr_state_style = match string_value(path, "pr_state_style", value, PR_STATE_STYLES)?
+        {
+            "word" => PrStateStyle::Word,
+            "letter" => PrStateStyle::Letter,
+            "nerd" => PrStateStyle::Nerd,
+            _ => return Err(value_error(path, "pr_state_style", PR_STATE_STYLES)),
+        };
     }
     if let Some(value) = table.get("stack_list_position") {
         config.stack_list_position =
@@ -1003,6 +1046,7 @@ mod tests {
         assert!(config.hyperlinks(), "hyperlinks are on by default");
         assert!(!config.stack_fetch(), "stack fetching is opt-in");
         assert_eq!(config.stack_list_position(), super::StackListPosition::Top);
+        assert_eq!(config.pr_state_style(), super::PrStateStyle::Word, "today's words");
         assert_eq!(config.avatar_width(), 1);
         assert_eq!(config.avatar_fit(), crate::avatar::Fit::Height);
         assert_eq!(config.github_host(), None);
@@ -1027,6 +1071,7 @@ mod tests {
                 "hyperlinks = false\n",
                 "stack_fetch = true\n",
                 "stack_list_position = \"bottom\"\n",
+                "pr_state_style = \"nerd\"\n",
                 "avatars = true\n",
                 "avatar_width = 2\n",
                 "avatar_fit = \"width\"\n",
@@ -1055,6 +1100,8 @@ mod tests {
         assert_eq!(config.to_json()["stack_fetch"], true);
         assert_eq!(config.stack_list_position(), super::StackListPosition::Bottom);
         assert_eq!(config.to_json()["stack_list_position"], "bottom");
+        assert_eq!(config.pr_state_style(), super::PrStateStyle::Nerd);
+        assert_eq!(config.to_json()["pr_state_style"], "nerd");
         assert!(config.avatars());
         assert_eq!(config.avatar_width(), 2);
         assert_eq!(config.to_json()["avatars"], true);
@@ -1168,6 +1215,8 @@ mod tests {
             ("stack_fetch = \"yes\"\n", "`stack_fetch`"),
             ("stack_list_position = \"left\"\n", "`stack_list_position`"),
             ("stack_list_position = true\n", "`stack_list_position`"),
+            ("pr_state_style = \"icon\"\n", "`pr_state_style`"),
+            ("pr_state_style = 1\n", "`pr_state_style`"),
             ("avatars = \"yes\"\n", "`avatars`"),
             ("avatar_width = 0\n", "`avatar_width`"),
             ("avatar_width = 3\n", "`avatar_width`"),
@@ -1476,6 +1525,7 @@ mod tests {
         assert_eq!(object["pr_nav_separators"], false);
         assert_eq!(object["stack_fetch"], false);
         assert_eq!(object["stack_list_position"], "top");
+        assert_eq!(object["pr_state_style"], "word");
         assert!(object["github_host"].is_null());
         let keybindings = object["keybindings"].as_object().unwrap();
         assert_eq!(

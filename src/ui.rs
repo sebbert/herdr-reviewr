@@ -2773,6 +2773,27 @@ mod tests {
         }
     }
 
+    #[test]
+    fn the_nerd_font_state_icons_are_one_cell_and_the_width_pass_leaves_them_alone() {
+        use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
+        let p = crate::theme::resolve(None).palette;
+        let states = [
+            (crate::forge::PrState::Open, false, "\u{f407}", "O"),
+            (crate::forge::PrState::Open, true, "\u{f4dd}", "D"),
+            (crate::forge::PrState::Merged, false, "\u{f419}", "M"),
+            (crate::forge::PrState::Closed, false, "\u{f4dc}", "C"),
+        ];
+        for (state, draft, icon, letter) in states {
+            use crate::config::PrStateStyle::{Letter, Nerd};
+            assert_eq!(super::stack_state(&p, Nerd, state, draft).0, icon);
+            assert_eq!(super::stack_state(&p, Letter, state, draft).0, letter);
+            // Private Use Area: one cell however it is measured, so nothing to settle.
+            assert_eq!(icon.width(), 1);
+            assert_eq!(icon.chars().next().unwrap().width(), Some(1));
+            assert_eq!(super::unambiguous_symbol(icon), None, "{icon:?}");
+        }
+    }
+
     use super::*;
     #[test]
     fn relative_age_buckets_by_magnitude() {
@@ -3882,22 +3903,12 @@ fn stack_list_line(
     let mut used = lead.width();
     let role_w = if role.is_empty() { 0 } else { 2 + role.width() };
     if let Some((state, draft)) = row.state {
-        let entry = forge::StackEntry {
-            number: 0,
-            title: String::new(),
-            state,
-            is_draft: draft,
-            head_ref: String::new(),
-            base_ref: String::new(),
-            url: None,
-            level: 0,
-        };
-        let (word, color) = stack_state(p, &entry);
+        let (glyph, color) = stack_state(p, app.pr_state_style(), state, draft);
         let number = format!("{} ", row.label);
         used += number.width();
         spans.push(Span::styled(number, Style::default().fg(p.yellow)));
-        // A narrow pane drops the state word before the role can clip.
-        let state = format!("{word:<6} ");
+        // A narrow pane drops the state before the role can clip.
+        let state = state_column(app.pr_state_style(), glyph);
         if width >= used + state.width() + role_w {
             used += state.width();
             spans.push(Span::styled(state, Style::default().fg(color)));
@@ -4729,14 +4740,10 @@ fn pr_status_word(s: &forge::PrSnapshot) -> &'static str {
     }
 }
 
-/// The status chip word and its theme accent, by lifecycle.
+/// The status chip word and its theme accent, by lifecycle. The header keeps the word — the
+/// chip reads as `open #12 ↗` — in the stack rows' GitHub colours.
 fn pr_status_chip(p: &Palette, s: &forge::PrSnapshot) -> (&'static str, Color) {
-    let color = match s.state {
-        forge::PrState::Merged => p.purple,
-        forge::PrState::Closed => p.red,
-        forge::PrState::Open if s.is_draft => p.yellow,
-        forge::PrState::Open => p.green,
-    };
+    let (_, color) = stack_state(p, crate::config::PrStateStyle::Letter, s.state, s.is_draft);
     (pr_status_word(s), color)
 }
 
@@ -4948,7 +4955,7 @@ fn push_stack_rows(rows: &mut Vec<PrNavRow>, app: &App, stack: &[forge::StackEnt
     let shown = app.pr_shown_number();
     let outside = shape.native.as_ref().map(|s| format!("not in stack #{}", s.number));
     for (i, entry) in stack.iter().rev().enumerate() {
-        let (word, color) = stack_state(p, entry);
+        let (glyph, color) = stack_state(p, app.pr_state_style(), entry.state, entry.is_draft);
         let (mark, mark_color, tag) = if checked_out == Some(entry.number) {
             ("●", p.green, "checked out")
         } else if !member(entry.number) {
@@ -4960,7 +4967,8 @@ fn push_stack_rows(rows: &mut Vec<PrNavRow>, app: &App, stack: &[forge::StackEnt
         let marked = !tag.is_empty() || viewed;
         let lead = format!(" {mark} ");
         let number = format!("{}{} ", app.pr_forge.sigil(), entry.number);
-        let state = format!("{word:<6} ");
+        // One cell and a space, so the titles line up whatever the state.
+        let state = state_column(app.pr_state_style(), glyph);
         let used = lead.width() + number.width() + state.width();
         // The tag keeps its room only while the title still gets a readable minimum.
         let tag_w = if !tag.is_empty() && width >= used + 2 + tag.width() + 8 {
@@ -5000,13 +5008,40 @@ fn push_stack_rows(rows: &mut Vec<PrNavRow>, app: &App, stack: &[forge::StackEnt
     }
 }
 
-/// A stack row's lifecycle word and accent, in the header chip's vocabulary.
-fn stack_state(p: &Palette, e: &forge::StackEntry) -> (&'static str, Color) {
-    match e.state {
-        forge::PrState::Merged => ("merged", p.purple),
-        forge::PrState::Closed => ("closed", p.red),
-        forge::PrState::Open if e.is_draft => ("draft", p.yellow),
-        forge::PrState::Open => ("open", p.green),
+/// A stack PR's state and its GitHub colour: open green, draft grey, merged purple, closed
+/// red. `word` paints the lifecycle word; `letter` `O`/`D`/`M`/`C`; `nerd` the Nerd Font Octicons
+/// (`nf-oct-git_pull_request`, `_draft`, `nf-oct-git_merge`, `nf-oct-git_pull_request_closed`).
+/// The icons are Private Use Area codepoints, one cell wide in every measure, so the
+/// emoji-width pass leaves them alone and a column of them keeps the titles aligned.
+fn stack_state(
+    p: &Palette,
+    style: crate::config::PrStateStyle,
+    state: forge::PrState,
+    draft: bool,
+) -> (&'static str, Color) {
+    use crate::config::PrStateStyle::{Letter, Nerd, Word};
+    match (state, draft, style) {
+        (forge::PrState::Merged, _, Word) => ("merged", p.purple),
+        (forge::PrState::Closed, _, Word) => ("closed", p.red),
+        (forge::PrState::Open, true, Word) => ("draft", p.dim2),
+        (forge::PrState::Open, false, Word) => ("open", p.green),
+        (forge::PrState::Merged, _, Letter) => ("M", p.purple),
+        (forge::PrState::Merged, _, Nerd) => ("\u{f419}", p.purple),
+        (forge::PrState::Closed, _, Letter) => ("C", p.red),
+        (forge::PrState::Closed, _, Nerd) => ("\u{f4dc}", p.red),
+        (forge::PrState::Open, true, Letter) => ("D", p.dim2),
+        (forge::PrState::Open, true, Nerd) => ("\u{f4dd}", p.dim2),
+        (forge::PrState::Open, false, Letter) => ("O", p.green),
+        (forge::PrState::Open, false, Nerd) => ("\u{f407}", p.green),
+    }
+}
+
+/// The state column's text: a word padded to the six cells the longest takes, as before the
+/// compact styles, or the one-cell glyph — each with its space — so the titles line up.
+fn state_column(style: crate::config::PrStateStyle, glyph: &str) -> String {
+    match style {
+        crate::config::PrStateStyle::Word => format!("{glyph:<6} "),
+        _ => format!("{glyph} "),
     }
 }
 

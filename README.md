@@ -253,6 +253,7 @@ pr_nav_separators = true
 hyperlinks = false
 stack_fetch = true
 stack_list_position = "bottom"
+pr_state_style = "nerd"
 avatars = true
 inline_images = true
 inline_image_width = "native"
@@ -425,11 +426,20 @@ checked-out branch's PR wears a filled `●` and a `checked out` tag:
 
 ```text
 stack · 3
-   #12 open   Add the settings page
+   #12 draft  Add the settings page
  ● #11 open   Add the settings API    checked out
    #10 merged Add the settings table
    └ main
 ```
+
+The state is in GitHub's colours: open green, draft grey, merged purple, closed red.
+`pr_state_style` picks how it paints. `"word"`, the default, is the word. `"letter"` is one
+cell: `O`, `D`, `M`, `C`. With a [Nerd Font](https://www.nerdfonts.com/) in your terminal,
+`"nerd"` paints GitHub's own pull request icons: `nf-oct-git_pull_request` (U+F407),
+`nf-oct-git_pull_request_draft` (U+F4DD), `nf-oct-git_merge` (U+F419), and
+`nf-oct-git_pull_request_closed` (U+F4DC). Every style keeps the titles lined up. The navigator's stack
+list on the Changes and All files tabs uses the same cell. The PR header keeps its word, as in
+`open #11 ↗`, in the same colours.
 
 Move onto a stack row with `j`/`k` and press `Enter` (or click it) to view that PR: its state,
 checks, description, and conversation. Nothing is checked out, and nothing outside the PR tab

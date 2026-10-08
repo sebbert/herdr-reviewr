@@ -7,6 +7,18 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ## [Unreleased]
 
 ### Added
+- **Stack PR states in GitHub's colours, and compact styles.** The PR tab's stack section and
+  the navigator's stack list paint a stack PR's state in GitHub's colours from every theme
+  (open green, draft grey, merged purple, closed red). `pr_state_style` (validated like every
+  key and in `--resolve-plugin-config`) picks the paint: `"word"`, the default, keeps the words
+  in their six-cell column, so the layout is unchanged; `"letter"` is one cell, `O`, `D`, `M`,
+  or `C`; `"nerd"` paints the Nerd Font Octicons, checked against Nerd Fonts'
+  `glyphnames.json`: U+F407 `nf-oct-git_pull_request`, U+F4DD `nf-oct-git_pull_request_draft`,
+  U+F419 `nf-oct-git_merge`, U+F4DC `nf-oct-git_pull_request_closed`. The compact styles are
+  one cell and a space, so the titles line up. The icons are Private Use Area codepoints, one
+  cell in every measure, so the emoji-width pass leaves them alone; a replayed terminal shows
+  no drifted cell around them. The PR header keeps its word (`open #12 ↗` reads as a phrase
+  and has the room), now in the same colours, so a draft is grey there too rather than yellow.
 - **Opt-in inline images on the PR tab.** With `inline_images = true` (off by default,
   validated like every key and in `--resolve-plugin-config`), the description's and comments'
   images, `![alt](url)` and HTML `<img src width height alt>`, paint as pictures through the

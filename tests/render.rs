@@ -6560,3 +6560,111 @@ fn an_image_resizing_above_the_reader_leaves_their_view_still() {
     assert_eq!(read(&mut app), before);
     assert_eq!(app.pr_read_scroll(), scroll);
 }
+
+// --- PR state glyphs ------------------------------------------------------------------
+
+/// The stack app with all four states: #13 closed, #12 draft, #11 open (checked out),
+/// #10 merged.
+fn four_state_app(style: &str) -> (Repo, App) {
+    use herdr_reviewr::forge::{PrState, PrView, StackEntry};
+    let (r, mut app) = stack_render_app(true);
+    with_config(&mut app, &format!("pr_state_style = \"{style}\"\n"));
+    let mut home = app.pr_checked_out_snapshot().unwrap().clone();
+    home.stack[0].state = PrState::Merged;
+    home.stack[2].is_draft = true;
+    home.stack.push(StackEntry {
+        number: 13,
+        title: "pr 13 title".into(),
+        state: PrState::Closed,
+        is_draft: false,
+        head_ref: "head-13".into(),
+        base_ref: "head-12".into(),
+        level: 2,
+        url: None,
+    });
+    app.apply_pr(PrView::Pr(Box::new(home)));
+    (r, app)
+}
+
+/// Each stack row's state cell and colour, and the column its title starts at.
+fn state_cells(buf: &Buffer) -> Vec<(u64, String, ratatui::style::Color, usize)> {
+    let text = dump(buf);
+    let mut out = Vec::new();
+    for n in [13u64, 12, 11, 10] {
+        let label = format!("#{n} ");
+        // Below the header, whose chip names the checked-out PR too.
+        let Some(y) = text.lines().skip(1).position(|l| l.contains(&label)).map(|y| y + 1) else {
+            continue;
+        };
+        let line = text.lines().nth(y).unwrap();
+        let x = line[..line.find(&label).unwrap()].chars().count() + label.chars().count();
+        let cell = &buf[(u16::try_from(x).unwrap(), u16::try_from(y).unwrap())];
+        // The state's text: the cells from there up to the column's trailing space.
+        let state: String = line.chars().skip(x).take_while(|c| *c != ' ').collect();
+        let title = format!("pr {n} title");
+        let title_x =
+            line[..line.find(&title).unwrap_or_else(|| panic!("{title}:\n{text}"))].chars().count();
+        out.push((n, state, cell.fg, title_x));
+    }
+    out
+}
+
+#[test]
+fn stack_states_paint_as_one_coloured_cell_in_both_styles_and_both_views() {
+    for (style, glyphs) in [
+        ("word", ["closed", "draft", "open", "merged"]),
+        ("letter", ["C", "D", "O", "M"]),
+        ("nerd", ["\u{f4dc}", "\u{f4dd}", "\u{f407}", "\u{f419}"]),
+    ] {
+        let (_r, mut app) = four_state_app(style);
+        let p = *app.palette();
+        let colours = [p.red, p.dim2, p.green, p.purple];
+        for tab in [Tab::Changes, Tab::Pr] {
+            app.set_tab(tab).unwrap();
+            let buf = render_buffer(&app);
+            let cells = state_cells(&buf);
+            assert_eq!(cells.len(), 4, "{style} {tab:?}:\n{}", dump(&buf));
+            for (i, (n, symbol, fg, _)) in cells.iter().enumerate() {
+                assert_eq!(symbol, glyphs[i], "{style} {tab:?} #{n}");
+                assert_eq!(*fg, colours[i], "{style} {tab:?} #{n}");
+            }
+            let titles: Vec<usize> = cells.iter().map(|c| c.3).collect();
+            assert!(
+                titles.windows(2).all(|w| w[0] == w[1]),
+                "{style} {tab:?}: titles align {titles:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn nerd_state_icons_paint_where_ratatui_put_them_in_a_grapheme_aware_terminal() {
+    for tab in [Tab::Changes, Tab::Pr] {
+        for borders in ["", "pane_outer_borders = false\n"] {
+            let (_r, mut app) = four_state_app("nerd");
+            if !borders.is_empty() {
+                with_config(&mut app, &format!("pr_state_style = \"nerd\"\n{borders}"));
+            }
+            app.set_tab(tab).unwrap();
+            let bad = replay_scrolled(&mut app, 100, 30, 2);
+            assert!(
+                bad.is_empty(),
+                "{tab:?} {borders:?}: drifted cells {:?}",
+                &bad[..bad.len().min(4)]
+            );
+        }
+    }
+}
+
+#[test]
+fn the_default_style_keeps_the_words_in_their_six_cell_column() {
+    let (_r, mut app) = stack_render_app(true);
+    app.set_tab(Tab::Pr).unwrap();
+    let buf = render_buffer(&app);
+    let cells = state_cells(&buf);
+    let words: Vec<&str> = cells.iter().map(|c| c.1.as_str()).collect();
+    assert_eq!(words, ["open", "open", "open"], "{}", dump(&buf));
+    assert!(cells.iter().all(|c| c.2 == app.palette().green));
+    // `#12 open   pr 12 title`: the word padded to six cells and a space, as before.
+    assert!(dump(&buf).contains("#12 open   pr 12 title"), "{}", dump(&buf));
+}

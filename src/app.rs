@@ -2580,6 +2580,13 @@ impl App {
             .unwrap_or_default()
     }
 
+    /// How a stack PR's state paints: the config's `pr_state_style`, letters while the config
+    /// is blocked.
+    #[must_use]
+    pub fn pr_state_style(&self) -> crate::config::PrStateStyle {
+        self.plugin_config().map(crate::config::PluginConfig::pr_state_style).unwrap_or_default()
+    }
+
     /// Whether the painted frame carries OSC 8 hyperlinks — the config's `hyperlinks`, on
     /// while the config is blocked (its screen carries none anyway).
     #[must_use]
