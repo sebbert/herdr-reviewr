@@ -229,7 +229,7 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 - **Inline images on a private GitHub repository's files, in `<picture>`, and in `<details>`.**
-  A diagram-bot bot comment's diagrams stayed alt links. The comment links them as
+  A bot comment's diagrams stayed alt links. It links them as
   `github.com/<o>/<r>/raw/<ref>/<path>` inside `<a href><picture>`, inside a `<details open>`
   with more `<details>` nested. Decisions:
   - **Raw file URLs.** On a GitHub PR, `github.com/<o>/<r>/raw/<ref>/<path>` and

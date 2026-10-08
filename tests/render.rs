@@ -6392,9 +6392,9 @@ fn an_image_landing_above_the_reader_leaves_their_view_still() {
 }
 
 const DIAGRAM_BOT: &str = include_str!("fixtures/diagram_bot_comment.md");
-const LENS_RAW: &str = "https://raw.githubusercontent.com/o/r/diagrams/7/0123abcd";
+const DIAGRAM_RAW: &str = "https://raw.githubusercontent.com/o/r/diagrams/7/0123abcd";
 
-/// A GitHub PR whose one comment is the diagram-bot bot's: pictures in an open `<details>`, a
+/// A GitHub PR whose one comment is a diagram bot's: pictures in an open `<details>`, a
 /// nested closed one, and a closed one after it.
 fn diagram_bot_app() -> App {
     use herdr_reviewr::forge::{Comment, PrSnapshot, PrView};
@@ -6416,7 +6416,7 @@ fn a_diagram_bot_comment_paints_its_open_picture_from_the_raw_file_with_the_toke
     let _ = render_buffer(&app);
     let requests = app.image_requests();
     // The default theme is dark: the dark source, at its raw URL, with github.com's token.
-    let want = format!("{LENS_RAW}/containers-dark-bb22.svg");
+    let want = format!("{DIAGRAM_RAW}/containers-dark-bb22.svg");
     assert_eq!(requests.len(), 1, "closed details fetch nothing: {requests:?}");
     assert_eq!(requests[0].url, want);
     assert_eq!(requests[0].token_host.as_deref(), Some("github.com"));
@@ -6434,7 +6434,7 @@ fn a_diagram_bot_comment_paints_its_open_picture_from_the_raw_file_with_the_toke
     app.toggle_details("Sorting components");
     let _ = render_buffer(&app);
     let next: Vec<String> = app.image_requests().into_iter().map(|r| r.url).collect();
-    assert_eq!(next, [format!("{LENS_RAW}/components-dark-dd44.svg")]);
+    assert_eq!(next, [format!("{DIAGRAM_RAW}/components-dark-dd44.svg")]);
 }
 
 #[test]
@@ -6443,5 +6443,5 @@ fn a_light_theme_takes_the_pictures_light_source() {
     app.set_cli_theme(Some("github-light".into()));
     let _ = render_buffer(&app);
     let urls: Vec<String> = app.image_requests().into_iter().map(|r| r.url).collect();
-    assert_eq!(urls, [format!("{LENS_RAW}/containers-light-aa11.svg")]);
+    assert_eq!(urls, [format!("{DIAGRAM_RAW}/containers-light-aa11.svg")]);
 }

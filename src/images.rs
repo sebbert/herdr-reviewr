@@ -537,9 +537,9 @@ mod tests {
     #[test]
     fn github_file_pages_resolve_to_the_raw_file_a_token_can_fetch() {
         let gh = Base { uploads: None, github: Some("github.com") };
-        let diagram_bot = "https://github.com/o/r/raw/diagrams/7/abc/c-light-1f.svg";
+        let file_page = "https://github.com/o/r/raw/diagrams/7/abc/c-light-1f.svg";
         assert_eq!(
-            resolve(diagram_bot, gh).as_deref(),
+            resolve(file_page, gh).as_deref(),
             Some("https://raw.githubusercontent.com/o/r/diagrams/7/abc/c-light-1f.svg")
         );
         for (url, want) in [
@@ -572,7 +572,7 @@ mod tests {
         );
         assert_eq!(github_raw("https://github.com/o/r/raw/main/a.svg", "ghe.corp"), None);
         // Not a GitHub PR: no rewrite.
-        assert_eq!(resolve(diagram_bot, Base::default()).as_deref(), Some(diagram_bot));
+        assert_eq!(resolve(file_page, Base::default()).as_deref(), Some(file_page));
     }
 
     #[test]

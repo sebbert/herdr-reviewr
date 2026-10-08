@@ -2456,7 +2456,7 @@ mod tests {
 
     /// Render the diagram-bot fixture as a GitHub PR's comment under `theme`, with `expanded`
     /// summaries flipped and every image landed at 1284×600.
-    fn render_lens(theme: &str, expanded: &[&str]) -> Rendered {
+    fn render_diagram_bot(theme: &str, expanded: &[&str]) -> Rendered {
         let t = theme::resolve(Some(theme));
         let hl = Highlighter::new(t.syntax);
         let base = crate::images::Base { uploads: None, github: Some("github.com") };
@@ -2479,7 +2479,7 @@ mod tests {
 
     #[test]
     fn an_open_details_renders_its_picture_and_a_closed_one_waits_for_its_expand() {
-        let r = render_lens("catppuccin-latte", &[]);
+        let r = render_diagram_bot("catppuccin-latte", &[]);
         let t = texts(&r.lines);
         assert!(t.iter().any(|l| l == "▾ Pipeline containers"), "authored open: {t:#?}");
         assert!(t.iter().any(|l| l == "▸ Sorting components"), "nested, closed: {t:#?}");
@@ -2503,7 +2503,7 @@ mod tests {
         assert!(t.iter().any(|l| l.contains("The intake boundary connects")));
 
         // Expanding the nested and the closed one renders their pictures too.
-        let r = render_lens("catppuccin-latte", &["Sorting components", "Intake flow"]);
+        let r = render_diagram_bot("catppuccin-latte", &["Sorting components", "Intake flow"]);
         assert_eq!(
             urls(&r),
             [
@@ -2513,7 +2513,7 @@ mod tests {
             ]
         );
         // The expand state flips an authored-open one shut, and its nested one with it.
-        let r = render_lens("catppuccin-latte", &["Pipeline containers", "Sorting components"]);
+        let r = render_diagram_bot("catppuccin-latte", &["Pipeline containers", "Sorting components"]);
         let t = texts(&r.lines);
         assert!(t.iter().any(|l| l == "▸ Pipeline containers"), "{t:#?}");
         assert!(!t.iter().any(|l| l.contains("Sorting components")));
@@ -2522,7 +2522,7 @@ mod tests {
 
     #[test]
     fn a_picture_takes_the_source_for_the_themes_scheme_else_its_img() {
-        let dark = render_lens("catppuccin", &[]);
+        let dark = render_diagram_bot("catppuccin", &[]);
         assert_eq!(urls(&dark), [format!("{RAW}/containers-dark-bb22.svg")]);
         let span = dark.meta.iter().flat_map(|m| &m.images).next().unwrap();
         assert_eq!(&*span.alt, "Pipeline containers", "the <img>'s alt");
