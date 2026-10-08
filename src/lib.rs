@@ -919,6 +919,8 @@ struct GraphicsHost {
     probe_sent: bool,
     avatars: Option<crate::avatar::Fetcher>,
     images: Option<crate::graphics::Fetcher<crate::images::Prepared>>,
+    /// Sharp SVG re-rasters, off the frame loop.
+    rasterizer: Option<crate::images::Rasterizer>,
     /// Images went out after the last draw: the next frame paints them without waiting.
     repaint: bool,
 }
@@ -949,6 +951,11 @@ impl GraphicsHost {
         if let Some(fetcher) = &self.images {
             while let Some((url, image)) = fetcher.try_recv() {
                 app.images.land(url, image);
+            }
+        }
+        if let Some(rasterizer) = &self.rasterizer {
+            while let Some(done) = rasterizer.try_recv() {
+                app.images.land_sharp(done);
             }
         }
         if app.avatar_cols().is_none() {
@@ -999,9 +1006,16 @@ impl GraphicsHost {
                 fetcher.request_with(request);
             }
         }
-        let (bytes, sent) = app.images.place(&painted);
-        write_terminal(&bytes);
-        self.repaint = sent;
+        let cell = app.cell_px.unwrap_or(crate::graphics::FALLBACK_CELL);
+        let placed = app.images.place(&painted, cell, Instant::now());
+        write_terminal(&placed.bytes);
+        self.repaint = placed.sent;
+        if !placed.rasters.is_empty() {
+            let rasterizer = self.rasterizer.get_or_insert_with(crate::images::Rasterizer::spawn);
+            for job in placed.rasters {
+                rasterizer.request(job);
+            }
+        }
     }
 
     /// Whether the loop should keep waking for graphics work: the probe's window, or
@@ -1011,7 +1025,8 @@ impl GraphicsHost {
         wanted
             && (self.probe.waiting()
                 || (app.avatars_wanted() && app.avatars.pending())
-                || (app.inline_images_wanted() && app.images.pending()))
+                || (app.inline_images_wanted()
+                    && (app.images.pending() || app.images.sharp_pending())))
     }
 
     /// Swallow a key that is part of the probe's reply, which the input parser reads as an
@@ -1105,6 +1120,8 @@ fn event_loop(terminal: &mut Term, app: &mut App, cfg: &Config, kbd: bool) -> Re
     let mut status_at = Instant::now();
     let mut last_status = String::new();
     let mut graphics = GraphicsHost::default();
+    // An event read while draining a resize burst, handled on the next pass.
+    let mut pending_event: Option<Event> = None;
     // Fetch the PR snapshot as soon as the panel opens, not on first switching to the tab, so the
     // tab is already populated when the user gets there.
     app.pr_pending = None;
@@ -1554,11 +1571,14 @@ fn event_loop(terminal: &mut Term, app: &mut App, cfg: &Config, kbd: bool) -> Re
             if app.gesture_active() && mouse_exited {
                 timeout = timeout.min(EXIT_DEADLINE.saturating_sub(last_mouse.elapsed()));
             }
-            if event::poll(timeout)? {
+            if pending_event.is_some() || event::poll(timeout)? {
                 if !painted_frame.still_current(app) {
                     continue;
                 }
-                let event = event::read()?;
+                let event = match pending_event.take() {
+                    Some(event) => event,
+                    None => event::read()?,
+                };
                 if graphics.swallows(&event) {
                     continue;
                 }
@@ -1618,6 +1638,17 @@ fn event_loop(terminal: &mut Term, app: &mut App, cfg: &Config, kbd: bool) -> Re
                     }
                     Event::Resize(_, _) => {
                         handle_resize(app);
+                        // A drag sends a burst: take every resize already queued, so the
+                        // burst draws once. The first other event waits for the next pass.
+                        while event::poll(Duration::ZERO)? {
+                            match event::read()? {
+                                Event::Resize(_, _) => {}
+                                other => {
+                                    pending_event = Some(other);
+                                    break;
+                                }
+                            }
+                        }
                     }
                     _ => {}
                 }
@@ -2275,9 +2306,9 @@ fn handle_resize(app: &mut App) {
     app.cancel_gesture();
     app.clear_settled_selection();
     app.hover = None;
-    // A resize can change the cell size and may drop images: measure again and re-send.
-    app.avatars.forget_sent();
-    app.images.forget_sent();
+    // Images persist in the terminal by id; a resize only moves placements, which the next
+    // frame does. The cell size is measured again before that frame: only a changed one (a
+    // font change) re-sends avatars, at their new geometry.
     app.cell_px = None;
 }
 
@@ -3932,5 +3963,46 @@ mod refresh_tests {
         assert_eq!(recovery_epoch, epoch);
         assert_eq!(target.theme(), "gruvbox");
         assert_eq!(recovered.plugin_config().unwrap().theme(), "gruvbox");
+    }
+}
+
+#[cfg(test)]
+mod resize_tests {
+    use crate::app::App;
+    use crate::model::Scope;
+
+    #[test]
+    fn a_resize_resends_no_avatar_and_no_inline_image() {
+        let mut app = App::new(std::path::PathBuf::from("."), Scope::Uncommitted, None);
+        let g = crate::avatar::geometry((10, 20), 1, crate::avatar::Fit::Height);
+        app.avatars.mark_requested("a");
+        let face = image::RgbaImage::from_pixel(8, 8, image::Rgba([1, 2, 3, 255]));
+        app.avatars.land("a".into(), Some(face));
+        assert!(!app.avatars.transmissions(g).is_empty());
+        let shot = crate::images::Prepared {
+            size: (120, 60),
+            raster: (120, 60),
+            pixels: 7200,
+            payload: std::sync::Arc::from("QUJD"),
+            svg: None,
+        };
+        app.images.land("i".into(), Some(shot));
+        let cells = crate::images::Cells { cols: 12, rows: 3 };
+        let now = std::time::Instant::now();
+        assert!(app.images.place(&[("i".into(), cells)], (10, 20), now).sent);
+
+        // A burst of resizes at one cell size: the avatar at the same geometry and the image at
+        // a new footprint go out as nothing and as a placement.
+        for _ in 0..20 {
+            super::handle_resize(&mut app);
+        }
+        assert!(app.avatars.transmissions(g).is_empty(), "the avatar is still there");
+        let wider = crate::images::Cells { cols: 30, rows: 8 };
+        let moved = app.images.place(&[("i".into(), wider)], (10, 20), now);
+        let seq = String::from_utf8(moved.bytes).unwrap();
+        assert!(seq.starts_with("\x1b_Ga=p,") && !seq.contains("a=t"), "{seq:?}");
+        // A changed cell size (a font change) re-sends the avatar at its new geometry.
+        let bigger = crate::avatar::geometry((12, 24), 1, crate::avatar::Fit::Height);
+        assert!(!app.avatars.transmissions(bigger).is_empty());
     }
 }

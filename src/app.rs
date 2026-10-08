@@ -2440,7 +2440,14 @@ impl App {
         let source = (self.tab == Tab::Pr && self.inline_images_wanted()).then(|| {
             crate::markdown::ImageSource {
                 cell: self.cell_px.unwrap_or(crate::graphics::FALLBACK_CELL),
-                max_rows: crate::images::MAX_ROWS,
+                max_rows: crate::images::row_cap(self.plugin_config().map_or(
+                    crate::images::DEFAULT_MAX_ROWS,
+                    crate::config::PluginConfig::inline_image_max_rows,
+                )),
+                width: self
+                    .plugin_config()
+                    .map(crate::config::PluginConfig::inline_image_width)
+                    .unwrap_or_default(),
                 salt: format!("{}|{}", base.uploads.unwrap_or(""), base.github.unwrap_or("")),
                 resolve: &resolve,
                 size: &size,
@@ -2690,13 +2697,13 @@ impl App {
         std::mem::take(&mut *self.painted_images.borrow_mut())
     }
 
-    /// The image id that paints `url` at `cells`, once the terminal holds it.
+    /// The image id that paints `url`, once the terminal holds it.
     #[must_use]
-    pub(crate) fn image_id(&self, url: &str, cells: crate::images::Cells) -> Option<u32> {
+    pub(crate) fn image_id(&self, url: &str) -> Option<u32> {
         if !self.inline_images_paint() {
             return None;
         }
-        self.images.placed_id(url, cells)
+        self.images.placed_id(url)
     }
 
     /// Note an avatar URL on a turn painted this frame.

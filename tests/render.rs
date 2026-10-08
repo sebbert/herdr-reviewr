@@ -6198,10 +6198,17 @@ fn a_cut_stack_shows_more_below_in_the_navigator_stack_list() {
     assert!(out.contains("Stack · 3"), "the cut row is no PR: {out}");
 }
 
-/// Load a config with inline images on, the terminal's graphics answer `graphics`.
+/// Load a config with inline images on at their own size, the terminal's graphics answer
+/// `graphics`.
 fn with_inline_images(app: &mut App, graphics: Option<bool>) {
+    with_inline_images_config(app, graphics, "inline_image_width = \"native\"\n");
+}
+
+/// Load a config with inline images on plus `extra` keys, the graphics answer `graphics`.
+fn with_inline_images_config(app: &mut App, graphics: Option<bool>, extra: &str) {
     let dir = tempfile::tempdir().unwrap();
-    std::fs::write(dir.path().join("config.toml"), "inline_images = true\n").unwrap();
+    let config = format!("inline_images = true\n{extra}");
+    std::fs::write(dir.path().join("config.toml"), config).unwrap();
     app.set_plugin_config(herdr_reviewr::config::plugin_config_in(dir.path()).unwrap());
     app.graphics = graphics;
     app.cell_px = Some((10, 20));
@@ -6226,14 +6233,20 @@ fn image_pr_app() -> App {
 }
 
 fn prepared(size: (u32, u32)) -> herdr_reviewr::images::Prepared {
-    herdr_reviewr::images::Prepared { size, pixels: 100, payload: std::sync::Arc::from("QUJD") }
+    herdr_reviewr::images::Prepared {
+        size,
+        raster: size,
+        pixels: 100,
+        payload: std::sync::Arc::from("QUJD"),
+        svg: None,
+    }
 }
 
 /// Render, put what the frame painted on the terminal as the loop would, render again.
 fn render_placed(app: &mut App) -> Buffer {
     let _ = render_buffer(app);
     let painted = app.take_painted_images();
-    let _ = app.images.place(&painted);
+    let _ = app.images.place(&painted, (10, 20), std::time::Instant::now());
     render_buffer(app)
 }
 
@@ -6285,8 +6298,7 @@ fn a_landed_image_paints_its_block_of_placeholder_cells_once_on_the_terminal() {
     assert!(!first.contains(herdr_reviewr::graphics::PLACEHOLDER));
 
     let buf = render_placed(&mut app);
-    let shot = herdr_reviewr::images::Cells { cols: 12, rows: 3 };
-    let id = app.images.placed_id(SHOT, shot).expect("placed");
+    let id = app.images.placed_id(SHOT).expect("placed");
     let (r, g, b) = herdr_reviewr::graphics::id_rgb(id);
     let cells: Vec<(u16, u16)> = (0..buf.area.height)
         .flat_map(|y| (0..buf.area.width).map(move |x| (x, y)))
@@ -6302,8 +6314,7 @@ fn a_landed_image_paints_its_block_of_placeholder_cells_once_on_the_terminal() {
     assert!(out.contains("Intro line.") && out.contains("Outro line."));
     assert!(!out.contains("⧉ the screen"), "the picture replaced its alt");
     // The badge rides its comment's line, then the text.
-    let badge = herdr_reviewr::images::Cells { cols: 9, rows: 1 };
-    let bid = app.images.placed_id(BADGE, badge).expect("the badge placed too");
+    let bid = app.images.placed_id(BADGE).expect("the badge placed too");
     let (r, g, b) = herdr_reviewr::graphics::id_rgb(bid);
     let row = (0..buf.area.height)
         .find(|&y| {
@@ -6406,7 +6417,9 @@ fn diagram_bot_app() -> App {
         comments: vec![Comment { body: DIAGRAM_BOT.into(), ..common::comment() }],
         ..common::pr_snapshot()
     })));
-    with_inline_images(&mut app, Some(true));
+    // Capped at 20 rows, so the disclosures after the picture stay on a 40-row screen.
+    let extra = "inline_image_width = \"native\"\ninline_image_max_rows = 20\n";
+    with_inline_images_config(&mut app, Some(true), extra);
     app
 }
 
@@ -6444,4 +6457,106 @@ fn a_light_theme_takes_the_pictures_light_source() {
     let _ = render_buffer(&app);
     let urls: Vec<String> = app.image_requests().into_iter().map(|r| r.url).collect();
     assert_eq!(urls, [format!("{DIAGRAM_RAW}/containers-light-aa11.svg")]);
+}
+
+#[test]
+fn a_block_image_fills_the_box_width_and_a_resize_refits_it_without_resending() {
+    use herdr_reviewr::forge::{PrSnapshot, PrView};
+    let mut app = image_pr_app();
+    app.apply_pr(PrView::Pr(Box::new(PrSnapshot {
+        url: "https://github.com/o/r/pull/7".into(),
+        body: format!("Intro.\n\n![shot]({SHOT})\n\nOutro."),
+        ..common::pr_snapshot()
+    })));
+    with_inline_images_config(&mut app, Some(true), "");
+    let _ = render_buffer(&app);
+    app.images.mark_requested(SHOT);
+    app.images.land(SHOT.into(), Some(prepared((120, 60))));
+    let id_cells = |buf: &Buffer, app: &App| {
+        let (r, g, b) = herdr_reviewr::graphics::id_rgb(app.images.placed_id(SHOT).unwrap());
+        let cells: Vec<(u16, u16)> = (0..buf.area.height)
+            .flat_map(|y| (0..buf.area.width).map(move |x| (x, y)))
+            .filter(|&(x, y)| buf[(x, y)].fg == ratatui::style::Color::Rgb(r, g, b))
+            .collect();
+        let cols = cells.iter().filter(|(_, y)| *y == cells[0].1).count();
+        (cols, cells.len() / cols.max(1))
+    };
+    // Natively 12×3; filled, as wide as the read pane's text and twice as tall as wide in
+    // cells (2:1 pixels on 1:2 cells).
+    let mut terminal = Terminal::new(TestBackend::new(140, 60)).unwrap();
+    terminal.draw(|f| ui::render(f, &app)).unwrap();
+    let painted = app.take_painted_images();
+    let first = app.images.place(&painted, (10, 20), std::time::Instant::now());
+    assert!(first.sent);
+    terminal.draw(|f| ui::render(f, &app)).unwrap();
+    let (cols, rows) = id_cells(terminal.backend().buffer(), &app);
+    let inner = ui::read_inner_rect(Rect::new(0, 0, 140, 60), &app);
+    assert_eq!(cols, inner.width as usize, "fills the text width");
+    assert!(rows.abs_diff(cols / 4) <= 1, "aspect kept, to the cell: {cols}×{rows}");
+
+    // A narrower pane re-fits the block; only a placement goes out, no pixels.
+    let _ = app.take_painted_images();
+    let mut narrow = Terminal::new(TestBackend::new(100, 60)).unwrap();
+    narrow.draw(|f| ui::render(f, &app)).unwrap();
+    let painted = app.take_painted_images();
+    let refit = app.images.place(&painted, (10, 20), std::time::Instant::now());
+    let seq = String::from_utf8(refit.bytes).unwrap();
+    assert!(seq.starts_with("\x1b_Ga=p,U=1,"), "a placement: {seq:?}");
+    assert!(!seq.contains("a=t"), "never the pixels again");
+    let (narrow_cols, _) = id_cells(narrow.backend().buffer(), &app);
+    assert!(narrow_cols < cols, "{narrow_cols} < {cols}");
+
+    // `native` keeps the image's own 12×3.
+    with_inline_images(&mut app, Some(true));
+    let mut terminal = Terminal::new(TestBackend::new(140, 60)).unwrap();
+    terminal.draw(|f| ui::render(f, &app)).unwrap();
+    assert_eq!(id_cells(terminal.backend().buffer(), &app), (12, 3));
+}
+
+#[test]
+fn an_image_resizing_above_the_reader_leaves_their_view_still() {
+    use herdr_reviewr::forge::{PrSnapshot, PrView};
+    let mut app = image_pr_app();
+    let paras = (0..40).map(|n| format!("para-{n:02}")).collect::<Vec<_>>().join("\n\n");
+    app.apply_pr(PrView::Pr(Box::new(PrSnapshot {
+        url: "https://github.com/o/r/pull/7".into(),
+        body: format!("Intro.\n\n![shot]({SHOT})\n\n{paras}"),
+        ..common::pr_snapshot()
+    })));
+    with_inline_images(&mut app, Some(true));
+    app.images.mark_requested(SHOT);
+    app.images.land(SHOT.into(), Some(prepared((100, 100))));
+    let read = |app: &mut App| -> Vec<String> {
+        let out = dump(&render_placed(app));
+        read_column(&out).iter().map(|l| l.trim_end().to_string()).collect()
+    };
+    let _ = read(&mut app);
+    for _ in 0..6 {
+        handle_mouse(
+            &mut app,
+            MouseEvent {
+                kind: MouseEventKind::ScrollDown,
+                column: 5,
+                row: 10,
+                modifiers: KeyModifiers::NONE,
+            },
+            Rect::new(0, 0, 140, 40),
+            &[],
+            &Keymap::default(),
+            &herdr_reviewr::export::Clipboard,
+        )
+        .unwrap();
+    }
+    let before = read(&mut app);
+    assert!(before.iter().any(|l| l.contains("para-")), "{before:#?}");
+    let scroll = app.pr_read_scroll();
+    // Native 10×5 cells → filled: the block above the reader grows by tens of rows.
+    with_inline_images_config(&mut app, Some(true), "");
+    let after = read(&mut app);
+    assert_eq!(before, after, "the reader's view does not move");
+    assert!(app.pr_read_scroll() > scroll + 10, "the scroll absorbs the growth");
+    // And back.
+    with_inline_images(&mut app, Some(true));
+    assert_eq!(read(&mut app), before);
+    assert_eq!(app.pr_read_scroll(), scroll);
 }

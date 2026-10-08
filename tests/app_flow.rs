@@ -9077,7 +9077,11 @@ fn a_drag_across_an_inline_image_copies_its_markdown_never_its_cells() {
     r.commit_all("init");
     let mut app = app_on(&r);
     let dir = tempfile::tempdir().unwrap();
-    std::fs::write(dir.path().join("config.toml"), "inline_images = true\n").unwrap();
+    std::fs::write(
+        dir.path().join("config.toml"),
+        "inline_images = true\ninline_image_width = \"native\"\n",
+    )
+    .unwrap();
     app.set_plugin_config(herdr_reviewr::config::plugin_config_in(dir.path()).unwrap());
     app.graphics = Some(true);
     app.cell_px = Some((10, 20));
@@ -9089,8 +9093,10 @@ fn a_drag_across_an_inline_image_copies_its_markdown_never_its_cells() {
     app.images.mark_requested(shot);
     let prepared = herdr_reviewr::images::Prepared {
         size: (120, 60),
+        raster: (120, 60),
         pixels: 100,
         payload: std::sync::Arc::from("QUJD"),
+        svg: None,
     };
     app.images.land(shot.into(), Some(prepared));
     // Paint once and put the image on the terminal, as the loop would.
@@ -9098,7 +9104,7 @@ fn a_drag_across_an_inline_image_copies_its_markdown_never_its_cells() {
     let mut terminal = ratatui::Terminal::new(backend).unwrap();
     terminal.draw(|f| herdr_reviewr::ui::render(f, &app)).unwrap();
     let painted = app.take_painted_images();
-    assert!(app.images.place(&painted).1);
+    assert!(app.images.place(&painted, (10, 20), std::time::Instant::now()).sent);
     let inner = herdr_reviewr::ui::read_inner_rect(SEL_AREA, &app);
     sel_mouse(&mut app, MouseEventKind::Down(MouseButton::Left), inner.x, inner.y);
     sel_mouse(&mut app, MouseEventKind::Drag(MouseButton::Left), inner.x + 60, inner.y + 7);

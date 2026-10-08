@@ -255,6 +255,8 @@ stack_fetch = true
 stack_list_position = "bottom"
 avatars = true
 inline_images = true
+inline_image_width = "native"
+inline_image_max_rows = 20
 github_host = "github.example.com"
 editor = "code -g {file}:{line}"
 
@@ -342,20 +344,28 @@ Opt in to paint the images in a PR's description and comments, `![alt](url)` and
 in place of their `⧉ alt` links:
 
 ```toml
-inline_images = true   # default: false (alt links)
+inline_images = true            # default: false (alt links)
+inline_image_width = "fill"     # "fill" or "native"; default "fill"
+inline_image_max_rows = 40      # 0 for no cap; default 40
 ```
 
 It uses the same Kitty graphics as [avatars](#avatars), and the same one question to the
 terminal. PNG, JPEG, GIF (the first frame), WebP, and SVG all paint. SVG renders inside
 reviewr with your system's fonts: no scripts, and nothing it references is ever loaded.
-A picture is sized from its pixels, or from `<img width height>`. It never grows past its own
-size, the box's width, or 20 rows. A badge (shields.io and the like) stays one row tall and
-sits in its line of text. A taller image gets rows of its own.
+A badge (shields.io and the like), anything one row tall at its own size, keeps that size
+and sits in its line of text. A taller image gets rows of its own. With
+`inline_image_width = "fill"` it spans the box's whole width. With `"native"` it keeps its own
+size, from its pixels or `<img width height>`, one image pixel per terminal pixel at most.
+Either way it keeps its aspect and stops at `inline_image_max_rows`. A resize or a wider pane
+refits it at once. The picture itself goes to the terminal only once: the terminal scales it
+into the new cells. An SVG drawn larger than reviewr's first rendering of it is rendered again
+at the block's own pixels, once the resizing stops, so it stays sharp. Until then the old
+rendering is shown scaled, never a gap.
 
 Images load lazily, visible ones first, and nothing waits on them. One inside a closed
 `<details>` loads once you open it. Until one arrives, and for
-good if it fails, it stays its dim `⧉ alt` link. When it lands it swaps in. If it lands above
-where you're reading, the pane scrolls with it, so your text stays put.
+good if it fails, it stays its dim `⧉ alt` link. When it lands it swaps in. If an image above
+where you're reading lands, or changes size, the pane scrolls with it, so your text stays put.
 
 On a GitHub PR, an image on GitHub's own host (`github.com` or your GHES host), such as a
 pasted `user-attachments` screenshot, downloads with your `gh auth token`. A file in the

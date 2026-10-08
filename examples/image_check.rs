@@ -49,13 +49,23 @@ fn main() {
     let ok = probe.answer() == Some(true);
     println!("kitty graphics probe: {}", if ok { "answered OK" } else { "no answer" });
 
-    let (cell, columns) = match window_size() {
-        Ok(w) if w.columns > 0 && w.width > 0 => {
-            ((w.width / w.columns, w.height / w.rows), usize::from(w.columns))
+    // The window-size ioctl (TIOCGWINSZ), as reviewr reads it.
+    let measured = match window_size() {
+        Ok(w) if w.columns > 0 && w.rows > 0 && w.width >= w.columns && w.height >= w.rows => {
+            Some(((w.width / w.columns, w.height / w.rows), usize::from(w.columns)))
         }
-        _ => (graphics::FALLBACK_CELL, 80),
+        _ => None,
     };
-    println!("cell size: {}×{} px", cell.0, cell.1);
+    let (cell, columns) = measured.unwrap_or((graphics::FALLBACK_CELL, 80));
+    if measured.is_some() {
+        println!("cell size: {}×{} px (measured)", cell.0, cell.1);
+    } else {
+        println!(
+            "cell size: {}×{} px — FALLBACK: the terminal reported no pixel size, so sharp SVG \
+             rasters are drawn for this guess (fill sizing in cells is unaffected)",
+            cell.0, cell.1
+        );
+    }
 
     let mut sources: Vec<(String, Option<Vec<u8>>)> = Vec::new();
     if urls.is_empty() {
@@ -89,14 +99,37 @@ fn main() {
             continue;
         };
         let room = columns.saturating_sub(4).max(1);
-        let cells = images::fit(prepared.size, (None, None), cell, room, images::MAX_ROWS);
+        let cells = images::layout(
+            prepared.size,
+            (None, None),
+            cell,
+            room,
+            images::DEFAULT_MAX_ROWS,
+            images::Width::Fill,
+        );
         let id = 0x00_60_F0_00 + n as u32;
         ids.push(id);
-        let head = format!("a=T,U=1,f=100,i={id},c={},r={},q=2,", cells.cols, cells.rows);
-        let _ = out.write_all(&graphics::chunked(&head, &prepared.payload));
+        // An SVG drawn larger than its packed raster is redrawn at the block's pixels, as
+        // reviewr does once a resize settles.
+        let block =
+            (u32::from(cells.cols) * u32::from(cell.0), u32::from(cells.rows) * u32::from(cell.1));
+        let sharp = prepared
+            .svg
+            .as_deref()
+            .filter(|_| block.0 > prepared.raster.0 || block.1 > prepared.raster.1)
+            .and_then(|svg| images::rasterize_svg_to(svg, block));
+        let payload = sharp.as_ref().map_or(&prepared.payload, |(p, _)| p);
+        let head = format!("a=t,f=100,i={id},q=2,");
+        let _ = out.write_all(&graphics::chunked(&head, payload));
+        let place = format!("\x1b_Ga=p,U=1,i={id},p=1,c={},r={},q=2\x1b\\", cells.cols, cells.rows);
+        let _ = out.write_all(place.as_bytes());
         println!(
-            "{name}: {}×{} px → {}×{} cells",
-            prepared.size.0, prepared.size.1, cells.cols, cells.rows
+            "{name}: {}×{} px → {}×{} cells{}",
+            prepared.size.0,
+            prepared.size.1,
+            cells.cols,
+            cells.rows,
+            if sharp.is_some() { ", SVG redrawn at the block's pixels" } else { "" }
         );
         let (r, g, b) = graphics::id_rgb(id);
         for row in 0..usize::from(cells.rows) {

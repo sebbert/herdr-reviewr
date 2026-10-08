@@ -46,6 +46,8 @@ pub struct Rendered {
 pub struct ImageSource<'a> {
     pub cell: (u16, u16),
     pub max_rows: u16,
+    /// Whether block images fill the width or keep their own size.
+    pub width: crate::images::Width,
     /// Anything else `resolve` depends on (the forge's uploads base), for the memo's key.
     pub salt: String,
     pub resolve: &'a dyn Fn(&str) -> Option<String>,
@@ -199,7 +201,7 @@ pub struct RenderCache {
     clock: u64,
 }
 
-type CacheKey = (String, usize, Vec<String>, Option<(u16, u16, u16, String)>);
+type CacheKey = (String, usize, Vec<String>, Option<(u16, u16, u16, bool, String)>);
 
 #[derive(Debug)]
 struct CacheSlot {
@@ -239,7 +241,10 @@ impl RenderCache {
         let mut expanded_key: Vec<String> = expanded.iter().cloned().collect();
         expanded_key.sort();
         self.clock += 1;
-        let image_key = images.map(|i| (i.cell.0, i.cell.1, i.max_rows, i.salt.clone()));
+        let image_key = images.map(|i| {
+            let fill = i.width == crate::images::Width::Fill;
+            (i.cell.0, i.cell.1, i.max_rows, fill, i.salt.clone())
+        });
         let key = (text.to_string(), width, expanded_key, image_key);
         if let Some(slot) = self.slots.get_mut(&key)
             && images
@@ -1014,7 +1019,14 @@ impl Renderer<'_> {
                 continue;
             };
             let img = &imgs[i];
-            let cells = crate::images::fit(img.size, img.attrs, src.cell, budget, src.max_rows);
+            let cells = crate::images::layout(
+                img.size,
+                img.attrs,
+                src.cell,
+                budget,
+                src.max_rows,
+                src.width,
+            );
             if cells.rows <= 1 {
                 self.urls.push(img.target.clone());
                 let id = self.urls.len() - 1;
@@ -2298,6 +2310,7 @@ mod tests {
         let src = super::ImageSource {
             cell: (10, 20),
             max_rows: 20,
+            width: crate::images::Width::Native,
             salt: String::new(),
             resolve: &resolve,
             size: &size,
@@ -2438,6 +2451,7 @@ mod tests {
         let src = super::ImageSource {
             cell: (10, 20),
             max_rows: 20,
+            width: crate::images::Width::Native,
             salt: String::new(),
             resolve: &resolve,
             size: &size,
@@ -2465,6 +2479,7 @@ mod tests {
         let src = super::ImageSource {
             cell: (10, 20),
             max_rows: 20,
+            width: crate::images::Width::Native,
             salt: String::new(),
             resolve: &resolve,
             size: &size,
@@ -2513,7 +2528,8 @@ mod tests {
             ]
         );
         // The expand state flips an authored-open one shut, and its nested one with it.
-        let r = render_diagram_bot("catppuccin-latte", &["Pipeline containers", "Sorting components"]);
+        let r =
+            render_diagram_bot("catppuccin-latte", &["Pipeline containers", "Sorting components"]);
         let t = texts(&r.lines);
         assert!(t.iter().any(|l| l == "▸ Pipeline containers"), "{t:#?}");
         assert!(!t.iter().any(|l| l.contains("Sorting components")));
@@ -2535,6 +2551,7 @@ mod tests {
         let src = super::ImageSource {
             cell: (10, 20),
             max_rows: 20,
+            width: crate::images::Width::Native,
             salt: String::new(),
             resolve: &resolve,
             size: &size,

@@ -10,13 +10,17 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - **Opt-in inline images on the PR tab.** With `inline_images = true` (off by default,
   validated like every key and in `--resolve-plugin-config`), the description's and comments'
   images, `![alt](url)` and HTML `<img src width height alt>`, paint as pictures through the
-  Kitty graphics that avatars use: PNG, JPEG, GIF (first frame), WebP, and SVG. A picture is
-  sized from its pixels or its `<img>` attributes. It never grows past its own size, the box's
-  width, or 20 rows, and it takes at least one cell. A badge stays one row and rides its line
-  of text. A taller image parts the text and takes rows of its own. Until it loads, when it
+  Kitty graphics that avatars use: PNG, JPEG, GIF (first frame), WebP, and SVG. A badge,
+  anything one row tall at its own size, keeps that size and rides its line of text. A taller
+  image parts the text and takes rows of its own. With `inline_image_width = "fill"` (the
+  default) it spans the box's width. With `"native"` it keeps its own size, from its pixels or
+  its `<img>` attributes, never upscaled. Either way the aspect is kept, the image takes at
+  least one cell, and it stops at `inline_image_max_rows` (default 40, `0` for no cap). Both
+  keys are validated like every key and appear in `--resolve-plugin-config`. Until it loads, when it
   fails, or wherever graphics don't paint, an image is the `⧉ alt` link it was. It loads
-  lazily, visible first, and nothing waits on it. When one lands above the reader, the read
-  pane's scroll moves by its growth, so the text on screen stays put. A copy of an image's
+  lazily, visible first, and nothing waits on it. When one above the reader lands or changes
+  size (a resize, a config change), the read pane's scroll moves with it, so the text on
+  screen stays put. A copy of an image's
   lines yields `![alt](url)`. `cargo run --example image_check [url …]` checks a terminal by
   hand. Decisions:
   - **One graphics layer.** The avatar code's protocol pieces moved into `src/graphics.rs`,
@@ -31,15 +35,36 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     cells only while the terminal holds that exact image, and the loop places what a frame
     painted right after it and repaints at once. So a landed image reserves its block a frame
     before its pixels arrive, and a block never jumps as it fills in.
-  - **One terminal image per URL and size.** Each size an image paints at is transmitted as its
-    own image with one virtual placement, so cells never need a placement id in the underline
-    colour, which the hyperlink tags already use. The payload is a PNG (`f=100`), packed once on
-    the worker at up to 2048 px and 4 Mpx, and the terminal scales it to the cells. Ghostty and
-    herdr's own renderer both decode PNG. Avatars keep their exact-size raw RGBA.
+  - **One terminal image per URL, pixels sent once.** Each image is transmitted once
+    (`a=t`, a PNG packed on the worker at up to 2048 px and 4 Mpx) and gets one virtual
+    placement (`a=p,U=1,p=1`). The Kitty spec fits a virtual placement's image into its
+    `c`×`r` cells, aspect kept. herdr's renderer is Ghostty's terminal core, whose
+    virtual-placement code fits and centres the same way (read from its binary's strings,
+    not run). So a new footprint (fill, a resize, a narrower box) only replaces the
+    placement, a few bytes, and rasters are never re-encoded for a size. One placement per
+    image means cells need no placement id in the underline colour, which the hyperlink tags
+    use. An image painted at two sizes in one frame takes the first. In the frame after a
+    footprint change the old placement is still up, so the picture shows at its old fit for
+    that frame, never blank. Avatars keep their exact-size raw RGBA.
+  - **Sharp SVGs, debounced.** An SVG whose block outgrows its packed raster (a wide pane on a
+    dense terminal) is re-rasterised at the block's pixel size (cells × the measured cell
+    size, within 6 Mpx) on its own thread. It asks only once that size has held for 150 ms, so
+    a drag asks once, after it settles. Each ask is tagged and only the latest lands. The old
+    raster stays placed and scaled meanwhile, and the new one replaces it under the same id:
+    the old one is deleted first and the budget counts the new one.
+  - **Resizes are cheap.** A resize no longer forgets what the terminal holds. Before, every
+    resize event re-sent every image and avatar, megabytes per event through herdr. The cell
+    size is measured again (`TIOCGWINSZ`), and only a changed one (a font change) re-sends
+    avatars at their new geometry. A burst of queued resize events is drained before the next
+    draw, so a drag draws once per frame, not once per event.
+    `cargo run --release --example bench_resize` counts the bytes. With 4 images (two SVG
+    diagrams, two photos) and 60 resizes: 197 MB of image payload before, 0 bytes after
+    (about 10 KB of placements). Then, on 18×38-px cells, two sharp SVG re-rasters (0.23 MB)
+    once the burst settles.
   - **A bounded terminal share.** At most 32 images and 24 Mpx at a time. Past that, the least
     recently painted that is off screen is deleted, and comes back if it is painted again.
     Images are also deleted on exit, before a terminal editor, and when the key is switched
-    off. A resize re-sends them.
+    off.
   - **Fetching.** `curl` with a 10 MB cap (enforced on the bytes read, not only the announced
     length), 20 s, `http(s)` only, redirects to `https` only. On a GitHub PR, a URL on the PR's
     own host over `https` downloads with `gh auth token --hostname <host>`. The token is read

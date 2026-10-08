@@ -5183,7 +5183,7 @@ fn markdown_image_runs(
 fn paint_image_runs(buf: &mut ratatui::buffer::Buffer, app: &App, runs: &[ImageRun]) {
     for run in runs {
         app.note_painted_image(&run.url, run.cells);
-        let Some(id) = app.image_id(&run.url, run.cells) else { continue };
+        let Some(id) = app.image_id(&run.url) else { continue };
         let (r, g, b) = crate::graphics::id_rgb(id);
         for i in 0..run.width {
             if let Some(cell) = buf.cell_mut((run.x + i, run.y)) {

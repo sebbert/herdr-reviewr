@@ -66,7 +66,7 @@ impl Config {
     }
 }
 
-const PLUGIN_CONFIG_KEYS: [&str; 22] = [
+const PLUGIN_CONFIG_KEYS: [&str; 24] = [
     "theme",
     "default_scope",
     "navigator_position",
@@ -83,6 +83,8 @@ const PLUGIN_CONFIG_KEYS: [&str; 22] = [
     "avatar_width",
     "avatar_fit",
     "inline_images",
+    "inline_image_width",
+    "inline_image_max_rows",
     "github_host",
     "gitlab_host",
     "azure_devops_host",
@@ -247,6 +249,10 @@ pub struct PluginConfig {
     /// Opt-in: paint the PR description's and comments' images in place of their alt links,
     /// through the same Kitty graphics as avatars.
     inline_images: bool,
+    /// Whether a block image fills the box's width or keeps its own size.
+    inline_image_width: crate::images::Width,
+    /// The tallest an inline image grows, in rows; 0 is no cap.
+    inline_image_max_rows: u16,
     github_host: Option<String>,
     gitlab_host: Option<String>,
     azure_devops_host: Option<String>,
@@ -274,6 +280,8 @@ impl Default for PluginConfig {
             avatar_width: 1,
             avatar_fit: crate::avatar::Fit::Height,
             inline_images: false,
+            inline_image_width: crate::images::Width::Fill,
+            inline_image_max_rows: crate::images::DEFAULT_MAX_ROWS,
             github_host: None,
             gitlab_host: None,
             azure_devops_host: None,
@@ -351,6 +359,15 @@ impl PluginConfig {
         self.inline_images
     }
 
+    pub fn inline_image_width(&self) -> crate::images::Width {
+        self.inline_image_width
+    }
+
+    /// The configured row cap, `0` for none (`crate::images::row_cap` resolves it).
+    pub fn inline_image_max_rows(&self) -> u16 {
+        self.inline_image_max_rows
+    }
+
     pub fn github_host(&self) -> Option<&str> {
         self.github_host.as_deref()
     }
@@ -414,6 +431,8 @@ impl PluginConfig {
             "avatar_width": self.avatar_width,
             "avatar_fit": self.avatar_fit.as_str(),
             "inline_images": self.inline_images,
+            "inline_image_width": self.inline_image_width.as_str(),
+            "inline_image_max_rows": self.inline_image_max_rows,
             "github_host": self.github_host,
             "gitlab_host": self.gitlab_host,
             "azure_devops_host": self.azure_devops_host,
@@ -634,6 +653,25 @@ fn parse_plugin_config(path: &Path) -> Result<PluginConfig, PluginConfigError> {
     if let Some(value) = table.get("inline_images") {
         config.inline_images =
             value.as_bool().ok_or_else(|| value_error(path, "inline_images", "a boolean"))?;
+    }
+    if let Some(value) = table.get("inline_image_width") {
+        let expected = "one of fill, native";
+        config.inline_image_width = match string_value(path, "inline_image_width", value, expected)?
+        {
+            "fill" => crate::images::Width::Fill,
+            "native" => crate::images::Width::Native,
+            _ => return Err(value_error(path, "inline_image_width", expected)),
+        };
+    }
+    if let Some(value) = table.get("inline_image_max_rows") {
+        let max = crate::graphics::MAX_SPAN as i64;
+        config.inline_image_max_rows = match value.as_integer() {
+            Some(n) if (0..=max).contains(&n) => n as u16,
+            _ => {
+                let expected = format!("an integer from 0 (no cap) to {max}");
+                return Err(value_error(path, "inline_image_max_rows", &expected));
+            }
+        };
     }
     if let Some(value) = table.get("github_host") {
         config.github_host = Some(parse_forge_host(path, "github_host", value)?);
@@ -960,6 +998,8 @@ mod tests {
         assert!(!config.pr_nav_separators(), "separators are opt-in");
         assert!(!config.avatars(), "avatars are opt-in");
         assert!(!config.inline_images(), "inline images are opt-in");
+        assert_eq!(config.inline_image_width(), crate::images::Width::Fill);
+        assert_eq!(config.inline_image_max_rows(), 40);
         assert!(config.hyperlinks(), "hyperlinks are on by default");
         assert!(!config.stack_fetch(), "stack fetching is opt-in");
         assert_eq!(config.stack_list_position(), super::StackListPosition::Top);
@@ -991,6 +1031,8 @@ mod tests {
                 "avatar_width = 2\n",
                 "avatar_fit = \"width\"\n",
                 "inline_images = true\n",
+                "inline_image_width = \"native\"\n",
+                "inline_image_max_rows = 0\n",
                 "github_host = \"GitHub.Example.COM\"\n",
             ),
         )
@@ -1021,6 +1063,10 @@ mod tests {
         assert_eq!(config.to_json()["avatar_fit"], "width");
         assert!(config.inline_images());
         assert_eq!(config.to_json()["inline_images"], true);
+        assert_eq!(config.inline_image_width(), crate::images::Width::Native);
+        assert_eq!(config.to_json()["inline_image_width"], "native");
+        assert_eq!(config.inline_image_max_rows(), 0);
+        assert_eq!(config.to_json()["inline_image_max_rows"], 0);
         assert_eq!(config.github_host(), Some("github.example.com"));
     }
 
@@ -1132,6 +1178,13 @@ mod tests {
             ("avatar_fit = 1\n", "`avatar_fit`"),
             ("inline_images = \"yes\"\n", "`inline_images`"),
             ("inline_images = 1\n", "`inline_images`"),
+            ("inline_image_width = \"wide\"\n", "`inline_image_width`"),
+            ("inline_image_width = \"Fill\"\n", "`inline_image_width`"),
+            ("inline_image_width = true\n", "`inline_image_width`"),
+            ("inline_image_max_rows = -1\n", "`inline_image_max_rows`"),
+            ("inline_image_max_rows = 298\n", "`inline_image_max_rows`"),
+            ("inline_image_max_rows = 2.5\n", "`inline_image_max_rows`"),
+            ("inline_image_max_rows = \"40\"\n", "`inline_image_max_rows`"),
             ("github_host = \"https://github.example.com\"\n", "`github_host`"),
             ("editor = \"\"\n", "`editor`"),
             ("editor = \"   \"\n", "`editor`"),
