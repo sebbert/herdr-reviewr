@@ -5548,7 +5548,7 @@ fn replay_scrolled(app: &mut App, w: u16, h: u16, pages: usize) -> Vec<(u16, u16
     worst
 }
 
-/// The PR conversation from the report: the dbschema plan with its 🗄️ heading and 🟡 table,
+/// A PR conversation with emoji in every hard spot: a plan with its 🗄️ heading and 🟡 table,
 /// and the reviewer's 🤖/✅/⚫ round.
 fn emoji_pr_app(framed: bool) -> App {
     use herdr_reviewr::forge::{Comment, PrSnapshot, PrView};
@@ -5558,7 +5558,7 @@ fn emoji_pr_app(framed: bool) -> App {
         | acme_shop_prod/public | db/shop/ | p | 🟡 changes |\n\n\
         <details><summary>🟡 shop-public-pp — changes</summary>\n\nbody\n</details>\n\n\
         Full plan ⚠️ ℹ️ ✔️ done";
-    let codex = "🤖 Example Review v2 — Round 1 — ✅ patch is correct\n\n\
+    let review = "🤖 Example Review v2 — Round 1 — ✅ patch is correct\n\n\
         | Severity | Category | Finding |\n|---|---|---|\n| ⚫ | security | Remove remote image |";
     let mut app = edited_app();
     if !framed {
@@ -5568,7 +5568,7 @@ fn emoji_pr_app(framed: bool) -> App {
     let comments: Vec<Comment> = (0..4)
         .map(|i| Comment {
             author: format!("u{i}"),
-            body: if i % 2 == 0 { plan.into() } else { codex.into() },
+            body: if i % 2 == 0 { plan.into() } else { review.into() },
             created_at: format!("2026-06-27T1{i}:00:00Z"),
             ..common::comment()
         })
