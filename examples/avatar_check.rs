@@ -60,7 +60,8 @@ fn main() {
     {
         let id = 0x00_52_F0 + n as u32;
         let g = avatar::geometry(cell, width, fit);
-        let _ = out.write_all(&avatar::transmit(id, g.cols, &avatar::paint(&source, &g)));
+        let _ = out.write_all(&avatar::transmit(id, &avatar::paint(&source, &g)));
+        let _ = out.write_all(&avatar::place(id, u16::from(g.cols), 1));
         let (r, gr, b) = avatar::id_rgb(id);
         let cells: String = (0..usize::from(g.cols)).map(avatar::placeholder_cell).collect();
         println!(

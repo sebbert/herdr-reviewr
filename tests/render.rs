@@ -6593,18 +6593,24 @@ fn a_block_image_fills_the_box_width_and_a_resize_refits_it_without_resending() 
     let first = app.images.place(&painted, (10, 20), std::time::Instant::now());
     assert!(first.sent);
     terminal.draw(|f| ui::render(f, &app)).unwrap();
+    let wide = app.take_painted_images();
+    let shown = herdr_reviewr::graphics::shown_ids(terminal.backend().buffer());
+    let staged = String::from_utf8(app.images.stage(&wide, &shown)).unwrap();
+    assert!(staged.starts_with("\x1b_Ga=p,U=1,"), "placed with the frame that shows it");
     let (cols, rows) = id_cells(terminal.backend().buffer(), &app);
     let inner = ui::read_inner_rect(Rect::new(0, 0, 140, 60), &app);
     assert_eq!(cols, inner.width as usize, "fills the text width");
     assert!(rows.abs_diff(cols / 4) <= 1, "aspect kept, to the cell: {cols}×{rows}");
 
-    // A narrower pane re-fits the block; only a placement goes out, no pixels.
-    let _ = app.take_painted_images();
+    // A narrower pane re-fits the block; only a placement moves, no pixels.
     let mut narrow = Terminal::new(TestBackend::new(100, 60)).unwrap();
     narrow.draw(|f| ui::render(f, &app)).unwrap();
     let painted = app.take_painted_images();
-    let refit = app.images.place(&painted, (10, 20), std::time::Instant::now());
-    let seq = String::from_utf8(refit.bytes).unwrap();
+    let shown = herdr_reviewr::graphics::shown_ids(narrow.backend().buffer());
+    let mut seq = String::from_utf8(app.images.stage(&painted, &shown)).unwrap();
+    seq +=
+        &String::from_utf8(app.images.place(&painted, (10, 20), std::time::Instant::now()).bytes)
+            .unwrap();
     assert!(seq.starts_with("\x1b_Ga=p,U=1,"), "a placement: {seq:?}");
     assert!(!seq.contains("a=t"), "never the pixels again");
     let (narrow_cols, _) = id_cells(narrow.backend().buffer(), &app);
@@ -6615,6 +6621,39 @@ fn a_block_image_fills_the_box_width_and_a_resize_refits_it_without_resending() 
     let mut terminal = Terminal::new(TestBackend::new(140, 60)).unwrap();
     terminal.draw(|f| ui::render(f, &app)).unwrap();
     assert_eq!(id_cells(terminal.backend().buffer(), &app), (12, 3));
+}
+
+#[test]
+fn an_image_off_screen_holds_no_placement_and_comes_back_without_its_pixels() {
+    let mut app = image_pr_app();
+    with_inline_images(&mut app, Some(true));
+    app.images.mark_requested(SHOT);
+    app.images.land(SHOT.into(), Some(prepared((120, 60))));
+    let mut terminal = Terminal::new(TestBackend::new(140, 60)).unwrap();
+    // One loop pass: render, stage placements from the frame, then send what it laid out.
+    let mut frame = |app: &mut App| {
+        terminal.draw(|f| ui::render(f, app)).unwrap();
+        let painted = app.take_painted_images();
+        let shown = herdr_reviewr::graphics::shown_ids(terminal.backend().buffer());
+        let mut seq = String::from_utf8(app.images.stage(&painted, &shown)).unwrap();
+        let placed = app.images.place(&painted, (10, 20), std::time::Instant::now());
+        seq += &String::from_utf8(placed.bytes).unwrap();
+        seq
+    };
+    let sent = frame(&mut app);
+    assert!(sent.contains("a=t,") && !sent.contains("a=p"), "data first: {sent:?}");
+    let id = app.images.placed_id(SHOT).unwrap();
+    assert!(frame(&mut app).starts_with("\x1b_Ga=p,U=1,"), "placed with its placeholders");
+    assert!(frame(&mut app).is_empty(), "a steady frame writes nothing");
+
+    // Another tab: the placement goes, the picture stays, and nothing churns while away.
+    app.set_tab(Tab::Changes).unwrap();
+    assert_eq!(frame(&mut app), format!("\x1b_Ga=d,d=i,i={id},p=1,q=2\x1b\\"));
+    assert!(frame(&mut app).is_empty());
+    // Back: one placement, no pixels.
+    app.set_tab(Tab::Pr).unwrap();
+    let back = frame(&mut app);
+    assert!(back.starts_with("\x1b_Ga=p,U=1,") && !back.contains("a=t"), "{back:?}");
 }
 
 #[test]

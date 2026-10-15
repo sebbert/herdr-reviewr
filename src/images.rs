@@ -6,16 +6,19 @@
 //! pending, failed, or unpaintable image is the `⧉ alt` link it always was. The fetcher's
 //! threads download (`curl`, size and time caps, a forge token only for the forge's own host),
 //! decode rasters or rasterise SVGs, and pack each as a PNG once. The event loop transmits an
-//! image once, when a frame first paints its block, and from then on only moves its one
-//! virtual placement: the terminal fits the picture into whatever cells the block has, aspect
-//! kept, so a resize or a wider pane sends a few bytes, never the picture. Only an SVG drawn
+//! image's data once, when a frame first paints its block, and from then on only places,
+//! moves, or deletes its one virtual placement: the terminal fits the picture into whatever
+//! cells the block has, aspect kept, so a resize or a wider pane sends a few bytes, never the
+//! picture, and the placement exists only while a frame paints the block's placeholder cells
+//! ([`Store::stage`]) — scrolled away, another tab, or covered, the data stays and the
+//! placement goes, and coming back is one placement again. Only an SVG drawn
 //! larger than its packed raster is re-rasterised at the block's pixel size, on the
 //! [`Rasterizer`]'s thread, once resizes go quiet, the old raster scaled meanwhile. The
 //! terminal's share stays bounded ([`MAX_PLACED`], [`MAX_PIXELS`]) by deleting the least
 //! recently painted, and the renderer swaps the block's cells for placeholders once the
 //! terminal holds the picture.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::Cursor;
 use std::sync::{Arc, Mutex, OnceLock, mpsc};
 use std::time::{Duration, Instant};
@@ -484,8 +487,8 @@ enum Held {
 }
 
 /// One image on (or off) the terminal: its id, what the terminal holds, the cells its one
-/// virtual placement spans, the frame that last painted it, and for an SVG the sharp
-/// raster's state.
+/// virtual placement spans while a frame shows it, the frame that last painted it, and for an
+/// SVG the sharp raster's state.
 #[derive(Debug)]
 struct Shown {
     id: u32,
@@ -511,7 +514,7 @@ enum Entry {
 /// What one [`Store::place`] pass wrote and asked for.
 #[derive(Debug, Default)]
 pub struct Placed {
-    /// The terminal writes: transmissions, deletions, placements.
+    /// The terminal writes: transmissions, deletions, and a swapped raster's placement.
     pub bytes: Vec<u8>,
     /// A picture went out for the first time: the next frame paints it.
     pub sent: bool,
@@ -521,8 +524,9 @@ pub struct Placed {
 
 /// Every inline image this session has asked for, keyed by URL. A failed URL stays its alt
 /// link for the session, so a dead host is asked once. Each image is one terminal image with
-/// one virtual placement: its pixels go out once, and a new footprint moves only the
-/// placement, which the terminal fits the picture into, aspect kept.
+/// at most one virtual placement: its pixels go out once, and a new footprint moves only the
+/// placement, which the terminal fits the picture into, aspect kept. The placement is there
+/// only while a frame shows the image.
 #[derive(Debug, Default)]
 pub struct Store {
     entries: HashMap<String, Entry>,
@@ -620,9 +624,8 @@ impl Store {
         }
     }
 
-    /// The image id to paint `url` with: once the terminal holds it. Its placement may lag
-    /// a footprint change by one frame, in which the terminal shows the picture at its old
-    /// cells' fit — stale for a frame, never blank.
+    /// The image id to paint `url` with: once the terminal holds its data. The frame that
+    /// paints it places it ([`Store::stage`]) before its cells reach the terminal.
     #[must_use]
     pub fn placed_id(&self, url: &str) -> Option<u32> {
         match self.entries.get(url) {
@@ -631,13 +634,42 @@ impl Store {
         }
     }
 
-    /// Put every image this frame painted on the terminal at the cells it painted, at `cell`
-    /// pixels per cell, `now`. An image not there yet is transmitted (after deleting the least
-    /// recently painted others while the budget would overflow; one that still does not fit
-    /// stays its alt text). One already there only has its placement moved when its cells
-    /// changed — a few bytes. An SVG whose block outgrew its packed raster asks for a sharp
-    /// one at the block's pixel size once that size has held for [`QUIET`], and swaps it in
-    /// when it lands, replacing (and so freeing) the old raster.
+    /// Match the terminal's placements to a finished frame, before its cells go out: every
+    /// held image whose id `shown` names (its placeholder cells survive in the frame) is
+    /// placed at the cells `painted` gives it — or moved there when they changed, a few bytes
+    /// — and every placed one `shown` no longer names is unplaced, its data kept. Only the
+    /// difference from the last frame goes out.
+    pub fn stage(&mut self, painted: &[(String, Cells)], shown: &HashSet<u32>) -> Vec<u8> {
+        let mut out = Vec::new();
+        for (url, entry) in &mut self.entries {
+            let Entry::Ready { shown: image, .. } = entry else { continue };
+            if image.held.is_none() {
+                continue;
+            }
+            // One placement per image: the first block that painted it this frame sizes it.
+            let cells = shown
+                .contains(&image.id)
+                .then(|| painted.iter().find(|(u, _)| u == url).map(|(_, c)| *c))
+                .flatten();
+            match cells {
+                Some(c) if image.placed != Some(c) => {
+                    out.extend(graphics::place(image.id, c.cols, c.rows));
+                }
+                None if image.placed.is_some() => out.extend(graphics::unplace(image.id)),
+                _ => {}
+            }
+            image.placed = cells;
+        }
+        out
+    }
+
+    /// Put every image this frame painted on the terminal, at `cell` pixels per cell, `now`.
+    /// An image not there yet is transmitted, data only (after deleting the least recently
+    /// painted others while the budget would overflow; one that still does not fit stays its
+    /// alt text), and the next frame, which paints it, places it. An SVG whose block outgrew
+    /// its packed raster asks for a sharp one at the block's pixel size once that size has
+    /// held for [`QUIET`], and swaps it in when it lands, replacing (and so freeing) the old
+    /// raster and placing the new one where the old one was.
     pub fn place(&mut self, painted: &[(String, Cells)], cell: (u16, u16), now: Instant) -> Placed {
         self.clock += 1;
         let clock = self.clock;
@@ -686,6 +718,7 @@ impl Store {
                     }
                 };
                 let replacing = shown.held.is_some();
+                let replaced = shown.placed;
                 let id = shown.id;
                 if !replacing && !self.make_room(pixels, clock, &mut out.bytes) {
                     continue;
@@ -701,19 +734,14 @@ impl Store {
                 let head = format!("a=t,f=100,i={id},q=2,");
                 out.bytes.extend(graphics::chunked(&head, &payload));
                 shown.held = Some(best);
-                shown.placed = None;
+                // The delete took the placement with it; a picture on screen keeps its own.
+                if let Some(at) = replaced {
+                    out.bytes.extend(graphics::place(id, at.cols, at.rows));
+                }
             }
             let Some(Entry::Ready { prepared, shown }) = self.entries.get_mut(url) else {
                 continue;
             };
-            if shown.placed != Some(*cells) {
-                let place = format!(
-                    "\x1b_Ga=p,U=1,i={},p=1,c={},r={},q=2\x1b\\",
-                    shown.id, cells.cols, cells.rows
-                );
-                out.bytes.extend(place.as_bytes());
-                shown.placed = Some(*cells);
-            }
             if let (Some(svg), Some((px, since))) = (&prepared.svg, shown.want) {
                 let have = shown.sharp.as_ref().is_some_and(|(p, ..)| *p == px);
                 let asked = shown.asked.is_some_and(|(p, _)| p == px);
@@ -982,6 +1010,21 @@ mod tests {
         store.place(&painted, CELL, now)
     }
 
+    /// A frame that paints `painted` with every held image's placeholders surviving: its
+    /// placements, staged before the frame goes out.
+    fn shows(store: &mut Store, painted: &[(&str, Cells)]) -> String {
+        let painted: Vec<_> = painted.iter().map(|(u, c)| ((*u).to_string(), *c)).collect();
+        let shown = painted.iter().filter_map(|(u, _)| store.placed_id(u)).collect();
+        String::from_utf8(store.stage(&painted, &shown)).unwrap()
+    }
+
+    /// The graphics commands in `seq`, sorted: the order images are staged in is the store's.
+    fn commands(seq: &str) -> Vec<String> {
+        let mut out: Vec<String> = seq.split_inclusive("\x1b\\").map(str::to_string).collect();
+        out.sort();
+        out
+    }
+
     /// The bytes of `bytes` that are image payload: every chunk's data after its `;`.
     fn payload_bytes(bytes: &[u8]) -> usize {
         String::from_utf8_lossy(bytes)
@@ -1005,29 +1048,72 @@ mod tests {
         assert_eq!(store.size("b"), None, "a failure stays its alt link");
         assert_eq!(store.placed_id("a"), None, "landed but not on the terminal");
 
+        // The frame that lays it out paints its alt text: no placeholders, no placement.
+        assert!(shows(&mut store, &[("a", cells)]).is_empty());
         let placed = at(&mut store, &[("a", cells), ("b", cells)], now);
         assert!(placed.sent);
         let seq = String::from_utf8(placed.bytes).unwrap();
-        assert_eq!(
-            seq,
-            "\x1b_Ga=t,f=100,i=6291456,q=2,m=0;QUJD\x1b\\\x1b_Ga=p,U=1,i=6291456,p=1,c=9,r=1,q=2\x1b\\",
-            "transmitted once, then one virtual placement"
-        );
+        assert_eq!(seq, "\x1b_Ga=t,f=100,i=6291456,q=2,m=0;QUJD\x1b\\", "data only, once");
         let id = store.placed_id("a").unwrap();
+        // The next frame paints its placeholders: one placement, before that frame.
+        assert_eq!(
+            shows(&mut store, &[("a", cells)]),
+            format!("\x1b_Ga=p,U=1,i={id},p=1,c=9,r=1,q=2\x1b\\")
+        );
         let again = at(&mut store, &[("a", cells)], now);
         assert!(again.bytes.is_empty() && !again.sent, "nothing to say twice");
+        assert!(shows(&mut store, &[("a", cells)]).is_empty(), "nothing to place twice");
         // A new footprint moves the placement only: no pixels.
         let wide = Cells { cols: 18, rows: 2 };
-        let moved = at(&mut store, &[("a", wide)], now);
+        assert!(at(&mut store, &[("a", wide)], now).bytes.is_empty());
         assert_eq!(
-            String::from_utf8(moved.bytes).unwrap(),
+            shows(&mut store, &[("a", wide)]),
             format!("\x1b_Ga=p,U=1,i={id},p=1,c=18,r=2,q=2\x1b\\")
         );
-        assert!(!moved.sent, "the frame already paints it");
         assert_eq!(store.placed_id("a"), Some(id), "one id for every size");
         assert_eq!(store.deletions(), graphics::delete(id));
         assert!(store.deletions().is_empty(), "deleted once");
+        assert!(shows(&mut store, &[("a", cells)]).is_empty(), "deleted: nothing to place");
         assert!(at(&mut store, &[("a", cells)], now).sent, "painted again: sent again");
+    }
+
+    #[test]
+    fn a_placement_lives_only_while_a_frame_shows_the_image() {
+        let now = Instant::now();
+        let mut store = Store::default();
+        let cells = Cells { cols: 9, rows: 1 };
+        for url in ["a", "b"] {
+            store.land(url.into(), Some(ready((90, 20), 5400)));
+        }
+        at(&mut store, &[("a", cells), ("b", cells)], now);
+        let (a, b) = (store.placed_id("a").unwrap(), store.placed_id("b").unwrap());
+        assert!(a < b, "ids in landing order, so the sorted commands below are a's first");
+        let place = |id| String::from_utf8(graphics::place(id, 9, 1)).unwrap();
+        let unplace = |id| String::from_utf8(graphics::unplace(id)).unwrap();
+        assert_eq!(
+            commands(&shows(&mut store, &[("a", cells), ("b", cells)])),
+            [place(a), place(b)]
+        );
+
+        // `b` scrolls off: only its placement goes, its data stays — the lowercase `d=i`.
+        assert_eq!(unplace(b), format!("\x1b_Ga=d,d=i,i={b},p=1,q=2\x1b\\"));
+        assert_eq!(shows(&mut store, &[("a", cells)]), unplace(b));
+        assert_eq!(store.placed_id("b"), Some(b), "still held: its cells still paint");
+        // Another tab: nothing on screen, nothing placed.
+        assert_eq!(shows(&mut store, &[]), unplace(a));
+        assert!(shows(&mut store, &[]).is_empty(), "no churn while away");
+        // Back: one placement each, and no pixels — the data never left.
+        let back = at(&mut store, &[("a", cells), ("b", cells)], now);
+        assert!(back.bytes.is_empty() && !back.sent);
+        assert_eq!(
+            commands(&shows(&mut store, &[("a", cells), ("b", cells)])),
+            [place(a), place(b)]
+        );
+
+        // Laid out but covered (an overlay over its cells): the frame shows no placeholder.
+        let painted = vec![("a".to_string(), cells), ("b".to_string(), cells)];
+        let staged = store.stage(&painted, &HashSet::from([a]));
+        assert_eq!(String::from_utf8(staged).unwrap(), unplace(b));
     }
 
     #[test]
@@ -1048,10 +1134,13 @@ mod tests {
         assert_eq!(payload_bytes(&first.bytes), k * 400_000, "each picture once");
         let mut burst = Vec::new();
         for i in 0..n {
-            burst.extend(store.place(&frame(40 + i as u16), CELL, now).bytes);
+            let painted = frame(40 + i as u16);
+            burst.extend(store.place(&painted, CELL, now).bytes);
+            let shown = painted.iter().filter_map(|(u, _)| store.placed_id(u)).collect();
+            burst.extend(store.stage(&painted, &shown));
         }
         assert_eq!(payload_bytes(&burst), 0, "no pixels during the burst");
-        assert!(burst.len() < k * n * 64, "placements only: {} bytes", burst.len());
+        assert!(!burst.is_empty() && burst.len() < k * n * 64, "placements: {}", burst.len());
     }
 
     #[test]
@@ -1104,13 +1193,15 @@ mod tests {
         let small = Cells { cols: 30, rows: 5 };
         let placed = at(&mut store, &[("s", small)], t0);
         assert!(placed.sent && placed.rasters.is_empty());
+        assert!(!shows(&mut store, &[("s", small)]).is_empty(), "placed");
         assert!(!store.sharp_pending());
         // 80×20 cells is 800×400 px: the block outgrew it. The packed raster stays placed
         // at the new cells, and nothing is asked until the size has held for QUIET.
         let big = Cells { cols: 80, rows: 20 };
         let placed = at(&mut store, &[("s", big)], t0);
         assert!(placed.rasters.is_empty(), "debounced");
-        assert_eq!(payload_bytes(&placed.bytes), 0, "only the placement moved");
+        assert!(placed.bytes.is_empty(), "no pixels");
+        assert_eq!(payload_bytes(shows(&mut store, &[("s", big)]).as_bytes()), 0, "moved only");
         assert!(store.sharp_pending(), "the loop keeps waking for it");
         let mid = Cells { cols: 90, rows: 25 };
         assert!(at(&mut store, &[("s", mid)], t0 + QUIET / 2).rasters.is_empty());

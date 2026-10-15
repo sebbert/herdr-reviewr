@@ -121,8 +121,7 @@ fn main() {
         let payload = sharp.as_ref().map_or(&prepared.payload, |(p, _)| p);
         let head = format!("a=t,f=100,i={id},q=2,");
         let _ = out.write_all(&graphics::chunked(&head, payload));
-        let place = format!("\x1b_Ga=p,U=1,i={id},p=1,c={},r={},q=2\x1b\\", cells.cols, cells.rows);
-        let _ = out.write_all(place.as_bytes());
+        let _ = out.write_all(&graphics::place(id, cells.cols, cells.rows));
         println!(
             "{name}: {}×{} px → {}×{} cells{}",
             prepared.size.0,

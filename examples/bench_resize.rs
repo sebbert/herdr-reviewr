@@ -102,7 +102,10 @@ fn main() {
     after.place(&frame(120), cell, t0);
     let (mut a_total, mut a_payload) = (0, 0);
     for i in 0..n {
-        let out = after.place(&frame(60 + i as u16), cell, t0).bytes;
+        let painted = frame(60 + i as u16);
+        let mut out = after.place(&painted, cell, t0).bytes;
+        let shown = painted.iter().filter_map(|(u, _)| after.placed_id(u)).collect();
+        out.extend(after.stage(&painted, &shown));
         a_total += out.len();
         a_payload += payload(&out);
     }

@@ -2,10 +2,13 @@
 //! (`crate::images`): the Kitty graphics protocol with Unicode placeholders.
 //!
 //! A picture reaches the pane in two halves that never wait on each other. Out of band, the
-//! event loop transmits an image under an id with a virtual placement (`U=1`) a number of
-//! cells wide and tall. In band, the renderer paints ordinary text cells — U+10EEEE plus a
-//! row and a column diacritic, the image id in the foreground colour — that the terminal
-//! swaps for that part of the picture. Downloads run on [`Fetcher`] threads (`curl`, size
+//! event loop transmits an image's data under an id, once. In band, the renderer paints
+//! ordinary text cells — U+10EEEE plus a row and a column diacritic, the image id in the
+//! foreground colour — that the terminal swaps for that part of the picture through the
+//! image's one virtual placement (`U=1`), a number of cells wide and tall. The placement
+//! exists only while a frame paints such cells ([`shown_ids`]): it goes out just before the
+//! frame that first shows the image, and is deleted, data kept, with the frame that stops
+//! showing it ([`place`], [`unplace`]). Downloads run on [`Fetcher`] threads (`curl`, size
 //! and time caps), and the [`PROBE`] asks the terminal once, through the input stream,
 //! whether it speaks the protocol at all. Anything missing keeps the text fallback.
 
@@ -377,6 +380,37 @@ pub fn delete(id: u32) -> Vec<u8> {
     format!("\x1b_Ga=d,d=I,i={id},q=2\x1b\\").into_bytes()
 }
 
+/// The escape sequence that puts image `id`'s one virtual placement (`p=1`) on the terminal,
+/// `cols` × `rows` cells — or moves it there, replacing the one it had.
+#[must_use]
+pub fn place(id: u32, cols: u16, rows: u16) -> Vec<u8> {
+    format!("\x1b_Ga=p,U=1,i={id},p=1,c={cols},r={rows},q=2\x1b\\").into_bytes()
+}
+
+/// The escape sequence that deletes image `id`'s placement and keeps its data (lowercase
+/// `d=i`), so showing it again is one [`place`], never a retransmit.
+#[must_use]
+pub fn unplace(id: u32) -> Vec<u8> {
+    format!("\x1b_Ga=d,d=i,i={id},p=1,q=2\x1b\\").into_bytes()
+}
+
+/// The image ids a finished frame paints placeholder cells for — the ids whose placements
+/// the terminal should hold. A placement no cell names still costs the terminal: a host like
+/// herdr scans the whole pane for placeholders on every render while any exists.
+#[must_use]
+pub fn shown_ids(buf: &ratatui::buffer::Buffer) -> std::collections::HashSet<u32> {
+    buf.content
+        .iter()
+        .filter(|cell| cell.symbol().starts_with(PLACEHOLDER))
+        .filter_map(|cell| match cell.fg {
+            ratatui::style::Color::Rgb(r, g, b) => {
+                Some(u32::from(r) << 16 | u32::from(g) << 8 | u32::from(b))
+            }
+            _ => None,
+        })
+        .collect()
+}
+
 /// Standard base64 with padding — the protocol's payload encoding.
 #[must_use]
 pub fn base64(bytes: &[u8]) -> String {
@@ -698,6 +732,28 @@ mod tests {
         assert!(chunks[0].starts_with("\x1b_Ga=T,i=4,m=1;"));
         assert!(chunks[1].starts_with("\x1b_Gm=1;"));
         assert!(chunks[2].starts_with("\x1b_Gm=0;"));
+    }
+
+    #[test]
+    fn a_frame_shows_the_ids_its_placeholder_cells_name_and_no_others() {
+        use ratatui::buffer::Buffer;
+        use ratatui::layout::Rect;
+        use ratatui::style::Color;
+        let mut buf = Buffer::empty(Rect::new(0, 0, 6, 2));
+        assert!(shown_ids(&buf).is_empty());
+        for (x, y, id) in [(0, 0, 0x52_00_01), (1, 0, 0x52_00_01), (3, 1, 0x60_00_00)] {
+            let (r, g, b) = id_rgb(id);
+            let cell = buf.cell_mut((x, y)).unwrap();
+            cell.set_symbol(&placeholder(0, usize::from(x)));
+            cell.fg = Color::Rgb(r, g, b);
+        }
+        // Text in an image's colour is not a placeholder; a placeholder needs its colour.
+        buf.cell_mut((4, 1)).unwrap().set_symbol("x").fg = Color::Rgb(0, 0x52, 0x02);
+        buf.cell_mut((5, 1)).unwrap().set_symbol(&placeholder(0, 0)).fg = Color::Reset;
+        assert_eq!(shown_ids(&buf), [0x52_00_01, 0x60_00_00].into_iter().collect());
+
+        assert_eq!(place(7, 12, 3), b"\x1b_Ga=p,U=1,i=7,p=1,c=12,r=3,q=2\x1b\\");
+        assert_eq!(unplace(7), b"\x1b_Ga=d,d=i,i=7,p=1,q=2\x1b\\", "lowercase: data kept");
     }
 
     #[test]

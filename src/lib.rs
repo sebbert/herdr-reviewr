@@ -164,6 +164,19 @@ fn draw(terminal: &mut Term, app: &App) -> io::Result<()> {
     Ok(())
 }
 
+/// [`draw`] in the event loop: between rendering a frame and flushing its cells, the
+/// graphics host matches the terminal's placements to what the frame paints, so a placement
+/// is never missing under its placeholders, and never there with none.
+fn draw_staged(terminal: &mut Term, app: &mut App, graphics: &mut GraphicsHost) -> io::Result<()> {
+    let links = terminal.backend().links();
+    terminal.draw(|f| {
+        ui::render(f, app);
+        *links.borrow_mut() = app.painted_hyperlinks();
+        graphics.stage(app, f.buffer_mut());
+    })?;
+    Ok(())
+}
+
 /// Claim the input modes the event loop reads, on a screen something else already owns.
 ///
 /// Bracketed paste so a multi-line paste arrives as one event, not raw keystrokes whose
@@ -923,6 +936,8 @@ struct GraphicsHost {
     rasterizer: Option<crate::images::Rasterizer>,
     /// Images went out after the last draw: the next frame paints them without waiting.
     repaint: bool,
+    /// The image blocks the last frame painted, from its render to `after_draw`.
+    painted: Vec<(String, crate::images::Cells)>,
 }
 
 impl GraphicsHost {
@@ -971,12 +986,27 @@ impl GraphicsHost {
         }
     }
 
+    /// Run between rendering a frame and flushing it: place every image whose placeholder
+    /// cells the frame paints, and unplace — data kept — every one it no longer paints. A
+    /// pane with no image on screen holds no placement, so its terminal never scans it for
+    /// placeholders; only the difference from the last frame goes out.
+    fn stage(&mut self, app: &mut App, buf: &ratatui::buffer::Buffer) {
+        self.painted = app.take_painted_images();
+        if !app.avatars_wanted() && !app.inline_images_wanted() {
+            return;
+        }
+        let shown = crate::graphics::shown_ids(buf);
+        let mut bytes = app.avatars.stage(&shown);
+        bytes.extend(app.images.stage(&self.painted, &shown));
+        write_terminal(&bytes);
+    }
+
     /// Run after every draw: send the probe once either kind is wanted, request the missing
-    /// URLs — what this frame painted first, so the visible cards fill in first — and put
-    /// the images this frame laid out on the terminal, so the next frame shows them. The PR
+    /// URLs — what this frame painted first, so the visible cards fill in first — and send
+    /// the images this frame laid out to the terminal, so the next frame shows them. The PR
     /// snapshot has already painted with dots and alt links by the time anything is asked for.
     fn after_draw(&mut self, app: &mut App) {
-        let painted = app.take_painted_images();
+        let painted = std::mem::take(&mut self.painted);
         if !app.avatars_wanted() && !app.inline_images_wanted() {
             return;
         }
@@ -1231,7 +1261,7 @@ fn event_loop(terminal: &mut Term, app: &mut App, cfg: &Config, kbd: bool) -> Re
             app.bound_file_scroll(file_vp);
             let painted_frame = PaintedFrameSnapshot::capture(app);
             graphics.before_draw(app);
-            draw(terminal, app)?;
+            draw_staged(terminal, app, &mut graphics)?;
             graphics.after_draw(app);
 
             // A world completion reconciles into the view only while the view it described is
@@ -3998,8 +4028,10 @@ mod resize_tests {
         }
         assert!(app.avatars.transmissions(g).is_empty(), "the avatar is still there");
         let wider = crate::images::Cells { cols: 30, rows: 8 };
-        let moved = app.images.place(&[("i".into(), wider)], (10, 20), now);
-        let seq = String::from_utf8(moved.bytes).unwrap();
+        let painted = [("i".to_string(), wider)];
+        assert!(app.images.place(&painted, (10, 20), now).bytes.is_empty(), "no pixels");
+        let shown = std::collections::HashSet::from([app.images.placed_id("i").unwrap()]);
+        let seq = String::from_utf8(app.images.stage(&painted, &shown)).unwrap();
         assert!(seq.starts_with("\x1b_Ga=p,") && !seq.contains("a=t"), "{seq:?}");
         // A changed cell size (a font change) re-sends the avatar at its new geometry.
         let bigger = crate::avatar::geometry((12, 24), 1, crate::avatar::Fit::Height);

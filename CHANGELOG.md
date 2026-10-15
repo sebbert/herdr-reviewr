@@ -292,6 +292,31 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   reply count on threads.
 
 ### Fixed
+- **No Kitty placements while no picture is on screen, so a host like herdr stops lagging.**
+  Once a pane holds any Kitty virtual placement, herdr scans that pane's whole viewport for
+  placeholder cells on every render, its own and every other pane's. reviewr's avatars were
+  transmitted with their placement (`a=T,U=1`), and an inline image's placement was only ever
+  moved, so a pane that had once shown a PR kept placements for its whole life — on the
+  Changes tab, with the images scrolled away — and every herdr render paid the scan.
+  Decisions:
+  - **A placement exists only while a frame paints its placeholder cells.** Which ids a frame
+    shows is read from the finished frame buffer itself (`graphics::shown_ids`), so another
+    tab, a scroll, a collapse, an overlay covering the block, and a changed PR all count, with
+    no list for each to keep. Images painted nowhere hold no placement at all.
+  - **Placed before the frame's cells, diffed against the last frame.** The loop renders, then
+    stages the placements (`a=p,U=1,…,p=1` for a newly shown image or a changed footprint,
+    `a=d,d=i,…,p=1` for one no longer shown), then flushes the frame — so placeholder cells
+    never reach the terminal ahead of their placement. A frame that shows what the last one
+    showed writes nothing.
+  - **Data stays; only the placement goes.** The deletion is lowercase `d=i` with the
+    placement id: the picture stays in the terminal, so coming back to the PR tab or scrolling
+    back is one placement command, never a retransmit. The full deletes (`d=I`) are unchanged:
+    exit, the editor handoff, a kind switched off, and eviction past `MAX_PLACED`/`MAX_PIXELS`.
+  - **Avatars transmit data only (`a=t`).** They are placed on demand at their geometry's width
+    like inline images; a new geometry (a font change) deletes the old picture before sending
+    the new one, and the next frame places it.
+  - **A sharp SVG swap keeps its place.** Swapping in a re-rasterised SVG deletes the old
+    picture with its placement, so a picture on screen is placed again in the same write.
 - **Inline images on a private GitHub repository's files, in `<picture>`, and in `<details>`.**
   A bot comment's diagrams stayed alt links. It links them as
   `github.com/<o>/<r>/raw/<ref>/<path>` inside `<a href><picture>`, inside a `<details open>`

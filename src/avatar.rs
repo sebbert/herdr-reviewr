@@ -4,14 +4,15 @@
 //! The pieces stay apart so none of them can hold a frame. The PR fetch carries avatar URLs
 //! as strings and nothing more. The [`Fetcher`] downloads and decodes on its own threads
 //! (`curl`, bounded concurrency, tight timeouts). The [`Store`] holds what landed, keyed by
-//! URL for the session. The event loop transmits a landed image once, out of band, and the
-//! renderer paints ordinary text cells — U+10EEEE plus row/column diacritics, the image id
-//! in the foreground colour — that the terminal swaps for the picture. Anything missing, a
+//! URL for the session. The event loop transmits a landed image's data once, out of band,
+//! the renderer paints ordinary text cells — U+10EEEE plus row/column diacritics, the image
+//! id in the foreground colour — and the image's virtual placement, which the terminal swaps
+//! those cells for the picture through, exists only while a frame paints them. Anything missing, a
 //! terminal that never answered the [`PROBE`], a failed download, keeps the dot. The
 //! protocol pieces, the probe, and the fetcher are `crate::graphics`, shared with inline
 //! PR images; what is here is the avatar's own: its circle, its cells, its store.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use image::RgbaImage;
 
@@ -19,6 +20,7 @@ use image::RgbaImage;
 use crate::graphics::base64;
 pub use crate::graphics::{
     FALLBACK_CELL, Fed, PLACEHOLDER, PROBE, PROBE_WINDOW, ProbeFilter, delete, id_rgb, parse_reply,
+    place, unplace,
 };
 
 /// The download workers: enough to fill a screen of cards quickly, few enough that a slow
@@ -34,13 +36,12 @@ pub fn placeholder_cell(col: usize) -> String {
     crate::graphics::placeholder(0, col.min(2))
 }
 
-/// The escape sequences that transmit `img` as image `id` with a virtual placement `cols`
-/// cells wide and one row tall, replies suppressed, the RGBA payload chunked the way the
-/// protocol requires.
+/// The escape sequences that transmit `img` as image `id`, data only — no placement, which
+/// [`Store::stage`] makes while a frame paints it — replies suppressed, the RGBA payload
+/// chunked the way the protocol requires.
 #[must_use]
-pub fn transmit(id: u32, cols: u8, img: &RgbaImage) -> Vec<u8> {
-    let head =
-        format!("a=T,U=1,f=32,s={},v={},c={cols},r=1,i={id},q=2,", img.width(), img.height());
+pub fn transmit(id: u32, img: &RgbaImage) -> Vec<u8> {
+    let head = format!("a=t,f=32,s={},v={},i={id},q=2,", img.width(), img.height());
     crate::graphics::chunked(&head, &crate::graphics::base64(img.as_raw()))
 }
 
@@ -201,6 +202,8 @@ enum Entry {
         /// The geometry it was last transmitted at; `None` until transmitted (again, after
         /// anything that could have dropped it).
         sent: Option<Geometry>,
+        /// Whether its virtual placement is on the terminal: only while a frame paints it.
+        placed: bool,
     },
 }
 
@@ -248,7 +251,7 @@ impl Store {
             Some(source) => {
                 let id = FIRST_ID + self.next_id;
                 self.next_id += 1;
-                Entry::Ready { id, source, sent: None }
+                Entry::Ready { id, source, sent: None, placed: false }
             }
             None => Entry::Failed,
         };
@@ -256,16 +259,39 @@ impl Store {
     }
 
     /// The transmissions owed at this geometry: every ready image not yet on the terminal
-    /// in this shape. Marks them sent.
+    /// in this shape, data only. One sent in another shape is deleted first, placement and
+    /// all; the next [`Store::stage`] places it again at the new width. Marks them sent.
     pub fn transmissions(&mut self, g: Geometry) -> Vec<u8> {
         let mut out = Vec::new();
         for entry in self.entries.values_mut() {
-            if let Entry::Ready { id, source, sent } = entry
+            if let Entry::Ready { id, source, sent, placed } = entry
                 && *sent != Some(g)
             {
-                out.extend(transmit(*id, g.cols, &paint(source, &g)));
+                if sent.is_some() {
+                    out.extend(delete(*id));
+                }
+                out.extend(transmit(*id, &paint(source, &g)));
                 *sent = Some(g);
+                *placed = false;
             }
+        }
+        out
+    }
+
+    /// Match the terminal's placements to a finished frame: place every transmitted avatar
+    /// whose id `shown` names, unplace — data kept — every placed one it no longer names.
+    /// Only the difference from the last frame goes out.
+    pub fn stage(&mut self, shown: &HashSet<u32>) -> Vec<u8> {
+        let mut out = Vec::new();
+        for entry in self.entries.values_mut() {
+            let Entry::Ready { id, sent: Some(g), placed, .. } = entry else { continue };
+            let want = shown.contains(id);
+            if want && !*placed {
+                out.extend(place(*id, u16::from(g.cols), 1));
+            } else if !want && *placed {
+                out.extend(unplace(*id));
+            }
+            *placed = want;
         }
         out
     }
@@ -275,23 +301,14 @@ impl Store {
     pub fn deletions(&mut self) -> Vec<u8> {
         let mut out = Vec::new();
         for entry in self.entries.values_mut() {
-            if let Entry::Ready { id, sent, .. } = entry
+            if let Entry::Ready { id, sent, placed, .. } = entry
                 && sent.take().is_some()
             {
+                *placed = false;
                 out.extend(delete(*id));
             }
         }
         out
-    }
-
-    /// Forget what the terminal holds, after anything that could have dropped it (a resize):
-    /// the next pass re-transmits. Painted cells fall back to dots until then.
-    pub fn forget_sent(&mut self) {
-        for entry in self.entries.values_mut() {
-            if let Entry::Ready { sent, .. } = entry {
-                *sent = None;
-            }
-        }
     }
 }
 
@@ -323,18 +340,18 @@ mod tests {
     }
 
     #[test]
-    fn a_transmission_creates_a_quiet_virtual_placement_and_chunks_its_payload() {
+    fn a_transmission_sends_quiet_data_with_no_placement_and_chunks_its_payload() {
         let small = RgbaImage::new(2, 1);
-        let seq = String::from_utf8(transmit(7, 2, &small)).unwrap();
-        assert_eq!(seq, "\x1b_Ga=T,U=1,f=32,s=2,v=1,c=2,r=1,i=7,q=2,m=0;AAAAAAAAAAA=\x1b\\");
+        let seq = String::from_utf8(transmit(7, &small)).unwrap();
+        assert_eq!(seq, "\x1b_Ga=t,f=32,s=2,v=1,i=7,q=2,m=0;AAAAAAAAAAA=\x1b\\");
 
         // 64×64 RGBA is 16 KiB raw, about 22 KiB of base64: several chunks, the control keys
         // on the first only, every chunk but the last flagged `m=1`.
         let big = RgbaImage::new(64, 64);
-        let seq = String::from_utf8(transmit(9, 1, &big)).unwrap();
+        let seq = String::from_utf8(transmit(9, &big)).unwrap();
         let chunks: Vec<&str> = seq.split("\x1b\\").filter(|c| !c.is_empty()).collect();
         assert!(chunks.len() > 1);
-        assert!(chunks[0].starts_with("\x1b_Ga=T,U=1,f=32,s=64,v=64,c=1,r=1,i=9,q=2,m=1;"));
+        assert!(chunks[0].starts_with("\x1b_Ga=t,f=32,s=64,v=64,i=9,q=2,m=1;"));
         assert!(chunks[1..chunks.len() - 1].iter().all(|c| c.starts_with("\x1b_Gm=1;")));
         assert!(chunks.last().unwrap().starts_with("\x1b_Gm=0;"));
         let payload: usize = chunks.iter().map(|c| c.split_once(';').unwrap().1.len()).sum();
@@ -475,17 +492,30 @@ mod tests {
         let g1 = geometry((10, 20), 1, Fit::Height);
         let g2 = geometry((10, 20), 2, Fit::Height);
         let sent = store.transmissions(g1);
-        assert!(sent.starts_with(b"\x1b_Ga=T,U=1"));
+        assert!(sent.starts_with(b"\x1b_Ga=t,f=32,"), "data only, no placement");
         let id = store.painted_id("a").expect("transmitted: painted");
         assert_eq!(store.painted_id("b"), None, "a failed URL stays a dot");
         assert!(store.transmissions(g1).is_empty(), "sent once");
-        assert!(!store.transmissions(g2).is_empty(), "a new width re-sends");
+        assert!(store.stage(&HashSet::new()).is_empty(), "not painted: never placed");
 
-        store.forget_sent();
-        assert_eq!(store.painted_id("a"), None, "after a resize: dots until re-sent");
-        assert!(!store.transmissions(g2).is_empty());
+        // A frame paints it: one placement, at the geometry's width, before that frame.
+        let shown = HashSet::from([id]);
+        assert_eq!(store.stage(&shown), place(id, 3, 1));
+        assert!(store.stage(&shown).is_empty(), "still painted: nothing to say");
+        // Off screen (another tab, scrolled past, covered): the placement goes, data stays.
+        assert_eq!(store.stage(&HashSet::new()), unplace(id));
+        assert!(store.stage(&HashSet::new()).is_empty(), "unplaced once");
+        assert!(store.transmissions(g1).is_empty(), "back on screen: no retransmit");
+        assert_eq!(store.stage(&shown), place(id, 3, 1));
+
+        // A new width replaces the picture, placement and all; the next frame places it.
+        let resent = store.transmissions(g2);
+        assert!(resent.starts_with(&delete(id)), "the old picture freed");
+        assert!(resent[delete(id).len()..].starts_with(b"\x1b_Ga=t,"));
+        assert_eq!(store.stage(&shown), place(id, 2, 1));
         assert_eq!(store.deletions(), delete(id));
         assert!(store.deletions().is_empty(), "deleted once");
+        assert!(store.stage(&shown).is_empty(), "deleted: nothing to place until re-sent");
     }
 
     #[test]
